@@ -1,0 +1,92 @@
+{
+  "info": {
+    "name": "OTT Community FULL API",
+    "_postman_id": "full-mysql-api",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Users",
+      "item": [
+        { "name": "GET all users", "request": { "method": "GET", "url": "{{baseUrl}}/api/users" } },
+        { "name": "GET user by id", "request": { "method": "GET", "url": "{{baseUrl}}/api/users/1" } },
+        { "name": "POST register", "request": { "method": "POST", "url": "{{baseUrl}}/api/users/register" } },
+        { "name": "POST login", "request": { "method": "POST", "url": "{{baseUrl}}/api/users/login" } },
+        { "name": "PUT update user", "request": { "method": "PUT", "url": "{{baseUrl}}/api/users/1" } },
+        { "name": "DELETE user", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/users/1" } }
+      ]
+    },
+    {
+      "name": "Relationships",
+      "item": [
+        { "name": "GET friends", "request": { "method": "GET", "url": "{{baseUrl}}/api/relationships" } },
+        { "name": "POST add friend", "request": { "method": "POST", "url": "{{baseUrl}}/api/relationships" } },
+        { "name": "PUT accept/block", "request": { "method": "PUT", "url": "{{baseUrl}}/api/relationships/1" } },
+        { "name": "DELETE unfriend", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/relationships/1" } }
+      ]
+    },
+    {
+      "name": "Groups",
+      "item": [
+        { "name": "GET all groups", "request": { "method": "GET", "url": "{{baseUrl}}/api/groups" } },
+        { "name": "GET group detail", "request": { "method": "GET", "url": "{{baseUrl}}/api/groups/1" } },
+        { "name": "POST create group", "request": { "method": "POST", "url": "{{baseUrl}}/api/groups" } },
+        { "name": "PUT update group", "request": { "method": "PUT", "url": "{{baseUrl}}/api/groups/1" } },
+        { "name": "DELETE group", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/groups/1" } }
+      ]
+    },
+    {
+      "name": "Group Members",
+      "item": [
+        { "name": "GET members", "request": { "method": "GET", "url": "{{baseUrl}}/api/groups/1/members" } },
+        { "name": "POST add member", "request": { "method": "POST", "url": "{{baseUrl}}/api/groups/1/members" } },
+        { "name": "PUT update role", "request": { "method": "PUT", "url": "{{baseUrl}}/api/groups/1/members/2" } },
+        { "name": "DELETE remove member", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/groups/1/members/2" } }
+      ]
+    },
+    {
+      "name": "Channels",
+      "item": [
+        { "name": "GET channels", "request": { "method": "GET", "url": "{{baseUrl}}/api/groups/1/channels" } },
+        { "name": "POST create channel", "request": { "method": "POST", "url": "{{baseUrl}}/api/groups/1/channels" } },
+        { "name": "DELETE channel", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/channels/1" } }
+      ]
+    },
+    {
+      "name": "Direct Chats",
+      "item": [
+        { "name": "GET chats", "request": { "method": "GET", "url": "{{baseUrl}}/api/direct-chats" } },
+        { "name": "POST create chat", "request": { "method": "POST", "url": "{{baseUrl}}/api/direct-chats" } }
+      ]
+    },
+    {
+      "name": "Messages",
+      "item": [
+        { "name": "GET messages by channel", "request": { "method": "GET", "url": "{{baseUrl}}/api/messages/channel/1" } },
+        { "name": "GET messages by direct chat", "request": { "method": "GET", "url": "{{baseUrl}}/api/messages/direct/1" } },
+        { "name": "POST send channel message", "request": { "method": "POST", "url": "{{baseUrl}}/api/messages/channel" } },
+        { "name": "POST send direct message", "request": { "method": "POST", "url": "{{baseUrl}}/api/messages/direct" } },
+        { "name": "PUT reaction", "request": { "method": "PUT", "url": "{{baseUrl}}/api/messages/1/reactions" } },
+        { "name": "DELETE message", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/messages/1" } }
+      ]
+    },
+    {
+      "name": "Read Receipts",
+      "item": [
+        { "name": "GET read status", "request": { "method": "GET", "url": "{{baseUrl}}/api/read-receipts" } },
+        { "name": "POST mark as read", "request": { "method": "POST", "url": "{{baseUrl}}/api/read-receipts" } }
+      ]
+    },
+    {
+      "name": "Calls",
+      "item": [
+        { "name": "GET calls", "request": { "method": "GET", "url": "{{baseUrl}}/api/calls" } },
+        { "name": "POST create call", "request": { "method": "POST", "url": "{{baseUrl}}/api/calls" } },
+        { "name": "PUT end call", "request": { "method": "PUT", "url": "{{baseUrl}}/api/calls/1" } }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:4000" }
+  ]
+}

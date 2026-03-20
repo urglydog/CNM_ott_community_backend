@@ -1,125 +1,151 @@
-const { pool } = require('../config/mysqlConfig');
+const { ddbDocClient } = require('../config/awsConfig');
+const { PutCommand, GetCommand, ScanCommand } = require('@aws-sdk/lib-dynamodb');
+
+const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || 'ott_groups';
+const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || 'ott_group_members';
 
 async function createGroup(payload) {
-  const connection = await pool.getConnection();
-  try {
-    const [result] = await connection.execute(
-      `INSERT INTO \`groups\` (name, description, type, created_by)
-       VALUES (?, ?, ?, ?)` ,
-      [
-        payload.name,
-        payload.description || '',
-        payload.type || 'public_community',
-        payload.ownerId || payload.createdBy || null
-      ]
-    );
-
-    const groupId = result.insertId;
-
-    if (payload.ownerId) {
-      await connection.execute(
-        `INSERT INTO group_members (group_id, user_id, role)
-         VALUES (?, ?, 'owner')`,
-        [groupId, payload.ownerId]
-      );
-    }
-
-    const [rows] = await connection.execute(
-      'SELECT id, name, description, avatar_url, type, join_setting, member_count, created_by, created_at FROM `groups` WHERE id = ?',
-      [groupId]
-    );
-    return rows[0];
-  } finally {
-    connection.release();
+  if (!payload.name) {
+    throw new Error('Group name is required');
   }
+
+  const now = new Date().toISOString();
+  // groupId là khoá chính (string) trong DynamoDB
+  const groupId = `group_${Date.now()}`;
+
+  const ownerId = payload.ownerId || payload.createdBy || null;
+
+  const groupItem = {
+    groupId, // primary key DynamoDB
+    name: payload.name,
+    description: payload.description || '',
+    avatar_url: null,
+    type: payload.type || 'public_community',
+    member_count: ownerId ? 1 : 0,
+    created_by: ownerId,
+    created_at: now
+  };
+
+  await ddbDocClient.send(new PutCommand({
+    TableName: GROUPS_TABLE,
+    Item: groupItem
+  }));
+
+  if (ownerId) {
+    // Bảng thành viên nhóm dạng (group_id, user_id, role)
+    await ddbDocClient.send(new PutCommand({
+      TableName: MEMBERS_TABLE,
+      Item: {
+        group_id: groupId,
+        user_id: ownerId,
+        role: 'owner',
+        joined_at: now
+      }
+    }));
+  }
+
+  return groupItem;
 }
 
 async function listGroups() {
-  const connection = await pool.getConnection();
-  try {
-    const [rows] = await connection.execute(
-      'SELECT id, name, description, avatar_url, type AS topic, member_count, created_by, created_at FROM `groups` ORDER BY id DESC'
-    );
+  const result = await ddbDocClient.send(new ScanCommand({
+    TableName: GROUPS_TABLE
+  }));
 
-    return rows.map((g) => ({
-      groupId: g.id,
-      name: g.name,
-      description: g.description,
-      topic: g.topic,
-      avatarUrl: g.avatar_url,
-      memberCount: g.member_count,
-      createdBy: g.created_by,
-      createdAt: g.created_at
-    }));
-  } finally {
-    connection.release();
-  }
+  const rows = (result.Items || []).sort((a, b) => {
+    const aTime = a.created_at || a.createdAt || '';
+    const bTime = b.created_at || b.createdAt || '';
+    return bTime.localeCompare(aTime);
+  });
+
+  return rows.map((g) => ({
+    groupId: g.groupId,
+    name: g.name,
+    description: g.description,
+    topic: g.type,
+    avatarUrl: g.avatar_url,
+    memberCount: g.member_count,
+    createdBy: g.created_by,
+    createdAt: g.created_at
+  }));
 }
 
 async function getGroupById(groupId) {
-  const connection = await pool.getConnection();
-  try {
-    const [rows] = await connection.execute(
-      'SELECT id, name, description, avatar_url, type AS topic, member_count, created_by, created_at FROM `groups` WHERE id = ?',
-      [groupId]
-    );
-    if (!rows.length) return null;
-    const g = rows[0];
-    return {
-      groupId: g.id,
-      name: g.name,
-      description: g.description,
-      topic: g.topic,
-      avatarUrl: g.avatar_url,
-      memberCount: g.member_count,
-      createdBy: g.created_by,
-      createdAt: g.created_at
-    };
-  } finally {
-    connection.release();
-  }
+  const result = await ddbDocClient.send(new GetCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: String(groupId) }
+  }));
+
+  if (!result.Item) return null;
+  const g = result.Item;
+
+  return {
+    groupId: g.groupId,
+    name: g.name,
+    description: g.description,
+    topic: g.type,
+    avatarUrl: g.avatar_url,
+    memberCount: g.member_count,
+    createdBy: g.created_by,
+    createdAt: g.created_at
+  };
 }
 
 async function addMemberToGroup(groupId, userId, role = 'member') {
-  const connection = await pool.getConnection();
-  try {
-    await connection.execute(
-      `INSERT INTO group_members (group_id, user_id, role)
-       VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE role = VALUES(role)`,
-      [groupId, userId, role]
-    );
+  const now = new Date().toISOString();
+  const groupKey = String(groupId);
+  const userKey = String(userId);
 
-    return { groupId, userId, role };
-  } finally {
-    connection.release();
-  }
+  await ddbDocClient.send(new PutCommand({
+    TableName: MEMBERS_TABLE,
+    Item: {
+      groupId: groupKey,
+      userId: userKey,
+      role,
+      joined_at: now
+    }
+  }));
+
+  return { groupId: groupKey, userId: userKey, role };
 }
 
 async function getGroupsForUser(userId) {
-  const connection = await pool.getConnection();
-  try {
-    const [rows] = await connection.execute(
-      `SELECT g.id, g.name, g.description, g.avatar_url, g.type AS topic, g.member_count, g.created_by, g.created_at
-       FROM group_members gm
-       JOIN \`groups\` g ON gm.group_id = g.id
-       WHERE gm.user_id = ?`,
-      [userId]
-    );
+  const userKey = String(userId);
 
-    return rows.map((g) => ({
-      groupId: g.id,
+  // Không có GSI nên dùng Scan + filter theo user_id
+  const membersRes = await ddbDocClient.send(new ScanCommand({
+    TableName: MEMBERS_TABLE,
+    FilterExpression: 'userId = :uid',
+    ExpressionAttributeValues: { ':uid': userKey }
+  }));
+
+  const memberItems = membersRes.Items || [];
+  if (!memberItems.length) return [];
+
+  const groupIds = [...new Set(memberItems.map((m) => m.groupId))];
+
+  const groups = await Promise.all(
+    groupIds.map(async (gid) => {
+      const res = await ddbDocClient.send(new GetCommand({
+        TableName: GROUPS_TABLE,
+        Key: { groupId: gid }
+      }));
+      return res.Item || null;
+    })
+  );
+
+  return groups
+    .filter(Boolean)
+    .map((g) => ({
+      groupId: g.groupId,
       name: g.name,
       description: g.description,
-      topic: g.topic,
+      topic: g.type,
       avatarUrl: g.avatar_url,
       memberCount: g.member_count,
       createdBy: g.created_by,
       createdAt: g.created_at
     }));
-  } finally {
-    connection.release();
-  }
 }
 
 module.exports = {

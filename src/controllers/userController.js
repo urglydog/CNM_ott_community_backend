@@ -4,7 +4,7 @@ const { signToken } = require('../utils/jwt');
 async function registerUser(req, res) {
   try {
     const user = await userService.registerUser(req.body);
-    const token = signToken({ userId: user.id, username: user.username });
+    const token = signToken({ userId: user.userId ?? user.id, username: user.username });
     res.status(201).json({ user, token });
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -14,7 +14,7 @@ async function registerUser(req, res) {
 async function loginUser(req, res) {
   try {
     const user = await userService.loginUser(req.body);
-    const token = signToken({ userId: user.id, username: user.username });
+    const token = signToken({ userId: user.userId ?? user.id, username: user.username });
     res.json({ user, token });
   } catch (error) {
     res.status(400).json({ message: error.message });

@@ -60,14 +60,27 @@ async function saveMessage(payload) {
     );
 
     const msg = rows[0];
+
+		// attachments/reactions là cột JSON, driver có thể trả về string hoặc object
+		const attachments = msg.attachments
+			? (typeof msg.attachments === 'string'
+					? JSON.parse(msg.attachments)
+					: msg.attachments)
+			: null;
+		const reactions = msg.reactions
+			? (typeof msg.reactions === 'string'
+					? JSON.parse(msg.reactions)
+					: msg.reactions)
+			: null;
+
     return {
       id: msg.id,
       conversationId: payload.conversationId,
       senderId: msg.sender_id,
       contentType: msg.type,
       content: msg.content,
-      attachments: msg.attachments ? JSON.parse(msg.attachments) : null,
-      reactions: msg.reactions ? JSON.parse(msg.reactions) : null,
+      attachments,
+      reactions,
       createdAt: msg.created_at
     };
   } finally {
@@ -89,16 +102,29 @@ async function getMessagesForConversation(conversationId) {
       [id]
     );
 
-    return rows.map((msg) => ({
+    return rows.map((msg) => {
+			const attachments = msg.attachments
+				? (typeof msg.attachments === 'string'
+						? JSON.parse(msg.attachments)
+						: msg.attachments)
+				: null;
+			const reactions = msg.reactions
+				? (typeof msg.reactions === 'string'
+						? JSON.parse(msg.reactions)
+						: msg.reactions)
+				: null;
+
+			return {
       id: msg.id,
       conversationId,
       senderId: msg.sender_id,
       contentType: msg.type,
       content: msg.content,
-      attachments: msg.attachments ? JSON.parse(msg.attachments) : null,
-      reactions: msg.reactions ? JSON.parse(msg.reactions) : null,
+      attachments,
+      reactions,
       createdAt: msg.created_at
-    }));
+    };
+		});
   } finally {
     connection.release();
   }

@@ -1,133 +1,92 @@
-const { pool } = require('../config/mysqlConfig');
+const { ddbDocClient } = require('../config/awsConfig');
+const { PutCommand, GetCommand } = require('@aws-sdk/lib-dynamodb');
 
-// Ở schema MySQL, message có thể thuộc channel (group) hoặc direct_chat.
-// Ở đây ta đơn giản hoá: conversationId dạng "channel:1" hoặc "direct:1".
+// Bảng messages trong DynamoDB (primary key: conversationId (S))
+// Mỗi conversationId sẽ là 1 document chứa mảng messages
+const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || 'ott_messages';
 
-function parseConversationId(conversationId) {
-  if (!conversationId) return { mode: 'channel', id: null };
-  if (conversationId.startsWith('channel:')) {
-    return { mode: 'channel', id: Number(conversationId.replace('channel:', '')) };
-  }
-  if (conversationId.startsWith('direct:')) {
-    return { mode: 'direct', id: Number(conversationId.replace('direct:', '')) };
-  }
-  // fallback: coi như channel_id
-  return { mode: 'channel', id: Number(conversationId) };
-}
+// conversationId vẫn giữ dạng "channel:1" hoặc "direct:1" để tương thích với API hiện tại
 
 async function saveMessage(payload) {
-  const { mode, id } = parseConversationId(payload.conversationId);
-  if (!id) {
-    throw new Error('Invalid conversationId');
+  if (!payload.conversationId) {
+    throw new Error('conversationId is required');
+  }
+  if (!payload.senderId) {
+    throw new Error('senderId is required');
   }
 
-  const connection = await pool.getConnection();
-  try {
-    const isChannel = mode === 'channel';
+  const createdAt = new Date().toISOString();
+  const id = Date.now();
 
-    const [result] = await connection.execute(
-      `INSERT INTO messages (sender_id, channel_id, direct_chat_id, type, content, attachments, reactions)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        payload.senderId,
-        isChannel ? id : null,
-        isChannel ? null : id,
-        payload.contentType || 'text',
-        payload.content || '',
-        payload.attachments ? JSON.stringify(payload.attachments) : null,
-        payload.reactions ? JSON.stringify(payload.reactions) : null
-      ]
-    );
+  const newMessage = {
+    id,
+    senderId: payload.senderId,
+    contentType: payload.contentType || 'text',
+    content: payload.content || '',
+    attachments: payload.attachments || null,
+    reactions: payload.reactions || null,
+    createdAt
+  };
 
-    const messageId = result.insertId;
+  // Lấy conversation hiện tại (nếu có)
+  const getRes = await ddbDocClient.send(new GetCommand({
+    TableName: MESSAGES_TABLE,
+    Key: { conversationId: payload.conversationId }
+  }));
 
-    // Cập nhật last_message_id cho channel/direct_chat
-    if (isChannel) {
-      await connection.execute(
-        'UPDATE channels SET last_message_id = ? WHERE id = ?',
-        [messageId, id]
-      );
-    } else {
-      await connection.execute(
-        'UPDATE direct_chats SET last_message_id = ? WHERE id = ?',
-        [messageId, id]
-      );
-    }
+  const existing = getRes.Item || { conversationId: payload.conversationId, messages: [] };
+  const messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
+  messages.push(newMessage);
 
-    const [rows] = await connection.execute(
-      'SELECT * FROM messages WHERE id = ?',
-      [messageId]
-    );
-
-    const msg = rows[0];
-
-		// attachments/reactions là cột JSON, driver có thể trả về string hoặc object
-		const attachments = msg.attachments
-			? (typeof msg.attachments === 'string'
-					? JSON.parse(msg.attachments)
-					: msg.attachments)
-			: null;
-		const reactions = msg.reactions
-			? (typeof msg.reactions === 'string'
-					? JSON.parse(msg.reactions)
-					: msg.reactions)
-			: null;
-
-    return {
-      id: msg.id,
+  await ddbDocClient.send(new PutCommand({
+    TableName: MESSAGES_TABLE,
+    Item: {
       conversationId: payload.conversationId,
-      senderId: msg.sender_id,
-      contentType: msg.type,
-      content: msg.content,
-      attachments,
-      reactions,
-      createdAt: msg.created_at
-    };
-  } finally {
-    connection.release();
-  }
+      messages
+    }
+  }));
+
+  return {
+    id: newMessage.id,
+    conversationId: payload.conversationId,
+    senderId: newMessage.senderId,
+    contentType: newMessage.contentType,
+    content: newMessage.content,
+    attachments: newMessage.attachments,
+    reactions: newMessage.reactions,
+    createdAt: newMessage.createdAt
+  };
 }
 
 async function getMessagesForConversation(conversationId) {
-  const { mode, id } = parseConversationId(conversationId);
-  if (!id) return [];
+  if (!conversationId) return [];
 
-  const connection = await pool.getConnection();
-  try {
-    const isChannel = mode === 'channel';
-    const [rows] = await connection.execute(
-      `SELECT * FROM messages
-       WHERE ${isChannel ? 'channel_id' : 'direct_chat_id'} = ?
-       ORDER BY created_at ASC`,
-      [id]
-    );
+  const res = await ddbDocClient.send(new GetCommand({
+    TableName: MESSAGES_TABLE,
+    Key: { conversationId }
+  }));
 
-    return rows.map((msg) => {
-			const attachments = msg.attachments
-				? (typeof msg.attachments === 'string'
-						? JSON.parse(msg.attachments)
-						: msg.attachments)
-				: null;
-			const reactions = msg.reactions
-				? (typeof msg.reactions === 'string'
-						? JSON.parse(msg.reactions)
-						: msg.reactions)
-				: null;
-
-			return {
-      id: msg.id,
-      conversationId,
-      senderId: msg.sender_id,
-      contentType: msg.type,
-      content: msg.content,
-      attachments,
-      reactions,
-      createdAt: msg.created_at
-    };
-		});
-  } finally {
-    connection.release();
+  if (!res.Item || !Array.isArray(res.Item.messages)) {
+    return [];
   }
+
+  // Đảm bảo sắp xếp theo thời gian
+  const messages = res.Item.messages.slice().sort((a, b) => {
+    const aTime = a.createdAt || '';
+    const bTime = b.createdAt || '';
+    return aTime.localeCompare(bTime);
+  });
+
+  return messages.map((msg) => ({
+    id: msg.id,
+    conversationId,
+    senderId: msg.senderId,
+    contentType: msg.contentType,
+    content: msg.content,
+    attachments: msg.attachments || null,
+    reactions: msg.reactions || null,
+    createdAt: msg.createdAt
+  }));
 }
 
 module.exports = {

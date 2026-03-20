@@ -11,7 +11,7 @@ async function getMessagesForConversation(req, res) {
 
 async function getMessagesForChannel(req, res) {
   try {
-    const channelId = Number(req.params.channelId);
+    const channelId = req.params.channelId;
     const conversationId = `channel:${channelId}`;
     const messages = await messageService.getMessagesForConversation(conversationId);
     res.json(messages);

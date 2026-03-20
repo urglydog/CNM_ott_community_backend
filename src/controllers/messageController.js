@@ -9,6 +9,17 @@ async function getMessagesForConversation(req, res) {
   }
 }
 
+async function getMessagesForChannel(req, res) {
+  try {
+    const channelId = Number(req.params.channelId);
+    const conversationId = `channel:${channelId}`;
+    const messages = await messageService.getMessagesForConversation(conversationId);
+    res.json(messages);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+}
+
 async function sendMessage(req, res) {
   try {
     const message = await messageService.saveMessage(req.body);
@@ -20,5 +31,6 @@ async function sendMessage(req, res) {
 
 module.exports = {
   getMessagesForConversation,
+  getMessagesForChannel,
   sendMessage
 };

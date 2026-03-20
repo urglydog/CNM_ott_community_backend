@@ -4,7 +4,7 @@ async function createGroup(payload) {
   const connection = await pool.getConnection();
   try {
     const [result] = await connection.execute(
-      `INSERT INTO groups (name, description, type, created_by)
+      `INSERT INTO \`groups\` (name, description, type, created_by)
        VALUES (?, ?, ?, ?)` ,
       [
         payload.name,
@@ -25,7 +25,7 @@ async function createGroup(payload) {
     }
 
     const [rows] = await connection.execute(
-      'SELECT id, name, description, avatar_url, type, join_setting, member_count, created_by, created_at FROM groups WHERE id = ?',
+      'SELECT id, name, description, avatar_url, type, join_setting, member_count, created_by, created_at FROM `groups` WHERE id = ?',
       [groupId]
     );
     return rows[0];
@@ -38,7 +38,7 @@ async function listGroups() {
   const connection = await pool.getConnection();
   try {
     const [rows] = await connection.execute(
-      'SELECT id, name, description, avatar_url, type AS topic, member_count, created_by, created_at FROM groups ORDER BY id DESC'
+      'SELECT id, name, description, avatar_url, type AS topic, member_count, created_by, created_at FROM `groups` ORDER BY id DESC'
     );
 
     return rows.map((g) => ({
@@ -60,7 +60,7 @@ async function getGroupById(groupId) {
   const connection = await pool.getConnection();
   try {
     const [rows] = await connection.execute(
-      'SELECT id, name, description, avatar_url, type AS topic, member_count, created_by, created_at FROM groups WHERE id = ?',
+      'SELECT id, name, description, avatar_url, type AS topic, member_count, created_by, created_at FROM `groups` WHERE id = ?',
       [groupId]
     );
     if (!rows.length) return null;
@@ -102,7 +102,7 @@ async function getGroupsForUser(userId) {
     const [rows] = await connection.execute(
       `SELECT g.id, g.name, g.description, g.avatar_url, g.type AS topic, g.member_count, g.created_by, g.created_at
        FROM group_members gm
-       JOIN groups g ON gm.group_id = g.id
+       JOIN \`groups\` g ON gm.group_id = g.id
        WHERE gm.user_id = ?`,
       [userId]
     );

@@ -1,0 +1,608 @@
+{
+  "info": {
+    "name": "CNM OTT - Friend Request API",
+    "description": "Collection test cho API gửi/nhận lời mời kết bạn. Chạy theo thứ tự từ trên xuống để test toàn bộ luồng.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "BASE_URL",
+      "value": "http://localhost:4000",
+      "type": "string"
+    },
+    {
+      "key": "TOKEN_USER_A",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "TOKEN_USER_B",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "USER_A_ID",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "USER_B_ID",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "FRIEND_REQUEST_ID",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "01 - Register User A",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 201) {",
+              "    const body = pm.response.json();",
+              "    pm.collectionVariables.set('TOKEN_USER_A', body.token);",
+              "    pm.collectionVariables.set('USER_A_ID', body.user.id || body.user.userId || '');",
+              "    console.log('User A registered, token saved.');",
+              "} else {",
+              "    console.log('Register failed:', pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"username\": \"usera\",\n    \"password\": \"123456\",\n    \"email\": \"usera@example.com\",\n    \"displayName\": \"Nguyễn Văn A\",\n    \"phoneNumber\": \"0837930093\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/users/register",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "users", "register"]
+        }
+      }
+    },
+    {
+      "name": "02 - Register User B",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 201) {",
+              "    const body = pm.response.json();",
+              "    pm.collectionVariables.set('TOKEN_USER_B', body.token);",
+              "    pm.collectionVariables.set('USER_B_ID', body.user.id || body.user.userId || '');",
+              "    console.log('User B registered, token saved.');",
+              "} else {",
+              "    console.log('Register failed:', pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"username\": \"userb\",\n    \"password\": \"123456\",\n    \"email\": \"userb@example.com\",\n    \"displayName\": \"Trần Thị B\",\n    \"phoneNumber\": \"0909123456\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/users/register",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "users", "register"]
+        }
+      }
+    },
+    {
+      "name": "03 - Login User A",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    const body = pm.response.json();",
+              "    pm.collectionVariables.set('TOKEN_USER_A', body.token);",
+              "    pm.collectionVariables.set('USER_A_ID', body.user.id || body.user.userId || '');",
+              "    console.log('User A logged in, token:', body.token);",
+              "} else {",
+              "    console.log('Login failed:', pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"username\": \"usera\",\n    \"password\": \"123456\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/users/login",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "users", "login"]
+        }
+      }
+    },
+    {
+      "name": "04 - Login User B",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    const body = pm.response.json();",
+              "    pm.collectionVariables.set('TOKEN_USER_B', body.token);",
+              "    pm.collectionVariables.set('USER_B_ID', body.user.id || body.user.userId || '');",
+              "    console.log('User B logged in, token:', body.token);",
+              "} else {",
+              "    console.log('Login failed:', pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"username\": \"userb\",\n    \"password\": \"123456\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/users/login",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "users", "login"]
+        }
+      }
+    },
+    {
+      "name": "05 - Xem danh sách user (lấy ID)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "const users = pm.response.json();",
+              "if (Array.isArray(users)) {",
+              "    const b = users.find(u => u.username === 'userb');",
+              "    if (b) {",
+              "        const id = b.userId || b.id;",
+              "        pm.collectionVariables.set('USER_B_ID', id);",
+              "        console.log('User B ID:', id);",
+              "    }",
+              "} else {",
+              "    console.log('Response is not array:', pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_A}}"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/users/",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "users", ""]
+        }
+      }
+    },
+    {
+      "name": "06 - Gửi lời mời kết bạn (User A → User B)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 201) {",
+              "    const body = pm.response.json();",
+              "    pm.collectionVariables.set('FRIEND_REQUEST_ID', body.data.id);",
+              "    console.log('Friend request sent, ID:', body.data.id);",
+              "    console.log('Response:', JSON.stringify(body, null, 2));",
+              "} else {",
+              "    console.log('Send failed:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_A}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"receiverId\": \"{{USER_B_ID}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/request",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "request"]
+        }
+      }
+    },
+    {
+      "name": "07 - Lỗi: Gửi lại lời mời (đã tồn tại)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 409) {",
+              "    const body = pm.response.json();",
+              "    console.log('✓ Đúng: Server trả 409 khi gửi lời mời trùng -', body.message);",
+              "} else {",
+              "    console.log('✗ Không đúng: Server trả', pm.response.code, 'thay vì 409');",
+              "    console.log(pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_A}}",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"receiverId\": \"{{USER_B_ID}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/request",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "request"]
+        }
+      }
+    },
+    {
+      "name": "08 - Xem lời mời chờ của User B (phía người nhận)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    const body = pm.response.json();",
+              "    console.log('Tổng lời mời chờ:', body.count);",
+              "    if (body.data && body.data.length > 0) {",
+              "        const req = body.data.find(r => r.sender_username === 'usera');",
+              "        if (req) {",
+              "            pm.collectionVariables.set('FRIEND_REQUEST_ID', req.id);",
+              "            console.log('Lời mời từ User A - ID:', req.id);",
+              "        }",
+              "    }",
+              "    console.log(JSON.stringify(body, null, 2));",
+              "} else {",
+              "    console.log('Failed:', pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_B}}"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/pending",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "pending"]
+        }
+      }
+    },
+    {
+      "name": "09 - User B ĐỒNG Ý lời mời",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    const body = pm.response.json();",
+              "    console.log('✓ User B đã đồng ý kết bạn!');",
+              "    console.log(JSON.stringify(body, null, 2));",
+              "} else {",
+              "    console.log('Accept failed:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_B}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"requestId\": \"{{FRIEND_REQUEST_ID}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/accept",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "accept"]
+        }
+      }
+    },
+    {
+      "name": "10 - Lỗi: Accept lại lời mời đã accept",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 400) {",
+              "    console.log('✓ Đúng: Server trả 400 khi accept lời mời đã xử lý -', pm.response.json().message);",
+              "} else {",
+              "    console.log('Response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_B}}",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"requestId\": \"{{FRIEND_REQUEST_ID}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/accept",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "accept"]
+        }
+      }
+    },
+    {
+      "name": "11 - Lỗi: User A gửi lời mời cho chính mình",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 400) {",
+              "    console.log('✓ Đúng: Server trả 400 khi gửi cho chính mình -', pm.response.json().message);",
+              "} else {",
+              "    console.log('Response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_A}}",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"receiverId\": \"{{USER_A_ID}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/request",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "request"]
+        }
+      }
+    },
+    {
+      "name": "12 - Lỗi: Accept lời mời không tồn tại",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 404) {",
+              "    console.log('✓ Đúng: Server trả 404 khi request không tồn tại -', pm.response.json().message);",
+              "} else {",
+              "    console.log('Response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_B}}",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"requestId\": 99999\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/accept",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "accept"]
+        }
+      }
+    },
+    {
+      "name": "13 - User A gửi lời mời khác (User C để test từ chối)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 201) {",
+              "    const body = pm.response.json();",
+              "    pm.collectionVariables.set('FRIEND_REQUEST_ID', body.data.id);",
+              "    console.log('Friend request sent to User C, ID:', body.data.id);",
+              "} else if (pm.response.code === 400 && pm.response.text().includes('already')) {",
+              "    console.log('User C đã là bạn hoặc đã có lời mời, bỏ qua bước này.');",
+              "} else {",
+              "    console.log('Response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_A}}",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"receiverId\": \"{{USER_B_ID}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/request",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "request"]
+        }
+      }
+    },
+    {
+      "name": "14 - User B TỪ CHỐI lời mời",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    console.log('✓ User B đã từ chối lời mời!');",
+              "    console.log(JSON.stringify(pm.response.json(), null, 2));",
+              "} else {",
+              "    console.log('Reject failed:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{TOKEN_USER_B}}",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"requestId\": \"{{FRIEND_REQUEST_ID}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/reject",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "reject"]
+        }
+      }
+    },
+    {
+      "name": "15 - Lỗi: Gửi khi không có token",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 401) {",
+              "    console.log('✓ Đúng: Server trả 401 khi không có token');",
+              "} else {",
+              "    console.log('Response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"receiverId\": \"{{USER_B_ID}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/friends/request",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "friends", "request"]
+        }
+      }
+    }
+  ]
+}

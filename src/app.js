@@ -60,4 +60,6 @@ server.listen(PORT, () => {
 	console.log(`OTT Community backend is running on port ${PORT}`);
 });
 
+console.log("JWT_SECRET:", process.env.JWT_SECRET);
+console.log("JWT_REFRESH_SECRET:", process.env.JWT_REFRESH_SECRET);
 module.exports = { app, server, io };

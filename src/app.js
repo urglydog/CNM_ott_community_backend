@@ -12,8 +12,9 @@ const messageRoutes = require('./routes/messageRoutes');
 const channelRoutes = require('./routes/channelRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const statsRoutes = require('./routes/statsRoutes');
+const friendRoutes = require('./routes/friendRoutes');
 
-const { handleSocketConnection } = require('./services/socketService');
+const { handleSocketConnection, socketAuthMiddleware, initializeIO } = require('./services/socketService');
 
 const app = express();
 const server = http.createServer(app);
@@ -48,6 +49,13 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/channels', channelRoutes);
 app.use('/api/uploads', uploadRoutes);
 app.use('/api/stats', statsRoutes);
+app.use('/api/friends', friendRoutes);
+
+// Gắn middleware xác thực JWT vào mọi kết nối Socket trước khi cho phép client tham gia
+io.use(socketAuthMiddleware);
+
+// Khởi tạo io instance cho socketService (để dùng trong các hàm emit notification)
+initializeIO(io);
 
 io.on('connection', (socket) => {
 	handleSocketConnection(io, socket);

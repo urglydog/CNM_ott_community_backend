@@ -12,6 +12,15 @@
         { "name": "GET user by id", "request": { "method": "GET", "url": "{{baseUrl}}/api/users/1" } },
         { "name": "POST register", "request": { "method": "POST", "url": "{{baseUrl}}/api/users/register" } },
         { "name": "POST login", "request": { "method": "POST", "url": "{{baseUrl}}/api/users/login" } },
+        {
+          "name": "POST refresh token",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}" },
+            "url": "{{baseUrl}}/api/users/refresh"
+          }
+        },
         { "name": "PUT update user", "request": { "method": "PUT", "url": "{{baseUrl}}/api/users/1" } },
         { "name": "DELETE user", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/users/1" } }
       ]

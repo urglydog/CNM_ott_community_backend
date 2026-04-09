@@ -12,9 +12,13 @@ const messageRoutes = require('./routes/messageRoutes');
 const channelRoutes = require('./routes/channelRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const statsRoutes = require('./routes/statsRoutes');
+<<<<<<< HEAD
 const callRoutes = require('./routes/callRoutes');
+=======
+const friendRoutes = require('./routes/friendRoutes');
+>>>>>>> 1829d0dcac717294f04a4dc3745e1a743e7d9c47
 
-const { handleSocketConnection } = require('./services/socketService');
+const { handleSocketConnection, socketAuthMiddleware, initializeIO } = require('./services/socketService');
 
 const app = express();
 const server = http.createServer(app);
@@ -49,7 +53,17 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/channels', channelRoutes);
 app.use('/api/uploads', uploadRoutes);
 app.use('/api/stats', statsRoutes);
+<<<<<<< HEAD
 app.use('/api/calls', callRoutes);
+=======
+app.use('/api/friends', friendRoutes);
+
+// Gắn middleware xác thực JWT vào mọi kết nối Socket trước khi cho phép client tham gia
+io.use(socketAuthMiddleware);
+
+// Khởi tạo io instance cho socketService (để dùng trong các hàm emit notification)
+initializeIO(io);
+>>>>>>> 1829d0dcac717294f04a4dc3745e1a743e7d9c47
 
 io.on('connection', (socket) => {
 	handleSocketConnection(io, socket);
@@ -62,4 +76,6 @@ server.listen(PORT, () => {
 	console.log(`OTT Community backend is running on port ${PORT}`);
 });
 
+console.log("JWT_SECRET:", process.env.JWT_SECRET);
+console.log("JWT_REFRESH_SECRET:", process.env.JWT_REFRESH_SECRET);
 module.exports = { app, server, io };

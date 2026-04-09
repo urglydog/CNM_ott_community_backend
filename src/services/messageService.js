@@ -8,11 +8,15 @@ const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || 'ott_messages';
 // conversationId vẫn giữ dạng "channel:1" hoặc "direct:1" để tương thích với API hiện tại
 
 async function saveMessage(payload) {
+  // ── Validate ──────────────────────────────────────────────
   if (!payload.conversationId) {
     throw new Error('conversationId is required');
   }
   if (!payload.senderId) {
     throw new Error('senderId is required');
+  }
+  if (!payload.content || !payload.content.trim()) {
+    throw new Error('content is required');
   }
 
   const createdAt = new Date().toISOString();
@@ -22,7 +26,7 @@ async function saveMessage(payload) {
     id,
     senderId: payload.senderId,
     contentType: payload.contentType || 'text',
-    content: payload.content || '',
+    content: payload.content.trim(),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
     createdAt

@@ -6,87 +6,312 @@
   },
   "item": [
     {
+      "name": "OTT File Attachments",
+      "item": [
+        {
+          "name": "POST get presigned upload URL",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"keyPrefix\": \"uploads\",\n  \"contentType\": \"image/png\"\n}"
+            },
+            "url": "{{baseUrl}}/api/uploads/presigned-url",
+            "description": "Step 1: create a presigned PUT URL. Save uploadUrl, uploadKey, and uploadBucket into environment variables."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const json = pm.response.json();",
+                  "pm.environment.set('uploadUrl', json.uploadUrl);",
+                  "pm.environment.set('uploadKey', json.key);",
+                  "pm.environment.set('uploadBucket', json.bucket);",
+                  "pm.test('presigned url returned', function () {",
+                  "  pm.expect(json.uploadUrl).to.be.a('string');",
+                  "  pm.expect(json.key).to.be.a('string');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "PUT upload file to S3",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "image/png" }],
+            "body": {
+              "mode": "file"
+            },
+            "url": "{{uploadUrl}}",
+            "description": "Step 2: use the uploadUrl returned by the previous request. In Postman, set Body to binary/file and choose a local file manually."
+          }
+        },
+        {
+          "name": "POST send attached channel message",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"conversationId\": \"channel:1\",\n  \"senderId\": 12,\n  \"contentType\": \"image\",\n  \"content\": \"\",\n  \"attachments\": [\n    {\n      \"url\": \"https://{{uploadBucket}}.s3.ap-southeast-1.amazonaws.com/{{uploadKey}}\",\n      \"key\": \"{{uploadKey}}\",\n      \"name\": \"sample-image.png\",\n      \"mimeType\": \"image/png\",\n      \"size\": 245678\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/api/messages",
+            "description": "Step 3: save the uploaded file as a message attachment. You can also switch this request to /api/messages/channel or /api/messages/direct."
+          }
+        },
+        {
+          "name": "GET verify channel messages",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/messages/conversations/channel:1",
+            "description": "Step 4: confirm that the attached message was persisted in DynamoDB."
+          }
+        }
+      ]
+    },
+    {
       "name": "Users",
       "item": [
-        { "name": "GET all users", "request": { "method": "GET", "url": "{{baseUrl}}/api/users" } },
-        { "name": "GET user by id", "request": { "method": "GET", "url": "{{baseUrl}}/api/users/1" } },
-        { "name": "POST register", "request": { "method": "POST", "url": "{{baseUrl}}/api/users/register" } },
-        { "name": "POST login", "request": { "method": "POST", "url": "{{baseUrl}}/api/users/login" } },
-        { "name": "PUT update user", "request": { "method": "PUT", "url": "{{baseUrl}}/api/users/1" } },
-        { "name": "DELETE user", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/users/1" } }
+        {
+          "name": "GET all users",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/users" }
+        },
+        {
+          "name": "GET user by id",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/users/1" }
+        },
+        {
+          "name": "POST register",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/users/register"
+          }
+        },
+        {
+          "name": "POST login",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/users/login" }
+        },
+        {
+          "name": "PUT update user",
+          "request": { "method": "PUT", "url": "{{baseUrl}}/api/users/1" }
+        },
+        {
+          "name": "DELETE user",
+          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/users/1" }
+        }
       ]
     },
     {
       "name": "Relationships",
       "item": [
-        { "name": "GET friends", "request": { "method": "GET", "url": "{{baseUrl}}/api/relationships" } },
-        { "name": "POST add friend", "request": { "method": "POST", "url": "{{baseUrl}}/api/relationships" } },
-        { "name": "PUT accept/block", "request": { "method": "PUT", "url": "{{baseUrl}}/api/relationships/1" } },
-        { "name": "DELETE unfriend", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/relationships/1" } }
+        {
+          "name": "GET friends",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/relationships" }
+        },
+        {
+          "name": "POST add friend",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/relationships"
+          }
+        },
+        {
+          "name": "PUT accept/block",
+          "request": {
+            "method": "PUT",
+            "url": "{{baseUrl}}/api/relationships/1"
+          }
+        },
+        {
+          "name": "DELETE unfriend",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/api/relationships/1"
+          }
+        }
       ]
     },
     {
       "name": "Groups",
       "item": [
-        { "name": "GET all groups", "request": { "method": "GET", "url": "{{baseUrl}}/api/groups" } },
-        { "name": "GET group detail", "request": { "method": "GET", "url": "{{baseUrl}}/api/groups/1" } },
-        { "name": "POST create group", "request": { "method": "POST", "url": "{{baseUrl}}/api/groups" } },
-        { "name": "PUT update group", "request": { "method": "PUT", "url": "{{baseUrl}}/api/groups/1" } },
-        { "name": "DELETE group", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/groups/1" } }
+        {
+          "name": "GET all groups",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/groups" }
+        },
+        {
+          "name": "GET group detail",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/groups/1" }
+        },
+        {
+          "name": "POST create group",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/groups" }
+        },
+        {
+          "name": "PUT update group",
+          "request": { "method": "PUT", "url": "{{baseUrl}}/api/groups/1" }
+        },
+        {
+          "name": "DELETE group",
+          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/groups/1" }
+        }
       ]
     },
     {
       "name": "Group Members",
       "item": [
-        { "name": "GET members", "request": { "method": "GET", "url": "{{baseUrl}}/api/groups/1/members" } },
-        { "name": "POST add member", "request": { "method": "POST", "url": "{{baseUrl}}/api/groups/1/members" } },
-        { "name": "PUT update role", "request": { "method": "PUT", "url": "{{baseUrl}}/api/groups/1/members/2" } },
-        { "name": "DELETE remove member", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/groups/1/members/2" } }
+        {
+          "name": "GET members",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/groups/1/members"
+          }
+        },
+        {
+          "name": "POST add member",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/groups/1/members"
+          }
+        },
+        {
+          "name": "PUT update role",
+          "request": {
+            "method": "PUT",
+            "url": "{{baseUrl}}/api/groups/1/members/2"
+          }
+        },
+        {
+          "name": "DELETE remove member",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/api/groups/1/members/2"
+          }
+        }
       ]
     },
     {
       "name": "Channels",
       "item": [
-        { "name": "GET channels", "request": { "method": "GET", "url": "{{baseUrl}}/api/groups/1/channels" } },
-        { "name": "POST create channel", "request": { "method": "POST", "url": "{{baseUrl}}/api/groups/1/channels" } },
-        { "name": "DELETE channel", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/channels/1" } }
+        {
+          "name": "GET channels",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/groups/1/channels"
+          }
+        },
+        {
+          "name": "POST create channel",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/groups/1/channels"
+          }
+        },
+        {
+          "name": "DELETE channel",
+          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/channels/1" }
+        }
       ]
     },
     {
       "name": "Direct Chats",
       "item": [
-        { "name": "GET chats", "request": { "method": "GET", "url": "{{baseUrl}}/api/direct-chats" } },
-        { "name": "POST create chat", "request": { "method": "POST", "url": "{{baseUrl}}/api/direct-chats" } }
+        {
+          "name": "GET chats",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/direct-chats" }
+        },
+        {
+          "name": "POST create chat",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/direct-chats" }
+        }
       ]
     },
     {
       "name": "Messages",
       "item": [
-        { "name": "GET messages by channel", "request": { "method": "GET", "url": "{{baseUrl}}/api/messages/channel/1" } },
-        { "name": "GET messages by direct chat", "request": { "method": "GET", "url": "{{baseUrl}}/api/messages/direct/1" } },
-        { "name": "POST send channel message", "request": { "method": "POST", "url": "{{baseUrl}}/api/messages/channel" } },
-        { "name": "POST send direct message", "request": { "method": "POST", "url": "{{baseUrl}}/api/messages/direct" } },
-        { "name": "PUT reaction", "request": { "method": "PUT", "url": "{{baseUrl}}/api/messages/1/reactions" } },
-        { "name": "DELETE message", "request": { "method": "DELETE", "url": "{{baseUrl}}/api/messages/1" } }
+        {
+          "name": "GET messages by channel",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/messages/channel/1"
+          }
+        },
+        {
+          "name": "GET messages by direct chat",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/messages/direct/1"
+          }
+        },
+        {
+          "name": "POST send channel message",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/messages/channel"
+          }
+        },
+        {
+          "name": "POST send direct message",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/messages/direct"
+          }
+        },
+        {
+          "name": "PUT reaction",
+          "request": {
+            "method": "PUT",
+            "url": "{{baseUrl}}/api/messages/1/reactions"
+          }
+        },
+        {
+          "name": "DELETE message",
+          "request": { "method": "DELETE", "url": "{{baseUrl}}/api/messages/1" }
+        }
       ]
     },
     {
       "name": "Read Receipts",
       "item": [
-        { "name": "GET read status", "request": { "method": "GET", "url": "{{baseUrl}}/api/read-receipts" } },
-        { "name": "POST mark as read", "request": { "method": "POST", "url": "{{baseUrl}}/api/read-receipts" } }
+        {
+          "name": "GET read status",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/read-receipts" }
+        },
+        {
+          "name": "POST mark as read",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/read-receipts"
+          }
+        }
       ]
     },
     {
       "name": "Calls",
       "item": [
-        { "name": "GET calls", "request": { "method": "GET", "url": "{{baseUrl}}/api/calls" } },
-        { "name": "POST create call", "request": { "method": "POST", "url": "{{baseUrl}}/api/calls" } },
-        { "name": "PUT end call", "request": { "method": "PUT", "url": "{{baseUrl}}/api/calls/1" } }
+        {
+          "name": "GET calls",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/calls" }
+        },
+        {
+          "name": "POST create call",
+          "request": { "method": "POST", "url": "{{baseUrl}}/api/calls" }
+        },
+        {
+          "name": "PUT end call",
+          "request": { "method": "PUT", "url": "{{baseUrl}}/api/calls/1" }
+        }
       ]
     }
   ],
   "variable": [
-    { "key": "baseUrl", "value": "http://localhost:4000" }
+    { "key": "baseUrl", "value": "http://localhost:4000" },
+    { "key": "uploadUrl", "value": "" },
+    { "key": "uploadKey", "value": "" },
+    { "key": "uploadBucket", "value": "" }
   ]
 }

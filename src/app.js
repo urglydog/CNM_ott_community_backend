@@ -12,6 +12,7 @@ const messageRoutes = require('./routes/messageRoutes');
 const channelRoutes = require('./routes/channelRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const statsRoutes = require('./routes/statsRoutes');
+const callRoutes = require('./routes/callRoutes');
 
 const { handleSocketConnection } = require('./services/socketService');
 
@@ -48,12 +49,13 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/channels', channelRoutes);
 app.use('/api/uploads', uploadRoutes);
 app.use('/api/stats', statsRoutes);
+app.use('/api/calls', callRoutes);
 
 io.on('connection', (socket) => {
 	handleSocketConnection(io, socket);
 });
 
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT;
 
 server.listen(PORT, () => {
 	// eslint-disable-next-line no-console

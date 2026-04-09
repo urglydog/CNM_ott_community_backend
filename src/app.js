@@ -12,7 +12,11 @@ const messageRoutes = require('./routes/messageRoutes');
 const channelRoutes = require('./routes/channelRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
 const statsRoutes = require('./routes/statsRoutes');
+<<<<<<< HEAD
+const callRoutes = require('./routes/callRoutes');
+=======
 const friendRoutes = require('./routes/friendRoutes');
+>>>>>>> 1829d0dcac717294f04a4dc3745e1a743e7d9c47
 
 const { handleSocketConnection, socketAuthMiddleware, initializeIO } = require('./services/socketService');
 
@@ -49,6 +53,9 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/channels', channelRoutes);
 app.use('/api/uploads', uploadRoutes);
 app.use('/api/stats', statsRoutes);
+<<<<<<< HEAD
+app.use('/api/calls', callRoutes);
+=======
 app.use('/api/friends', friendRoutes);
 
 // Gắn middleware xác thực JWT vào mọi kết nối Socket trước khi cho phép client tham gia
@@ -56,12 +63,13 @@ io.use(socketAuthMiddleware);
 
 // Khởi tạo io instance cho socketService (để dùng trong các hàm emit notification)
 initializeIO(io);
+>>>>>>> 1829d0dcac717294f04a4dc3745e1a743e7d9c47
 
 io.on('connection', (socket) => {
 	handleSocketConnection(io, socket);
 });
 
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT;
 
 server.listen(PORT, () => {
 	// eslint-disable-next-line no-console

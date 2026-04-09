@@ -75,6 +75,38 @@ function handleSocketConnection(io, socket) {
     socket.to(roomId).emit('user_joined', { userId, roomId });
   });
 
+<<<<<<< HEAD
+  socket.on('call-request', (payload = {}) => {
+    const { conversationId } = payload;
+    if (!conversationId) return;
+
+    // In a 1-1 room, this forwards the incoming call signal to the other peer.
+    socket.to(conversationId).emit('incoming-call', payload);
+  });
+
+  socket.on('call-accepted', (payload = {}) => {
+    const { conversationId } = payload;
+    if (!conversationId) return;
+
+    socket.to(conversationId).emit('call-accepted', payload);
+  });
+
+  socket.on('call-rejected', (payload = {}) => {
+    const { conversationId } = payload;
+    if (!conversationId) return;
+
+    socket.to(conversationId).emit('call-rejected', payload);
+  });
+
+  socket.on('end-call', (payload = {}) => {
+    const { conversationId } = payload;
+    if (!conversationId) return;
+
+    socket.to(conversationId).emit('end-call', payload);
+  });
+
+  socket.on('send-message', async (payload, callback) => {
+=======
   // --- Rời phòng chat ---
   socket.on('leave_room', ({ roomId }) => {
     if (!roomId) return;
@@ -91,6 +123,7 @@ function handleSocketConnection(io, socket) {
       return callback({ ok: false, error: 'roomId and content are required' });
     }
 
+>>>>>>> 1829d0dcac717294f04a4dc3745e1a743e7d9c47
     try {
       const entityPayload = {
         conversationId: payload.roomId,

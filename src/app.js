@@ -6,19 +6,19 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const path = require('path');
 
-const userRoutes = require('./routes/userRoutes');
-const groupRoutes = require('./routes/groupRoutes');
-const messageRoutes = require('./routes/messageRoutes');
-const channelRoutes = require('./routes/channelRoutes');
-const uploadRoutes = require('./routes/uploadRoutes');
-const statsRoutes = require('./routes/statsRoutes');
-<<<<<<< HEAD
-const callRoutes = require('./routes/callRoutes');
-=======
-const friendRoutes = require('./routes/friendRoutes');
->>>>>>> 1829d0dcac717294f04a4dc3745e1a743e7d9c47
+// Modular Routes
+const authRoutes = require('./modules/auth/authRoutes');
+const userRoutes = require('./modules/users/userRoutes');
+const friendRoutes = require('./modules/users/friendRoutes');
+const messageRoutes = require('./modules/chat/messageRoutes');
+const groupRoutes = require('./modules/chat/groupRoutes');
+const channelRoutes = require('./modules/chat/channelRoutes');
+const callRoutes = require('./modules/chat/callRoutes');
+const uploadRoutes = require('./modules/media/uploadRoutes');
+const statsRoutes = require('./modules/stats/statsRoutes');
 
-const { handleSocketConnection, socketAuthMiddleware, initializeIO } = require('./services/socketService');
+// Socket Handler
+const { handleSocketConnection, socketAuthMiddleware, initializeIO } = require('./socket/socketHandler');
 
 const app = express();
 const server = http.createServer(app);
@@ -26,56 +26,52 @@ const server = http.createServer(app);
 const allowedOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
 
 const io = new Server(server, {
-	cors: {
-		origin: allowedOrigin,
-		methods: ['GET', 'POST']
-	}
+  cors: {
+    origin: allowedOrigin,
+    methods: ['GET', 'POST']
+  }
 });
 
 app.use(cors({
-	origin: allowedOrigin,
-	credentials: true
+  origin: allowedOrigin,
+  credentials: true
 }));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Serve static uploads if you later proxy S3 or store local files (optional)
+// Serve static uploads
 app.use('/public', express.static(path.join(__dirname, '..', 'public')));
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 app.get('/health', (req, res) => {
-	res.json({ status: 'ok', service: 'ott-community-backend' });
+  res.json({ status: 'ok', service: 'ott-community-backend' });
 });
 
+// API Routes initialization
+app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
-app.use('/api/groups', groupRoutes);
+app.use('/api/friends', friendRoutes);
 app.use('/api/messages', messageRoutes);
+app.use('/api/groups', groupRoutes);
 app.use('/api/channels', channelRoutes);
+app.use('/api/calls', callRoutes);
 app.use('/api/uploads', uploadRoutes);
 app.use('/api/stats', statsRoutes);
-<<<<<<< HEAD
-app.use('/api/calls', callRoutes);
-=======
-app.use('/api/friends', friendRoutes);
 
-// Gắn middleware xác thực JWT vào mọi kết nối Socket trước khi cho phép client tham gia
+// Socket.io Middleware and Initialization
 io.use(socketAuthMiddleware);
-
-// Khởi tạo io instance cho socketService (để dùng trong các hàm emit notification)
 initializeIO(io);
->>>>>>> 1829d0dcac717294f04a4dc3745e1a743e7d9c47
 
 io.on('connection', (socket) => {
-	handleSocketConnection(io, socket);
+  handleSocketConnection(io, socket);
 });
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 4000;
 
 server.listen(PORT, () => {
-	// eslint-disable-next-line no-console
-	console.log(`OTT Community backend is running on port ${PORT}`);
+  // eslint-disable-next-line no-console
+  console.log(`OTT Community backend (Restructured) is running on port ${PORT}`);
 });
 
-console.log("JWT_SECRET:", process.env.JWT_SECRET);
-console.log("JWT_REFRESH_SECRET:", process.env.JWT_REFRESH_SECRET);
 module.exports = { app, server, io };

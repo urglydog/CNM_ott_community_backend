@@ -9,8 +9,25 @@ const { s3Client } = require("../../config/awsConfig");
 const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
 const FILE_MESSAGES_TABLE = process.env.DYNAMODB_TABLE_NAME || MESSAGES_TABLE;
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME;
+const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
 
 // conversationId vẫn giữ dạng "channel:1" hoặc "direct:1" để tương thích với API hiện tại
+
+async function enrichSenderInfo(senderId) {
+  try {
+    const result = await ddbDocClient.send(new GetCommand({
+      TableName: USERS_TABLE,
+      Key: { userId: String(senderId) }
+    }));
+    const u = result.Item;
+    return {
+      senderDisplayName: u?.display_name || u?.username || String(senderId),
+      senderAvatarUrl: u?.avatar_url || null,
+    };
+  } catch {
+    return { senderDisplayName: String(senderId), senderAvatarUrl: null };
+  }
+}
 
 async function saveMessage(payload) {
   // ── Validate ──────────────────────────────────────────────
@@ -79,12 +96,10 @@ async function saveMessage(payload) {
 async function getMessagesForConversation(conversationId) {
   if (!conversationId) return [];
 
-  const res = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId },
-    }),
-  );
+  const res = await ddbDocClient.send(new GetCommand({
+    TableName: MESSAGES_TABLE,
+    Key: { conversationId },
+  }));
 
   if (!res.Item || !Array.isArray(res.Item.messages)) {
     return [];
@@ -97,16 +112,26 @@ async function getMessagesForConversation(conversationId) {
     return aTime.localeCompare(bTime);
   });
 
-  return messages.map((msg) => ({
-    id: msg.id,
-    conversationId,
-    senderId: msg.senderId,
-    contentType: msg.contentType,
-    content: msg.content,
-    attachments: msg.attachments || null,
-    reactions: msg.reactions || null,
-    createdAt: msg.createdAt,
-  }));
+  // Enrich mỗi tin nhắn với displayName/avatarUrl của người gửi
+  const enriched = await Promise.all(
+    messages.map(async (msg) => {
+      const info = await enrichSenderInfo(msg.senderId);
+      return {
+        id: msg.id,
+        conversationId,
+        senderId: msg.senderId,
+        contentType: msg.contentType,
+        content: msg.content,
+        attachments: msg.attachments || null,
+        reactions: msg.reactions || null,
+        createdAt: msg.createdAt,
+        senderDisplayName: info.senderDisplayName,
+        senderAvatarUrl: info.senderAvatarUrl,
+      };
+    })
+  );
+
+  return enriched;
 }
 
 function resolveAttachmentType(mimetype) {

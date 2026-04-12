@@ -148,10 +148,62 @@ async function getGroupsForUser(userId) {
     }));
 }
 
+const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
+
+/**
+ * Lấy danh sách thành viên nhóm kèm displayName / username.
+ * Trả về mảng { userId, displayName, username, avatarUrl, role }
+ */
+async function getGroupMembers(groupId) {
+  const targetGroupId = String(groupId);
+
+  // Scan tất cả member của nhóm
+  const res = await ddbDocClient.send(new ScanCommand({
+    TableName: MEMBERS_TABLE,
+    FilterExpression: 'groupId = :gid',
+    ExpressionAttributeValues: { ':gid': targetGroupId }
+  }));
+
+  const members = res.Items || [];
+
+  // Đồng thời lấy thông tin user từ bảng ott_users
+  const userIds = members.map((m) => m.userId).filter(Boolean);
+  const userMap = {};
+
+  if (userIds.length > 0) {
+    // Batch get bằng Scan để tránh nhiều GetCommand
+    const userRes = await ddbDocClient.send(new ScanCommand({
+      TableName: USERS_TABLE,
+      FilterExpression: `userId IN (${userIds.map((_, i) => `:uid${i}`).join(',')})`,
+      ExpressionAttributeValues: Object.fromEntries(
+        userIds.map((uid, i) => [`:uid${i}`, uid])
+      )
+    }));
+    for (const u of userRes.Items || []) {
+      userMap[u.userId] = u;
+    }
+  }
+
+  return members.map((m) => {
+    const u = userMap[m.userId] || {};
+    return {
+      userId: m.userId,
+      displayName: u.display_name || u.username || m.userId,
+      username: u.username || "",
+      avatarUrl: u.avatar_url || null,
+      role: m.role || "member",
+    };
+  });
+}
+
 module.exports = {
   createGroup,
   listGroups,
   getGroupById,
   addMemberToGroup,
-  getGroupsForUser
+  getGroupsForUser,
+  getGroupMembers,
+  getInviteLink,
+  joinGroupByInviteCode,
+  debugGetMembers
 };

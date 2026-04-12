@@ -42,6 +42,15 @@ async function addMemberToGroup(req, res) {
   }
 }
 
+async function getGroupMembers(req, res) {
+  try {
+    const members = await groupService.getGroupMembers(req.params.groupId);
+    res.json(members);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+}
+
 async function getGroupsForUser(req, res) {
   try {
     const authUserId = req.user?.userId;
@@ -118,6 +127,7 @@ module.exports = {
   listGroups,
   getGroupById,
   addMemberToGroup,
+  getGroupMembers,
   getGroupsForUser,
   getInviteInfo,
   joinGroup,

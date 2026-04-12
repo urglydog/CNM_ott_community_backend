@@ -44,10 +44,17 @@ async function addMemberToGroup(req, res) {
 
 async function getGroupMembers(req, res) {
   try {
-    const members = await groupService.getGroupMembers(req.params.groupId);
+    const groupId = req.params.groupId;
+    console.log('[getGroupMembers] Dang tim members cho Group ID:', groupId);
+
+    const members = await groupService.getGroupMembers(groupId);
     res.json(members);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('[getGroupMembers] Loi lay danh sach thanh vien nhom:', error);
+    res.status(500).json({
+      message: 'Loi server',
+      error: error.message,
+    });
   }
 }
 

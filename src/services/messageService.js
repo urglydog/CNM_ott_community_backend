@@ -66,9 +66,15 @@ async function saveMessage(payload) {
   const conversationId = buildConversationIdFromPayload(payload);
   if (!conversationId) {
     throw new Error("conversationId is required");
+  // ── Validate ──────────────────────────────────────────────
+  if (!payload.conversationId) {
+    throw new Error('conversationId is required');
   }
   if (!payload.senderId) {
     throw new Error("senderId is required");
+  }
+  if (!payload.content || !payload.content.trim()) {
+    throw new Error('content is required');
   }
 
   const attachments = normalizeAttachments(payload.attachments);
@@ -84,6 +90,9 @@ async function saveMessage(payload) {
     contentType,
     content,
     attachments,
+    contentType: payload.contentType || 'text',
+    content: payload.content.trim(),
+    attachments: payload.attachments || null,
     reactions: payload.reactions || null,
     createdAt,
   };

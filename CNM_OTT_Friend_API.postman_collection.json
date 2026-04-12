@@ -34,6 +34,26 @@
       "key": "FRIEND_REQUEST_ID",
       "value": "",
       "type": "string"
+    },
+    {
+      "key": "TEST_FILE_PATH",
+      "value": "D:/test/sample.jpg",
+      "type": "string"
+    },
+    {
+      "key": "MESSAGE_SENDER_ID",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "MESSAGE_RECEIVER_ID",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "MESSAGE_CHANNEL_ID",
+      "value": "",
+      "type": "string"
     }
   ],
   "item": [
@@ -601,6 +621,96 @@
           "raw": "{{BASE_URL}}/api/friends/request",
           "host": ["{{BASE_URL}}"],
           "path": ["api", "friends", "request"]
+        }
+      }
+    },
+    {
+      "name": "16 - Send File Message (1-1)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 201) {",
+              "    const body = pm.response.json();",
+              "    console.log('✓ Send file message success');",
+              "    console.log(JSON.stringify(body, null, 2));",
+              "} else {",
+              "    console.log('Send file message failed:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "{{TEST_FILE_PATH}}"
+            },
+            {
+              "key": "sender_id",
+              "value": "{{MESSAGE_SENDER_ID}}",
+              "type": "text"
+            },
+            {
+              "key": "receiver_id",
+              "value": "{{MESSAGE_RECEIVER_ID}}",
+              "type": "text"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/messages/file",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "messages", "file"]
+        }
+      }
+    },
+    {
+      "name": "17 - Send File Message Error (missing file)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 400) {",
+              "    console.log('✓ Đúng: thiếu file -> 400');",
+              "    console.log(pm.response.text());",
+              "} else {",
+              "    console.log('Response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "sender_id",
+              "value": "{{MESSAGE_SENDER_ID}}",
+              "type": "text"
+            },
+            {
+              "key": "receiver_id",
+              "value": "{{MESSAGE_RECEIVER_ID}}",
+              "type": "text"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{BASE_URL}}/api/messages/file",
+          "host": ["{{BASE_URL}}"],
+          "path": ["api", "messages", "file"]
         }
       }
     }

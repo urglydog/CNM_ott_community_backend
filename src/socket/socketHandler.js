@@ -1,5 +1,31 @@
+const { ddbDocClient } = require('../config/awsConfig');
+const { PutCommand, GetCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
 const { saveMessage } = require('../modules/chat/messageService');
 const { verifyToken } = require('../common/utils/jwt');
+
+const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || 'ott_group_members';
+const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
+
+/**
+ * Lấy displayName và avatarUrl của user từ bảng ott_users.
+ * @param {string} userId
+ * @returns {Promise<{displayName: string, avatarUrl: string|null}>}
+ */
+async function getUserDisplayInfo(userId) {
+  try {
+    const result = await ddbDocClient.send(new GetCommand({
+      TableName: USERS_TABLE,
+      Key: { userId: String(userId) }
+    }));
+    const u = result.Item;
+    return {
+      displayName: u?.display_name || u?.username || String(userId),
+      avatarUrl: u?.avatar_url || null,
+    };
+  } catch {
+    return { displayName: String(userId), avatarUrl: null };
+  }
+}
 
 /**
  * In-memory map: userId (string) -> Set of socket.id
@@ -22,6 +48,65 @@ function initializeIO(io) {
  */
 function getIO() {
   return ioInstance;
+}
+
+/**
+ * ============================================================
+ * HELPER: Kiểm tra user có phải thành viên nhóm hay không
+ * Bảng ott_group_members có composite key (groupId, userId)
+ * ============================================================
+ * @param {string} groupId
+ * @param {string} userId
+ * @returns {Promise<boolean>}
+ */
+/**
+ * ============================================================
+ * HELPER: Kiểm tra user có phải thành viên nhóm hay không
+ * Bảng ott_group_members có composite key (groupId, userId)
+ *
+ * Xử lý 2 loại room:
+ *  - Group:   roomId là groupId → Query bảng ott_group_members
+ *  - DM:      roomId format "dm:userA:userB" → parse & verify user là 1 trong 2 participant
+ * ============================================================
+ * @param {string} groupId
+ * @param {string} userId
+ * @returns {Promise<boolean>}
+ */
+async function checkUserInGroup(groupId, userId) {
+  const targetGroupId = String(groupId);
+  const targetUserId = String(userId);
+
+  // --- DM conversation: "dm:userA:userB" ---
+  // Cho phép join/send nếu user là 1 trong 2 participant
+  if (targetGroupId.startsWith('dm:')) {
+    const parts = targetGroupId.split(':');
+    if (parts.length >= 3) {
+      const participantA = parts[1];
+      const participantB = parts[2];
+      return targetUserId === participantA || targetUserId === participantB;
+    }
+    // malformed dm: treat as not a member
+    console.warn(`[checkUserInGroup] Malformed DM roomId: ${targetGroupId}`);
+    return false;
+  }
+
+  // --- Group: Query bảng ott_group_members với composite key (groupId, userId) ---
+  try {
+    const result = await ddbDocClient.send(new QueryCommand({
+      TableName: MEMBERS_TABLE,
+      KeyConditionExpression: 'groupId = :gid AND userId = :uid',
+      ExpressionAttributeValues: {
+        ':gid': targetGroupId,
+        ':uid': targetUserId
+      },
+      Limit: 1
+    }));
+
+    return !!(result.Items && result.Items.length > 0);
+  } catch (error) {
+    console.error(`[checkUserInGroup] DynamoDB error for group=${targetGroupId} user=${targetUserId}:`, error.message);
+    return false;
+  }
 }
 
 /**
@@ -62,57 +147,102 @@ function handleSocketConnection(io, socket) {
     onlineUsers.get(userId).add(socket.id);
   }
 
-  // --- Tham gia phòng chat (room) ---
-  socket.on('join_room', ({ roomId }) => {
-    if (!roomId) return;
+  // ============================================================
+  // JOIN ROOM — có kiểm tra membership
+  // ============================================================
+  socket.on('join_room', async ({ roomId }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, 'roomId is required');
+      return;
+    }
 
+    if (!userId) {
+      _respond(callback, false, 'User not authenticated');
+      return;
+    }
+
+    // --- Kiểm tra membership trước khi cho join ---
+    const isMember = await checkUserInGroup(roomId, userId);
+
+    if (!isMember) {
+      console.warn(`[join_room] User ${userId} denied: not a member of group ${roomId}`);
+      _respond(callback, false, 'Access denied: you are not a member of this group');
+      return;
+    }
+
+    // --- Cho phép join ---
     socket.join(roomId);
+    console.log(`[join_room] User ${userId} joined room ${roomId}`);
 
     // Thông báo cho client biết đã tham gia thành công
     socket.emit('room_joined', { roomId });
 
-    // Tùy chọn: thông báo cho các thành viên khác trong phòng
+    // Thông báo cho các thành viên khác trong phòng
     socket.to(roomId).emit('user_joined', { userId, roomId });
+
+    _respond(callback, true, null, { roomId });
   });
 
-  // --- Call related events ---
-  socket.on('call-request', (payload = {}) => {
-    const { conversationId } = payload;
-    if (!conversationId) return;
-    socket.to(conversationId).emit('incoming-call', payload);
+  // --- Tham gia phòng chat (legacy alias) ---
+  // KHÔNG dùng socket.emit vì emit không truyền callback qua chain,
+  // dẫn đến lỗi rơi vào "No callback provided" thay vì phản hồi client.
+  // Inline thẳng logic kiểm tra membership.
+  socket.on('join-group', async ({ groupId }, callback) => {
+    if (!groupId) {
+      _respond(callback, false, 'groupId is required');
+      return;
+    }
+
+    if (!userId) {
+      _respond(callback, false, 'User not authenticated');
+      return;
+    }
+
+    const isMember = await checkUserInGroup(groupId, userId);
+
+    if (!isMember) {
+      console.warn(`[join-group] User ${userId} denied from group ${groupId}`);
+      _respond(callback, false, 'Access denied: you are not a member of this group');
+      return;
+    }
+
+    socket.join(groupId);
+    console.log(`[join-group] User ${userId} joined group ${groupId}`);
+
+    socket.emit('room_joined', { roomId: groupId });
+    socket.to(groupId).emit('user_joined', { userId, roomId: groupId });
+
+    _respond(callback, true, null, { roomId: groupId });
   });
 
-  socket.on('call-accepted', (payload = {}) => {
-    const { conversationId } = payload;
-    if (!conversationId) return;
-    socket.to(conversationId).emit('call-accepted', payload);
-  });
-
-  socket.on('call-rejected', (payload = {}) => {
-    const { conversationId } = payload;
-    if (!conversationId) return;
-    socket.to(conversationId).emit('call-rejected', payload);
-  });
-
-  socket.on('end-call', (payload = {}) => {
-    const { conversationId } = payload;
-    if (!conversationId) return;
-    socket.to(conversationId).emit('end-call', payload);
-  });
-
-  // --- Rời phòng chat ---
+  // ============================================================
+  // LEAVE ROOM
+  // ============================================================
   socket.on('leave_room', ({ roomId }) => {
     if (!roomId) return;
-
     socket.leave(roomId);
     socket.to(roomId).emit('user_left', { userId, roomId });
   });
 
-  // --- Gửi tin nhắn (Boundary: nhận payload từ client, trích sender_id từ auth) ---
+  // ============================================================
+  // SEND MESSAGE — có kiểm tra membership
+  // ============================================================
   socket.on('send_message', async (payload, callback) => {
     // Payload: { roomId, content, contentType, attachments }
     if (!payload.roomId || !payload.content?.trim()) {
-      return callback({ ok: false, error: 'roomId and content are required' });
+      return _respond(callback, false, 'roomId and content are required');
+    }
+
+    if (!userId) {
+      return _respond(callback, false, 'User not authenticated');
+    }
+
+    // --- Kiểm tra membership trước khi lưu tin nhắn ---
+    const isMember = await checkUserInGroup(payload.roomId, userId);
+
+    if (!isMember) {
+      console.warn(`[send_message] User ${userId} tried to send in non-member group ${payload.roomId}`);
+      return _respond(callback, false, 'Not a member of this group');
     }
 
     try {
@@ -126,17 +256,36 @@ function handleSocketConnection(io, socket) {
 
       const savedMessage = await saveMessage(entityPayload);
 
-      // Broadcast tin nhắn tới tất cả thành viên trong phòng (bao gồm cả người nhận)
-      io.to(payload.roomId).emit('receive_message', savedMessage);
+      // Enrich với displayName/avatarUrl để frontend hiển thị đúng trong group chat
+      const senderInfo = await getUserDisplayInfo(userId);
+      const enrichedMessage = {
+        ...savedMessage,
+        senderDisplayName: senderInfo.displayName,
+        senderAvatarUrl: senderInfo.avatarUrl,
+      };
 
-      // Phản hồi client: thông báo tin nhắn đã lưu và trạng thái "Đã gửi"
-      if (typeof callback === 'function') {
-        callback({ ok: true, message: savedMessage });
+      // Broadcast tới tất cả thành viên trong phòng (bao gồm cả người gửi)
+      io.to(payload.roomId).emit('receive_message', enrichedMessage);
+
+      // Nếu là DM 1:1, gửi thêm đích danh trực tiếp tới socket người nhận
+      // (phòng trường hợp người nhận chưa join room hoặc đang ở tab khác)
+      if (payload.roomId.startsWith('dm:')) {
+        const parts = payload.roomId.split(':');
+        if (parts.length >= 3) {
+          const receiverId = parts[1] === String(userId) ? parts[2] : parts[1];
+          const receiverSockets = onlineUsers.get(String(receiverId));
+          if (receiverSockets) {
+            for (const sockId of receiverSockets) {
+              io.to(sockId).emit('receive_message', enrichedMessage);
+            }
+          }
+        }
       }
+
+      _respond(callback, true, null, { message: enrichedMessage });
     } catch (error) {
-      if (typeof callback === 'function') {
-        callback({ ok: false, error: error.message });
-      }
+      console.error('[send_message] saveMessage error:', error.message);
+      _respond(callback, false, error.message);
     }
   });
 
@@ -145,28 +294,108 @@ function handleSocketConnection(io, socket) {
     socket.emit('send_message', payload, callback);
   });
 
-  // --- Typing indicator ---
-  socket.on('typing_start', ({ roomId }) => {
-    if (!roomId) return;
+  // ============================================================
+  // TYPING INDICATOR — cũng nên kiểm tra membership
+  // ============================================================
+  socket.on('typing_start', async ({ roomId }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, 'roomId is required');
+      return;
+    }
+
+    if (!userId) {
+      _respond(callback, false, 'User not authenticated');
+      return;
+    }
+
+    const isMember = await checkUserInGroup(roomId, userId);
+    if (!isMember) {
+      _respond(callback, false, 'Not a member of this group');
+      return;
+    }
+
     // Gửi cho tất cả người khác trong phòng (không gửi lại cho chính mình)
     socket.to(roomId).emit('user_typing', {
       roomId,
       userId,
       userName: socket.user?.username || ''
     });
+
+    _respond(callback, true);
   });
 
-  socket.on('typing_stop', ({ roomId }) => {
-    if (!roomId) return;
+  socket.on('typing_stop', async ({ roomId }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, 'roomId is required');
+      return;
+    }
+
+    if (!userId) {
+      _respond(callback, false, 'User not authenticated');
+      return;
+    }
+
+    const isMember = await checkUserInGroup(roomId, userId);
+    if (!isMember) {
+      _respond(callback, false, 'Not a member of this group');
+      return;
+    }
+
     socket.to(roomId).emit('user_stopped_typing', {
       roomId,
       userId
     });
+
+    _respond(callback, true);
   });
 
-  // --- Ngắt kết nối ---
+  // ============================================================
+  // CALL RELATED EVENTS — nên kiểm tra membership
+  // ============================================================
+  socket.on('call-request', async ({ conversationId } = {}, callback) => {
+    if (!conversationId) {
+      _respond(callback, false, 'conversationId is required');
+      return;
+    }
+
+    const isMember = await checkUserInGroup(conversationId, userId);
+    if (!isMember) {
+      _respond(callback, false, 'Not a member of this group');
+      return;
+    }
+
+    socket.to(conversationId).emit('incoming-call', {
+      from: { userId, username: socket.user?.username || '' }
+    });
+
+    _respond(callback, true);
+  });
+
+  socket.on('call-accepted', ({ conversationId } = {}) => {
+    if (!conversationId) return;
+    socket.to(conversationId).emit('call-accepted', {
+      from: { userId, username: socket.user?.username || '' }
+    });
+  });
+
+  socket.on('call-rejected', ({ conversationId } = {}) => {
+    if (!conversationId) return;
+    socket.to(conversationId).emit('call-rejected', {
+      from: { userId, username: socket.user?.username || '' }
+    });
+  });
+
+  socket.on('end-call', ({ conversationId } = {}) => {
+    if (!conversationId) return;
+    socket.to(conversationId).emit('end-call', {
+      from: { userId, username: socket.user?.username || '' }
+    });
+  });
+
+  // ============================================================
+  // NGẮT KẾT NỐI
+  // ============================================================
   socket.on('disconnect', () => {
-    // --- Xóa user khỏi danh sách online ---
     if (userId) {
       const sockets = onlineUsers.get(userId);
       if (sockets) {
@@ -177,6 +406,30 @@ function handleSocketConnection(io, socket) {
       }
     }
   });
+}
+
+// ================================================================
+// HÀM PHỤ TRỢ NỘI BỘ
+// ================================================================
+
+/**
+ * Gửi phản hồi统一 qua callback hoặc emit event 'error'/'success'
+ * @param {Function|undefined} callback
+ * @param {boolean} ok
+ * @param {string|null} error
+ * @param {object} extra
+ */
+function _respond(callback, ok, error, extra = {}) {
+  if (typeof callback === 'function') {
+    if (ok) {
+      callback({ ok: true, ...extra });
+    } else {
+      callback({ ok: false, error: error || 'Unknown error' });
+    }
+  } else if (!ok) {
+    // Fallback: emit error event lên socket để client nhận được lỗi qua socket.on('error')
+    socket?.emit('error', { code: 'MEMBERSHIP_DENIED', message: error || 'Access denied' });
+  }
 }
 
 /**
@@ -218,7 +471,7 @@ function notifyNewFriendRequest(receiverId, senderInfo) {
 }
 
 /**
- * Gửi thông báo lời mời kết bạn đã được chấp nhận
+ * Gửi thông báo lời mời kết bạn đã đ��ợc chấp nhận
  * @param {string|number} senderId - ID người gửi ban đầu
  * @param {object} receiverInfo - Thông tin người chấp nhận { id, display_name, username, avatar_url }
  */
@@ -250,6 +503,7 @@ module.exports = {
   socketAuthMiddleware,
   initializeIO,
   getIO,
+  checkUserInGroup,
   isUserOnline,
   notifyNewFriendRequest,
   notifyFriendAccepted

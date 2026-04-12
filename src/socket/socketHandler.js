@@ -138,14 +138,34 @@ function socketAuthMiddleware(socket, next) {
 function handleSocketConnection(io, socket) {
   // Client đã được gán user từ middleware xác thực ở trên
   const userId = socket.user?.id || socket.user?.userId;
+  const userIdKey = userId != null ? String(userId) : '';
 
   // --- Đăng ký user vào danh sách online ---
-  if (userId) {
-    if (!onlineUsers.has(userId)) {
-      onlineUsers.set(userId, new Set());
+  if (userIdKey) {
+    if (!onlineUsers.has(userIdKey)) {
+      onlineUsers.set(userIdKey, new Set());
     }
-    onlineUsers.get(userId).add(socket.id);
+    onlineUsers.get(userIdKey).add(socket.id);
+    console.log(`[socket] User ${userIdKey} connected with socket ${socket.id}`);
   }
+
+  const emitToUserSockets = (targetUserId, eventName, payload) => {
+    const targetKey = String(targetUserId || '').trim();
+    if (!targetKey) return false;
+
+    const targetSockets = onlineUsers.get(targetKey);
+    if (!targetSockets || targetSockets.size === 0) {
+      console.warn(`[signal] No active socket found for user ${targetKey} (${eventName})`);
+      return false;
+    }
+
+    for (const targetSocketId of targetSockets) {
+      io.to(targetSocketId).emit(eventName, payload);
+    }
+
+    console.log(`[signal] Forwarded ${eventName} to user ${targetKey} (${targetSockets.size} socket(s))`);
+    return true;
+  };
 
   // ============================================================
   // JOIN ROOM — có kiểm tra membership
@@ -352,7 +372,62 @@ function handleSocketConnection(io, socket) {
   // ============================================================
   // CALL RELATED EVENTS — nên kiểm tra membership
   // ============================================================
-  socket.on('call-request', async ({ conversationId } = {}, callback) => {
+  socket.on('call-user', (data = {}, callback) => {
+    const targetUserId = String(data.to || data.receiverId || '').trim();
+    if (!targetUserId) {
+      _respond(callback, false, 'to (receiverId) is required');
+      return;
+    }
+
+    const payload = {
+      ...data,
+      to: targetUserId,
+      receiverId: targetUserId,
+      callerId: String(data.callerId || userIdKey),
+      callerName: data.callerName || socket.user?.username || '',
+      roomId: String(data.roomId || ''),
+      isGroupCall: false,
+    };
+
+    console.log(`[signal] Received call-user from ${payload.callerId} -> ${targetUserId}, room=${payload.roomId}`);
+
+    const forwarded = emitToUserSockets(targetUserId, 'call-user', payload);
+    if (!forwarded) {
+      _respond(callback, false, 'Receiver is offline');
+      return;
+    }
+
+    _respond(callback, true);
+  });
+
+  socket.on('call-request', async (data = {}, callback) => {
+    const targetUserId = String(data.to || data.receiverId || '').trim();
+
+    // Legacy path: if target user exists, forward to that user directly.
+    if (targetUserId) {
+      const payload = {
+        ...data,
+        to: targetUserId,
+        receiverId: targetUserId,
+        callerId: String(data.callerId || userIdKey),
+        callerName: data.callerName || socket.user?.username || '',
+        roomId: String(data.roomId || ''),
+        isGroupCall: false,
+      };
+
+      console.log(`[signal] Received call-request (direct) from ${payload.callerId} -> ${targetUserId}`);
+      const forwarded = emitToUserSockets(targetUserId, 'call-request', payload);
+      if (!forwarded) {
+        _respond(callback, false, 'Receiver is offline');
+        return;
+      }
+
+      _respond(callback, true);
+      return;
+    }
+
+    // Room-based fallback for old clients.
+    const conversationId = data.conversationId;
     if (!conversationId) {
       _respond(callback, false, 'conversationId is required');
       return;
@@ -364,46 +439,157 @@ function handleSocketConnection(io, socket) {
       return;
     }
 
+    console.log(`[signal] Received call-request (room) user=${userIdKey}, conversation=${conversationId}`);
+
     socket.to(conversationId).emit('incoming-call', {
-      from: { userId, username: socket.user?.username || '' }
+      ...data,
+      callerId: String(data.callerId || userIdKey),
+      callerName: data.callerName || socket.user?.username || '',
     });
 
     _respond(callback, true);
   });
 
-  socket.on('call-accepted', ({ conversationId } = {}) => {
-    if (!conversationId) return;
-    socket.to(conversationId).emit('call-accepted', {
-      from: { userId, username: socket.user?.username || '' }
-    });
+  socket.on('group-call-request', async (data = {}, callback) => {
+    const { groupId, callerName } = data;
+
+    if (!groupId) {
+      _respond(callback, false, 'groupId is required');
+      return;
+    }
+
+    if (!userId) {
+      _respond(callback, false, 'User not authenticated');
+      return;
+    }
+
+    const normalizedGroupId = String(groupId).startsWith('group_')
+      ? String(groupId)
+      : `group_${groupId}`;
+
+    const isMember = await checkUserInGroup(normalizedGroupId, userId);
+    if (!isMember) {
+      _respond(callback, false, 'Not a member of this group');
+      return;
+    }
+
+    if (!socket.rooms.has(normalizedGroupId)) {
+      console.warn(`[Call Group] Caller ${userIdKey} has not joined room ${normalizedGroupId}; reject signaling`);
+      _respond(callback, false, 'Caller has not joined the group room');
+      return;
+    }
+
+    const payload = {
+      groupId: normalizedGroupId,
+      roomId: String(data.roomId || ''),
+      callerName: callerName || socket.user?.username || '',
+      callerId: String(data.callerId || userIdKey),
+      isGroupCall: true,
+    };
+
+    console.log(`[Call Group] Bao thuc phong: ${normalizedGroupId} do ${payload.callerName || userId} goi`);
+
+    socket.to(normalizedGroupId).emit('group-call-request', payload);
+
+    _respond(callback, true);
   });
 
-  socket.on('call-rejected', ({ conversationId } = {}) => {
-    if (!conversationId) return;
-    socket.to(conversationId).emit('call-rejected', {
-      from: { userId, username: socket.user?.username || '' }
-    });
+  socket.on('call-accepted', (data = {}, callback) => {
+    const targetUserId = String(data.to || data.callerId || '').trim();
+    const payload = {
+      ...data,
+      callerId: String(data.callerId || userIdKey),
+      callerName: data.callerName || socket.user?.username || '',
+      from: String(userIdKey),
+    };
+
+    if (targetUserId) {
+      console.log(`[signal] Forwarding call-accepted to User ${targetUserId}...`);
+      const forwarded = emitToUserSockets(targetUserId, 'call-accepted', payload);
+      if (!forwarded) {
+        _respond(callback, false, 'Caller is offline');
+        return;
+      }
+      _respond(callback, true);
+      return;
+    }
+
+    const conversationId = data.conversationId;
+    if (!conversationId) {
+      _respond(callback, false, 'conversationId or to is required');
+      return;
+    }
+
+    console.log(`[signal] Forwarding call-accepted to room ${conversationId}...`);
+    socket.to(conversationId).emit('call-accepted', payload);
+    _respond(callback, true);
   });
 
-  socket.on('end-call', ({ conversationId } = {}) => {
-    if (!conversationId) return;
-    socket.to(conversationId).emit('end-call', {
-      from: { userId, username: socket.user?.username || '' }
-    });
+  const forwardCallStopSignal = (eventName, data = {}, callback) => {
+    const targetUserId = String(data.to || data.receiverId || data.callerId || '').trim();
+    const payload = {
+      ...data,
+      callerId: String(data.callerId || userIdKey),
+      callerName: data.callerName || socket.user?.username || '',
+      from: String(userIdKey),
+    };
+
+    if (targetUserId) {
+      console.log(`[signal] Forwarding ${eventName} to User ${targetUserId}...`);
+      const forwarded = emitToUserSockets(targetUserId, eventName, payload);
+      if (!forwarded) {
+        _respond(callback, false, 'Target user is offline');
+        return;
+      }
+
+      // Keep backward compatibility for older listeners.
+      if (eventName === 'call-declined') {
+        emitToUserSockets(targetUserId, 'call-rejected', payload);
+      }
+      if (eventName === 'call-rejected') {
+        emitToUserSockets(targetUserId, 'call-declined', payload);
+      }
+
+      _respond(callback, true);
+      return;
+    }
+
+    const conversationId = data.conversationId;
+    if (!conversationId) {
+      _respond(callback, false, 'conversationId or target user is required');
+      return;
+    }
+
+    console.log(`[signal] Forwarding ${eventName} to room ${conversationId}...`);
+    socket.to(conversationId).emit(eventName, payload);
+    _respond(callback, true);
+  };
+
+  socket.on('call-declined', (data = {}, callback) => {
+    forwardCallStopSignal('call-declined', data, callback);
+  });
+
+  socket.on('call-rejected', (data = {}, callback) => {
+    forwardCallStopSignal('call-rejected', data, callback);
+  });
+
+  socket.on('end-call', (data = {}, callback) => {
+    forwardCallStopSignal('end-call', data, callback);
   });
 
   // ============================================================
   // NGẮT KẾT NỐI
   // ============================================================
   socket.on('disconnect', () => {
-    if (userId) {
-      const sockets = onlineUsers.get(userId);
+    if (userIdKey) {
+      const sockets = onlineUsers.get(userIdKey);
       if (sockets) {
         sockets.delete(socket.id);
         if (sockets.size === 0) {
-          onlineUsers.delete(userId);
+          onlineUsers.delete(userIdKey);
         }
       }
+      console.log(`[socket] User ${userIdKey} disconnected socket ${socket.id}`);
     }
   });
 }
@@ -427,8 +613,7 @@ function _respond(callback, ok, error, extra = {}) {
       callback({ ok: false, error: error || 'Unknown error' });
     }
   } else if (!ok) {
-    // Fallback: emit error event lên socket để client nhận được lỗi qua socket.on('error')
-    socket?.emit('error', { code: 'MEMBERSHIP_DENIED', message: error || 'Access denied' });
+    console.warn(`[signal] Callback missing for failed socket response: ${error || 'Unknown error'}`);
   }
 }
 

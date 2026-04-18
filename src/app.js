@@ -1,10 +1,12 @@
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({
+  path: process.env.DOTENV_PATH || path.join(__dirname, "..", ".env"),
+});
 
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
-const path = require("path");
 
 // Modular Routes
 const authRoutes = require("./modules/auth/authRoutes");
@@ -14,6 +16,7 @@ const messageRoutes = require("./modules/chat/messageRoutes");
 const groupRoutes = require("./modules/chat/groupRoutes");
 const channelRoutes = require("./modules/chat/channelRoutes");
 const callRoutes = require("./modules/chat/callRoutes");
+const botRoutes = require("./modules/chat/botRoutes");
 const uploadRoutes = require("./modules/media/uploadRoutes");
 const statsRoutes = require("./modules/stats/statsRoutes");
 
@@ -83,6 +86,7 @@ app.use("/api/messages", messageRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/channels", channelRoutes);
 app.use("/api/calls", callRoutes);
+app.use("/api/v1/bot", botRoutes);
 app.use("/api/uploads", uploadRoutes);
 app.use("/api/stats", statsRoutes);
 

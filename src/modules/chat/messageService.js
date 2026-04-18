@@ -1,7 +1,7 @@
 const { ddbDocClient } = require("../../config/awsConfig");
 const { PutCommand, GetCommand } = require("@aws-sdk/lib-dynamodb");
 const { PutObjectCommand } = require("@aws-sdk/client-s3");
-const { v4: uuidv4 } = require("uuid");
+const { randomUUID } = require("crypto");
 const { s3Client } = require("../../config/awsConfig");
 
 // Bảng messages trong DynamoDB (primary key: conversationId (S))
@@ -152,7 +152,7 @@ async function uploadFileToS3(file) {
     throw new Error("S3_BUCKET_NAME is not configured");
   }
 
-  const fileKey = `messages/${Date.now()}-${uuidv4()}-${sanitizeFilename(file.originalname)}`;
+  const fileKey = `messages/${Date.now()}-${randomUUID()}-${sanitizeFilename(file.originalname)}`;
 
   const command = new PutObjectCommand({
     Bucket: S3_BUCKET_NAME,
@@ -231,7 +231,7 @@ async function saveFileMessage(data) {
   );
 
   const item = {
-    message_id: uuidv4(),
+    message_id: randomUUID(),
     conversation_id: conversationId,
     sender_id: senderId,
     receiver_id: receiverId,

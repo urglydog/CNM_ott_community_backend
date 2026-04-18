@@ -1,12 +1,12 @@
 const { s3Client } = require("../config/awsConfig");
 const { PutObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
-const { v4: uuidv4 } = require("uuid");
+const { randomUUID } = require("crypto");
 
 const BUCKET_NAME = process.env.S3_BUCKET_NAME || "ott-community-media";
 
 async function getPresignedUploadUrl({ keyPrefix, contentType }) {
-  const key = `${keyPrefix || "uploads"}/${uuidv4()}`;
+  const key = `${keyPrefix || "uploads"}/${randomUUID()}`;
 
   const command = new PutObjectCommand({
     Bucket: BUCKET_NAME,

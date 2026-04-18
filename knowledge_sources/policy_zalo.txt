@@ -1,0 +1,22 @@
+TÀI LIỆU CHÍNH SÁCH VÀ GIỚI HẠN TÍNH NĂNG ZALO (BẢN CẬP NHẬT MỚI NHẤT)
+
+1. CHÍNH SÁCH KẾT BẠN VÀ DANH BẠ
+- Giới hạn gửi lời mời: Zalo giới hạn tối đa 50 yêu cầu kết bạn mỗi ngày đối với tài khoản thường. Đối với tài khoản đã xác thực (có tick vàng), giới hạn này là 100 yêu cầu/ngày.
+- Khóa tính năng: Nếu gửi lời mời kết bạn liên tục và bị người khác từ chối hoặc báo cáo nhiều lần, tài khoản sẽ bị khóa tính năng kết bạn tạm thời trong 7 ngày.
+- Giới hạn danh bạ: Mỗi tài khoản Zalo cá nhân được phép kết bạn tối đa 3000 người. Khi đạt mức tối đa, bạn không thể nhận hoặc gửi thêm yêu cầu kết bạn trừ khi xóa bớt bạn bè cũ.
+
+2. CHÍNH SÁCH NHÓM CHAT (ZALO GROUP)
+- Số lượng thành viên: Một nhóm chat Zalo có sức chứa tối đa là 1000 thành viên.
+- Phân quyền: Mỗi nhóm chỉ được phép có 1 Trưởng nhóm và tối đa 5 Phó nhóm để hỗ trợ quản lý.
+- Ghim tin nhắn: Quản trị viên có thể ghim tối đa 3 tin nhắn hoặc bảng bình chọn lên đầu nhóm chat.
+- Xóa nhóm tự động: Những nhóm chat không có bất kỳ tương tác nào (tin nhắn, gọi điện) trong vòng 6 tháng sẽ tự động bị hệ thống giải tán để tiết kiệm tài nguyên.
+
+3. GIỚI HẠN GỬI FILE VÀ TIN NHẮN
+- Kích thước file: Zalo hỗ trợ gửi file tài liệu, hình ảnh, video với dung lượng tối đa lên đến 1GB cho mỗi lần gửi.
+- Chuyển tiếp tin nhắn: Để hạn chế tin giả (fake news) và spam, một tin nhắn chỉ được phép chuyển tiếp (forward) cho tối đa 5 trò chuyện cùng một lúc.
+- Tin nhắn thoại: Thời lượng tối đa cho một tin nhắn ghi âm giọng nói (voice message) là 10 phút.
+
+4. XỬ LÝ VI PHẠM TÀI KHOẢN
+- Vi phạm nhẹ (Spam tin nhắn, quảng cáo trái phép): Khóa tài khoản tạm thời từ 1 đến 7 ngày tùy mức độ.
+- Vi phạm nặng (Lừa đảo, phát tán mã độc, nội dung đồi trụy): Khóa tài khoản vĩnh viễn (thu hồi vĩnh viễn số điện thoại đăng ký trên hệ thống).
+- Khiếu nại: Người dùng có quyền gửi yêu cầu khiếu nại mở khóa tài khoản trong vòng 14 ngày kể từ ngày bị khóa. Sau thời gian này, yêu cầu sẽ không được giải quyết.

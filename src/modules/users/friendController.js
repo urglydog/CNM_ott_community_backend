@@ -6,12 +6,12 @@ async function sendFriendRequest(req, res) {
   try {
     const senderId = req.user?.userId;
     if (!senderId) {
-      return res.status(401).json({ message: 'Unauthorized' });
+      return res.status(401).json({ message: 'Chưa xác thực' });
     }
 
     const { receiverId } = req.body;
     if (!receiverId) {
-      return res.status(400).json({ message: 'receiverId is required' });
+      return res.status(400).json({ message: 'Vui lòng cung cấp receiverId' });
     }
 
     const result = await friendService.sendFriendRequest(senderId, receiverId);
@@ -22,7 +22,7 @@ async function sendFriendRequest(req, res) {
     }
 
     return res.status(201).json({
-      message: 'Friend request sent successfully',
+      message: 'Đã gửi lời mời kết bạn',
       data: result
     });
   } catch (error) {
@@ -35,12 +35,12 @@ async function acceptFriendRequest(req, res) {
   try {
     const userId = req.user?.userId;
     if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
+      return res.status(401).json({ message: 'Chưa xác thực' });
     }
 
     const { requestId } = req.body;
     if (!requestId) {
-      return res.status(400).json({ message: 'requestId is required' });
+      return res.status(400).json({ message: 'Vui lòng cung cấp requestId' });
     }
 
     const result = await friendService.acceptFriendRequest(requestId, userId);
@@ -51,7 +51,7 @@ async function acceptFriendRequest(req, res) {
     }
 
     return res.status(200).json({
-      message: 'Friend request accepted',
+      message: 'Đã chấp nhận lời mời kết bạn',
       data: result
     });
   } catch (error) {
@@ -64,17 +64,17 @@ async function rejectFriendRequest(req, res) {
   try {
     const userId = req.user?.userId;
     if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
+      return res.status(401).json({ message: 'Chưa xác thực' });
     }
 
     const { requestId } = req.body;
     if (!requestId) {
-      return res.status(400).json({ message: 'requestId is required' });
+      return res.status(400).json({ message: 'Vui lòng cung cấp requestId' });
     }
 
     const result = await friendService.rejectFriendRequest(requestId, userId);
     return res.status(200).json({
-      message: 'Friend request rejected',
+      message: 'Đã từ chối lời mời kết bạn',
       data: result
     });
   } catch (error) {
@@ -87,12 +87,12 @@ async function getPendingRequests(req, res) {
   try {
     const userId = req.user?.userId;
     if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
+      return res.status(401).json({ message: 'Chưa xác thực' });
     }
 
     const requests = await friendService.getPendingRequests(userId);
     return res.status(200).json({
-      message: 'Pending friend requests retrieved',
+      message: 'Đã lấy danh sách lời mời kết bạn đang chờ',
       data: requests,
       count: requests.length
     });
@@ -105,12 +105,12 @@ async function getFriends(req, res) {
   try {
     const userId = req.user?.userId;
     if (!userId) {
-      return res.status(401).json({ message: 'Unauthorized' });
+      return res.status(401).json({ message: 'Chưa xác thực' });
     }
 
     const friends = await friendService.getFriends(userId);
     return res.status(200).json({
-      message: 'Friends list retrieved',
+      message: 'Đã lấy danh sách bạn bè',
       data: friends,
       count: friends.length
     });

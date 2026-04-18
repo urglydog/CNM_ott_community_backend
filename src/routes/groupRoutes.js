@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-const groupController = require('../controllers/groupController');
+const groupController = require('../modules/chat/groupController');
 
 router.post('/', groupController.createGroup);
 router.get('/', groupController.listGroups);

@@ -56,7 +56,7 @@ async function sendFriendRequest(senderId, receiverId) {
   const receiver = String(receiverId);
 
   if (sender === receiver) {
-    const err = new Error('Cannot send friend request to yourself');
+    const err = new Error('Không thể gửi lời mời kết bạn cho chính mình');
     err.statusCode = 400;
     throw err;
   }
@@ -66,12 +66,12 @@ async function sendFriendRequest(senderId, receiverId) {
 
   if (existing) {
     if (existing.status === 'accepted') {
-      const err = new Error('You are already friends');
+      const err = new Error('Hai tài khoản đã là bạn bè');
       err.statusCode = 409;
       throw err;
     }
     if (existing.status === 'pending') {
-      const err = new Error('Friend request already exists');
+      const err = new Error('Lời mời kết bạn đã tồn tại');
       err.statusCode = 409;
       throw err;
     }
@@ -112,19 +112,19 @@ async function acceptFriendRequest(friendshipId, userId) {
   const rec = await getFriendshipByFriendshipId(friendshipId);
 
   if (!rec) {
-    const err = new Error('Friend request not found or you are not authorized');
+    const err = new Error('Không tìm thấy lời mời kết bạn hoặc bạn không có quyền thực hiện');
     err.statusCode = 404;
     throw err;
   }
 
   if (String(rec.receiver_id) !== String(userId)) {
-    const err = new Error('Friend request not found or you are not authorized');
+    const err = new Error('Không tìm thấy lời mời kết bạn hoặc bạn không có quyền thực hiện');
     err.statusCode = 404;
     throw err;
   }
 
   if (rec.status !== 'pending') {
-    const err = new Error(`Cannot accept a request with status: ${rec.status}`);
+    const err = new Error(`Không thể chấp nhận lời mời có trạng thái: ${rec.status}`);
     err.statusCode = 400;
     throw err;
   }
@@ -149,19 +149,19 @@ async function rejectFriendRequest(friendshipId, userId) {
   const rec = await getFriendshipByFriendshipId(friendshipId);
 
   if (!rec) {
-    const err = new Error('Friend request not found or you are not authorized');
+    const err = new Error('Không tìm thấy lời mời kết bạn hoặc bạn không có quyền thực hiện');
     err.statusCode = 404;
     throw err;
   }
 
   if (String(rec.receiver_id) !== String(userId)) {
-    const err = new Error('Friend request not found or you are not authorized');
+    const err = new Error('Không tìm thấy lời mời kết bạn hoặc bạn không có quyền thực hiện');
     err.statusCode = 404;
     throw err;
   }
 
   if (rec.status !== 'pending') {
-    const err = new Error(`Cannot reject a request with status: ${rec.status}`);
+    const err = new Error(`Không thể từ chối lời mời có trạng thái: ${rec.status}`);
     err.statusCode = 400;
     throw err;
   }

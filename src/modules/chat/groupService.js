@@ -1,5 +1,5 @@
 const { ddbDocClient } = require('../../config/awsConfig');
-const { PutCommand, GetCommand, ScanCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { PutCommand, GetCommand, ScanCommand, UpdateCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
 const crypto = require('crypto');
 
 const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || 'ott_groups';
@@ -153,6 +153,57 @@ async function getGroupsForUser(userId) {
     }));
 }
 
+async function getGroupMembers(groupId) {
+  const groupKey = String(groupId || '').trim();
+  if (!groupKey) {
+    throw new Error('Group ID is required');
+  }
+
+  const membersRes = await ddbDocClient.send(new QueryCommand({
+    TableName: MEMBERS_TABLE,
+    KeyConditionExpression: 'groupId = :gid',
+    ExpressionAttributeValues: {
+      ':gid': groupKey,
+    },
+  }));
+
+  const members = membersRes.Items || [];
+  if (!members.length) return [];
+
+  const userProfiles = await Promise.all(
+    members.map(async (member) => {
+      const uid = String(member.userId || '');
+      if (!uid) {
+        return {
+          userId: '',
+          displayName: 'Unknown user',
+          username: 'unknown',
+          avatarUrl: null,
+          role: member.role || 'member',
+          joinedAt: member.joined_at || null,
+        };
+      }
+
+      const userRes = await ddbDocClient.send(new GetCommand({
+        TableName: process.env.DDB_USERS_TABLE || 'ott_users',
+        Key: { userId: uid },
+      }));
+
+      const u = userRes.Item || {};
+      return {
+        userId: uid,
+        displayName: u.display_name || u.full_name || u.username || uid,
+        username: u.username || u.display_name || uid,
+        avatarUrl: u.avatar_url || null,
+        role: member.role || 'member',
+        joinedAt: member.joined_at || null,
+      };
+    })
+  );
+
+  return userProfiles;
+}
+
 async function getInviteLink(groupId) {
   const group = await getGroupById(groupId);
   if (!group) {
@@ -233,6 +284,7 @@ module.exports = {
   listGroups,
   getGroupById,
   addMemberToGroup,
+  getGroupMembers,
   getGroupsForUser,
   getInviteLink,
   joinGroupByInviteCode,

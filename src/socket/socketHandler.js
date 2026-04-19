@@ -10,6 +10,12 @@ const { verifyToken } = require("../common/utils/jwt");
 const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
 const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
 
+// ============================================================
+// CALL MANAGER (Server-authoritative)
+// ============================================================
+// roomId -> { callerId, receiverIds: string[], status, timeoutRef }
+const activeCalls = new Map();
+
 /**
  * Lấy displayName và avatarUrl của user từ bảng ott_users.
  * @param {string} userId
@@ -198,6 +204,33 @@ function handleSocketConnection(io, socket) {
       `[signal] Forwarded ${eventName} to user ${targetKey} (${targetSockets.size} socket(s))`,
     );
     return true;
+  };
+
+  const clearActiveCall = (roomId) => {
+    const record = activeCalls.get(roomId);
+    if (record?.timeoutRef) {
+      clearTimeout(record.timeoutRef);
+    }
+    activeCalls.delete(roomId);
+  };
+
+  const emitToCallParticipants = (record, eventName, payload) => {
+    if (!record) return;
+    const participants = [record.callerId, ...(record.receiverIds || [])];
+    participants.forEach((id) => emitToUserSockets(id, eventName, payload));
+  };
+
+  const getCallsForUser = (targetUserId) => {
+    const result = [];
+    for (const [roomId, record] of activeCalls.entries()) {
+      const inCall =
+        String(record.callerId) === String(targetUserId) ||
+        (record.receiverIds || []).some(
+          (rid) => String(rid) === String(targetUserId),
+        );
+      if (inCall) result.push({ roomId, record });
+    }
+    return result;
   };
 
   // ============================================================
@@ -446,92 +479,52 @@ function handleSocketConnection(io, socket) {
   });
 
   // ============================================================
-  // CALL RELATED EVENTS — nên kiểm tra membership
+  // CALL MANAGER EVENTS (Server-authoritative)
   // ============================================================
-  socket.on("call-user", (data = {}, callback) => {
-    const targetUserId = String(data.to || data.receiverId || "").trim();
-    if (!targetUserId) {
-      _respond(callback, false, "to (receiverId) is required");
+  socket.on("call-request", (data = {}, callback) => {
+    const callerId = String(data.callerId || userIdKey || "").trim();
+    const receiverId = String(data.receiverId || data.to || "").trim();
+    const roomId = String(data.roomId || "").trim();
+
+    if (!callerId || !receiverId || !roomId) {
+      _respond(callback, false, "callerId, receiverId, roomId are required");
       return;
     }
 
-    const payload = {
-      ...data,
-      to: targetUserId,
-      receiverId: targetUserId,
-      callerId: String(data.callerId || userIdKey),
-      callerName: data.callerName || socket.user?.username || "",
-      roomId: String(data.roomId || ""),
-      isGroupCall: false,
+    const record = {
+      callerId,
+      receiverIds: [receiverId],
+      status: "ringing",
+      timeoutRef: null,
     };
 
-    console.log(
-      `[signal] Received call-user from ${payload.callerId} -> ${targetUserId}, room=${payload.roomId}`,
-    );
+    // Override any existing call for this room
+    clearActiveCall(roomId);
+    activeCalls.set(roomId, record);
 
-    const forwarded = emitToUserSockets(targetUserId, "call-user", payload);
+    record.timeoutRef = setTimeout(() => {
+      const payload = {
+        roomId,
+        callerId,
+        receiverId,
+        reason: "timeout",
+      };
+      emitToCallParticipants(record, "call-timeout", payload);
+      clearActiveCall(roomId);
+    }, 30_000);
+
+    const forwarded = emitToUserSockets(receiverId, "incoming-call", {
+      ...data,
+      callerId,
+      receiverId,
+      roomId,
+    });
+
     if (!forwarded) {
+      clearActiveCall(roomId);
       _respond(callback, false, "Receiver is offline");
       return;
     }
-
-    _respond(callback, true);
-  });
-
-  socket.on("call-request", async (data = {}, callback) => {
-    const targetUserId = String(data.to || data.receiverId || "").trim();
-
-    // Legacy path: if target user exists, forward to that user directly.
-    if (targetUserId) {
-      const payload = {
-        ...data,
-        to: targetUserId,
-        receiverId: targetUserId,
-        callerId: String(data.callerId || userIdKey),
-        callerName: data.callerName || socket.user?.username || "",
-        roomId: String(data.roomId || ""),
-        isGroupCall: false,
-      };
-
-      console.log(
-        `[signal] Received call-request (direct) from ${payload.callerId} -> ${targetUserId}`,
-      );
-      const forwarded = emitToUserSockets(
-        targetUserId,
-        "call-request",
-        payload,
-      );
-      if (!forwarded) {
-        _respond(callback, false, "Receiver is offline");
-        return;
-      }
-
-      _respond(callback, true);
-      return;
-    }
-
-    // Room-based fallback for old clients.
-    const conversationId = data.conversationId;
-    if (!conversationId) {
-      _respond(callback, false, "conversationId is required");
-      return;
-    }
-
-    const isMember = await checkUserInGroup(conversationId, userId);
-    if (!isMember) {
-      _respond(callback, false, "Not a member of this group");
-      return;
-    }
-
-    console.log(
-      `[signal] Received call-request (room) user=${userIdKey}, conversation=${conversationId}`,
-    );
-
-    socket.to(conversationId).emit("incoming-call", {
-      ...data,
-      callerId: String(data.callerId || userIdKey),
-      callerName: data.callerName || socket.user?.username || "",
-    });
 
     _respond(callback, true);
   });
@@ -584,130 +577,120 @@ function handleSocketConnection(io, socket) {
     _respond(callback, true);
   });
 
-  socket.on("call-accepted", (data = {}, callback) => {
-    const targetUserId = String(data.to || data.callerId || "").trim();
+  const handleCallAccept = (data = {}, callback) => {
+    const roomId = String(data.roomId || "").trim();
+    const callerId = String(data.callerId || "").trim();
+    const receiverId = String(data.receiverId || "").trim();
+    if (!roomId || !callerId) {
+      _respond(callback, false, "roomId and callerId are required");
+      return;
+    }
+
+    const record = activeCalls.get(roomId);
+    if (!record) {
+      _respond(callback, false, "Call not found or already ended");
+      return;
+    }
+
+    if (record.timeoutRef) {
+      clearTimeout(record.timeoutRef);
+      record.timeoutRef = null;
+    }
+
+    record.status = "in_call";
+
     const payload = {
       ...data,
-      callerId: String(data.callerId || userIdKey),
-      callerName: data.callerName || socket.user?.username || "",
-      from: String(userIdKey),
+      roomId,
+      callerId: record.callerId,
+      receiverId: receiverId || (record.receiverIds || [])[0] || "",
     };
 
-    if (targetUserId) {
-      console.log(
-        `[signal] Forwarding call-accepted to User ${targetUserId}...`,
-      );
-      const forwarded = emitToUserSockets(
-        targetUserId,
-        "call-accepted",
-        payload,
-      );
-      if (!forwarded) {
-        _respond(callback, false, "Caller is offline");
-        return;
-      }
-      _respond(callback, true);
-      return;
-    }
+    emitToUserSockets(record.callerId, "call-accepted", payload);
+    console.log(`[signal] Forwarded call-accepted to caller ${record.callerId}`);
 
-    const conversationId = data.conversationId;
-    if (!conversationId) {
-      _respond(callback, false, "conversationId or to is required");
-      return;
-    }
-
-    console.log(
-      `[signal] Forwarding call-accepted to room ${conversationId}...`,
-    );
-    socket.to(conversationId).emit("call-accepted", payload);
-    _respond(callback, true);
-  });
-
-  const forwardCallStopSignal = (eventName, data = {}, callback) => {
-    const targetUserId = String(
-      data.to || data.receiverId || data.callerId || "",
-    ).trim();
-    const payload = {
-      ...data,
-      callerId: String(data.callerId || userIdKey),
-      callerName: data.callerName || socket.user?.username || "",
-      from: String(userIdKey),
-    };
-
-    if (targetUserId) {
-      console.log(
-        `[signal] Forwarding ${eventName} to User ${targetUserId}...`,
-      );
-      const forwarded = emitToUserSockets(targetUserId, eventName, payload);
-      if (!forwarded) {
-        _respond(callback, false, "Target user is offline");
-        return;
-      }
-
-      // Keep backward compatibility for older listeners.
-      if (eventName === "call-declined") {
-        emitToUserSockets(targetUserId, "call-rejected", payload);
-      }
-      if (eventName === "call-rejected") {
-        emitToUserSockets(targetUserId, "call-declined", payload);
-      }
-
-      _respond(callback, true);
-      return;
-    }
-
-    const conversationId = data.conversationId;
-    if (!conversationId) {
-      _respond(callback, false, "conversationId or target user is required");
-      return;
-    }
-
-    console.log(
-      `[signal] Forwarding ${eventName} to room ${conversationId}...`,
-    );
-    socket.to(conversationId).emit(eventName, payload);
     _respond(callback, true);
   };
 
-  socket.on("call-declined", (data = {}, callback) => {
-    const targetUserId = String(data.to || data.callerId || "").trim();
-    const payload = {
-      ...data,
-      to: targetUserId,
-      from: String(userIdKey),
-      callerId: String(data.callerId || userIdKey),
-      callerName: data.callerName || socket.user?.username || "",
-    };
+  socket.on("call-accepted", handleCallAccept);
+  socket.on("call-accept", handleCallAccept);
 
-    console.log(
-      `[Call Signal] ${targetUserId || "unknown-target"} bi tu choi cuoc goi`,
-    );
-
-    // Preferred path: forward directly to caller by userId -> socketId map.
-    if (targetUserId) {
-      const forwarded = emitToUserSockets(
-        targetUserId,
-        "call-declined",
-        payload,
-      );
-      if (!forwarded) {
-        _respond(callback, false, "Caller is offline");
-        return;
-      }
-      _respond(callback, true);
+  socket.on("call-reject", (data = {}, callback) => {
+    const roomId = String(data.roomId || "").trim();
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
       return;
     }
 
-    // Backward-compatible fallback for older clients using room signaling.
-    forwardCallStopSignal("call-declined", data, callback);
+    const record = activeCalls.get(roomId);
+    if (!record) {
+      _respond(callback, false, "Call not found or already ended");
+      return;
+    }
+
+    clearActiveCall(roomId);
+    emitToCallParticipants(record, "call-ended", {
+      ...data,
+      roomId,
+      reason: "rejected",
+    });
+
+    _respond(callback, true);
   });
 
-  socket.on("call-rejected", (data = {}, callback) => {
-    forwardCallStopSignal("call-rejected", data, callback);
+  socket.on("call-cancel", (data = {}, callback) => {
+    const roomId = String(data.roomId || "").trim();
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
+      return;
+    }
+
+    const record = activeCalls.get(roomId);
+    if (!record) {
+      _respond(callback, false, "Call not found or already ended");
+      return;
+    }
+
+    clearActiveCall(roomId);
+    emitToCallParticipants(record, "call-ended", {
+      ...data,
+      roomId,
+      reason: "canceled",
+    });
+
+    _respond(callback, true);
   });
 
   socket.on("end-call", (data = {}, callback) => {
-    forwardCallStopSignal("end-call", data, callback);
+    const roomId = String(data.roomId || "").trim();
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
+      return;
+    }
+
+    const record = activeCalls.get(roomId);
+    if (!record) {
+      _respond(callback, false, "Call not found or already ended");
+      return;
+    }
+
+    clearActiveCall(roomId);
+    emitToCallParticipants(record, "call-ended", {
+      ...data,
+      roomId,
+      reason: "ended",
+    });
+
+    _respond(callback, true);
+  });
+
+  // Backward compatibility for older event names
+  socket.on("call-declined", (data = {}, callback) => {
+    socket.emit("call-reject", data, callback);
+  });
+
+  socket.on("call-rejected", (data = {}, callback) => {
+    socket.emit("call-reject", data, callback);
   });
 
   // ============================================================
@@ -719,6 +702,18 @@ function handleSocketConnection(io, socket) {
       console.log(
         `[socket] User ${userIdKey} disconnected socket ${socket.id}`,
       );
+    }
+
+    if (userIdKey) {
+      const calls = getCallsForUser(userIdKey);
+      calls.forEach(({ roomId, record }) => {
+        clearActiveCall(roomId);
+        emitToCallParticipants(record, "call-ended", {
+          roomId,
+          reason: "disconnect",
+          disconnectedUserId: userIdKey,
+        });
+      });
     }
   });
 }

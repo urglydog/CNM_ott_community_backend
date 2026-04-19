@@ -4,11 +4,16 @@ const bcrypt = require('bcryptjs');
 
 const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
 const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 5 * 60 * 1000);
-const EMAIL_PROVIDER = (process.env.OTP_EMAIL_PROVIDER || 'console').toLowerCase();
-const SMS_PROVIDER = (process.env.OTP_SMS_PROVIDER || 'console').toLowerCase();
+const OTP_SEND_COOLDOWN_MS = Number(process.env.OTP_SEND_COOLDOWN_MS || 60 * 1000);
+const OTP_SEND_WINDOW_MS = Number(process.env.OTP_SEND_WINDOW_MS || 10 * 60 * 1000);
+const OTP_SEND_MAX_PER_WINDOW = Number(process.env.OTP_SEND_MAX_PER_WINDOW || 3);
+const OTP_APP_NAME = process.env.OTP_APP_NAME || 'OTT Community';
+const EMAIL_PROVIDER = (process.env.OTP_EMAIL_PROVIDER || 'console').trim().toLowerCase();
+const SMS_PROVIDER = (process.env.OTP_SMS_PROVIDER || 'console').trim().toLowerCase();
 const INCLUDE_OTP_DEBUG = String(process.env.OTP_INCLUDE_IN_RESPONSE || '').toLowerCase() === 'true';
 
 const otpStore = new Map();
+const otpSendStore = new Map();
 
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').trim());
@@ -32,13 +37,70 @@ function maskTarget(target) {
   return value.length <= 4 ? '***' : `***${value.slice(-3)}`;
 }
 
+function normalizeEmailValue(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizePhoneValue(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  const digits = raw.replace(/\D/g, '');
+  if (digits.startsWith('84') && digits.length === 11) {
+    return `0${digits.slice(2)}`;
+  }
+  if (digits.startsWith('0')) {
+    return digits;
+  }
+  if (digits.length === 9 && /^[3-9]/.test(digits)) {
+    return `0${digits}`;
+  }
+  return raw;
+}
+
+function getOtpMinutes() {
+  return Math.max(1, Math.ceil(OTP_TTL_MS / 60000));
+}
+
+function normalizePhoneForTwilio(phone) {
+  const raw = String(phone || '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim();
+
+  const compact = raw.replace(/\s+/g, '');
+
+  if (compact.startsWith('+')) {
+    const digits = compact.slice(1).replace(/\D/g, '');
+    return digits ? `+${digits}` : compact;
+  }
+
+  const digits = compact.replace(/\D/g, '');
+  if (digits.startsWith('84') && digits.length === 11) {
+    return `+${digits}`;
+  }
+  if (/^0[3-9][0-9]{8}$/.test(digits)) {
+    return `+84${digits.slice(1)}`;
+  }
+  if (/^[3-9][0-9]{8}$/.test(digits)) {
+    return `+84${digits}`;
+  }
+
+  return compact;
+}
+
 function otpKey(type, target) {
   return `${String(type)}:${String(target).trim().toLowerCase()}`;
 }
 
 function createOTP(type, target) {
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
   const key = otpKey(type, target);
+  const existing = otpStore.get(key);
+  if (existing && existing.expiresAt > Date.now()) {
+    return existing.otp;
+  }
+
+  const otp = String(Math.floor(100000 + Math.random() * 900000));
   otpStore.set(key, {
     otp,
     expiresAt: Date.now() + OTP_TTL_MS,
@@ -46,7 +108,67 @@ function createOTP(type, target) {
   return otp;
 }
 
+function getOtpSendRecord(type, target) {
+  const key = otpKey(type, target);
+  const now = Date.now();
+  const existing = otpSendStore.get(key);
+  if (!existing) {
+    return { key, record: null, now };
+  }
+
+  const recentAttempts = (existing.attempts || []).filter((timestamp) => now - timestamp < OTP_SEND_WINDOW_MS);
+  if (recentAttempts.length === 0) {
+    otpSendStore.delete(key);
+    return { key, record: null, now };
+  }
+
+  const record = {
+    ...existing,
+    attempts: recentAttempts,
+  };
+  otpSendStore.set(key, record);
+  return { key, record, now };
+}
+
+function assertOtpSendAllowed(type, target) {
+  const { key, record, now } = getOtpSendRecord(type, target);
+  if (!record) {
+    return;
+  }
+
+  const lastAttemptAt = record.attempts[record.attempts.length - 1];
+  const cooldownRemaining = OTP_SEND_COOLDOWN_MS - (now - lastAttemptAt);
+  if (cooldownRemaining > 0) {
+    throw new Error(`Vui lòng đợi ${Math.ceil(cooldownRemaining / 1000)} giây trước khi gửi lại mã OTP`);
+  }
+
+  if (record.attempts.length >= OTP_SEND_MAX_PER_WINDOW) {
+    const windowRemaining = OTP_SEND_WINDOW_MS - (now - record.attempts[0]);
+    throw new Error(`Bạn đã gửi OTP quá nhiều lần. Vui lòng thử lại sau ${Math.ceil(windowRemaining / 1000)} giây`);
+  }
+
+  otpSendStore.set(key, record);
+}
+
+function recordOtpSendAttempt(type, target) {
+  const key = otpKey(type, target);
+  const now = Date.now();
+  const existing = otpSendStore.get(key);
+  const attempts = existing?.attempts || [];
+  const recentAttempts = attempts.filter((timestamp) => now - timestamp < OTP_SEND_WINDOW_MS);
+  recentAttempts.push(now);
+
+  otpSendStore.set(key, {
+    attempts: recentAttempts,
+    lastSentAt: now,
+  });
+}
+
 async function sendOtpEmail(email, otp) {
+  const otpMinutes = getOtpMinutes();
+  const subject = `${OTP_APP_NAME} - Mã OTP xác thực tài khoản`;
+  const message = `Xin chào,\n\nMã OTP của bạn là: ${otp}\nMã có hiệu lực trong ${otpMinutes} phút.\n\nNếu bạn không yêu cầu mã này, hãy bỏ qua email này.`;
+
   if (EMAIL_PROVIDER === 'sendgrid') {
     const apiKey = process.env.SENDGRID_API_KEY;
     const fromEmail = process.env.SENDGRID_FROM_EMAIL;
@@ -63,11 +185,39 @@ async function sendOtpEmail(email, otp) {
       body: JSON.stringify({
         personalizations: [{ to: [{ email }] }],
         from: { email: fromEmail },
-        subject: 'Ma OTP xac thuc tai khoan',
+        subject,
         content: [{
           type: 'text/plain',
-          value: `Ma OTP cua ban la: ${otp}. Ma co hieu luc trong ${Math.floor(OTP_TTL_MS / 60000)} phut.`,
+          value: message,
         }],
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Gui OTP email that bai (${response.status}): ${text.substring(0, 200)}`);
+    }
+    return;
+  }
+
+  if (EMAIL_PROVIDER === 'resend') {
+    const apiKey = process.env.RESEND_API_KEY;
+    const fromEmail = process.env.RESEND_FROM_EMAIL;
+    if (!apiKey || !fromEmail) {
+      throw new Error('Thiếu cấu hình Resend (RESEND_API_KEY, RESEND_FROM_EMAIL)');
+    }
+
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: fromEmail,
+        to: [email],
+        subject,
+        text: message,
       }),
     });
 
@@ -83,41 +233,70 @@ async function sendOtpEmail(email, otp) {
 }
 
 async function sendOtpSms(phone, otp) {
-  if (SMS_PROVIDER === 'twilio') {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const fromPhone = process.env.TWILIO_FROM_PHONE;
-    if (!accountSid || !authToken || !fromPhone) {
-      throw new Error('Thiếu cấu hình Twilio (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_PHONE)');
-    }
+  const otpMinutes = getOtpMinutes();
+  const message = `${OTP_APP_NAME}: ma OTP cua ban la ${otp}. Hieu luc trong ${otpMinutes} phut. Neu ban khong yeu cau, hay bo qua tin nhan nay.`;
 
-    const form = new URLSearchParams();
-    form.append('From', fromPhone);
-    form.append('To', phone);
-    form.append('Body', `Ma OTP cua ban la ${otp}. Het han sau ${Math.floor(OTP_TTL_MS / 60000)} phut.`);
-
-    const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
-    const response = await fetch(
-      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Basic ${auth}`,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: form.toString(),
-      }
-    );
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Gui OTP SMS that bai (${response.status}): ${text.substring(0, 200)}`);
-    }
+  if (SMS_PROVIDER !== 'twilio') {
+    // eslint-disable-next-line no-console
+    console.log(`[OTP][PHONE][console] ${phone} => ${otp}`);
     return;
   }
 
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const fromPhone = normalizePhoneForTwilio(process.env.TWILIO_FROM_PHONE);
+  if (!accountSid || !authToken || !fromPhone) {
+    throw new Error('Thiếu cấu hình Twilio (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_PHONE)');
+  }
+  const sid = String(accountSid).trim();
+  if (!sid.startsWith('AC')) {
+    throw new Error('TWILIO_ACCOUNT_SID không hợp lệ. Phải dùng Account SID bắt đầu bằng AC, không dùng API Key bắt đầu bằng SK.');
+  }
+  if (!/^AC[a-zA-Z0-9]{32}$/.test(sid)) {
+    throw new Error('TWILIO_ACCOUNT_SID sai định dạng. Vui lòng kiểm tra lại giá trị Account SID trên Twilio Console.');
+  }
+
+  const targetPhone = normalizePhoneForTwilio(phone);
+  if (!/^\+[1-9][0-9]{7,14}$/.test(targetPhone)) {
+    throw new Error('Số điện thoại nhận SMS phải có định dạng quốc tế để gửi qua Twilio');
+  }
+  if (!/^\+[1-9][0-9]{7,14}$/.test(fromPhone)) {
+    throw new Error('TWILIO_FROM_PHONE không hợp lệ, cần định dạng E.164 ví dụ +19893345542');
+  }
+
+  // Log chẩn đoán để đối chiếu chính xác số gửi/nhận với Twilio Verified Caller IDs.
   // eslint-disable-next-line no-console
-  console.log(`[OTP][PHONE][${SMS_PROVIDER}] ${phone} => ${otp}`);
+  console.log(`[OTP][TWILIO] FROM: ${fromPhone} TO: ${targetPhone}`);
+  // eslint-disable-next-line no-console
+  console.log(`[OTP][TWILIO] USING SID: ${sid}`);
+
+  const form = new URLSearchParams();
+  form.append('From', fromPhone);
+  form.append('To', targetPhone);
+  form.append('Body', message);
+
+  const auth = Buffer.from(`${sid}:${authToken}`).toString('base64');
+  const response = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: form.toString(),
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    if (response.status === 400 && text.includes('21612')) {
+      throw new Error('Twilio trial chỉ gửi SMS tới số điện thoại đã được xác minh trong tài khoản Twilio. Hãy verify số nhận trong Twilio Console.');
+    }
+    throw new Error(`Gui OTP SMS that bai (${response.status}): ${text.substring(0, 200)}`);
+  }
+
+  return;
 }
 
 function verifyStoredOTP(type, target, otp) {
@@ -137,37 +316,27 @@ function verifyStoredOTP(type, target, otp) {
 }
 
 async function findUserByIdentifier({ email, phone, username }) {
-  const filterParts = [];
-  const values = {};
-  const names = {};
-
-  if (email) {
-    filterParts.push('#email = :email');
-    names['#email'] = 'email';
-    values[':email'] = String(email).trim();
-  }
-  if (phone) {
-    filterParts.push('#phone = :phone');
-    names['#phone'] = 'phone_number';
-    values[':phone'] = String(phone).trim();
-  }
-  if (username) {
-    filterParts.push('#username = :username');
-    names['#username'] = 'username';
-    values[':username'] = String(username).trim();
-  }
-
-  if (filterParts.length === 0) return null;
-
   const result = await ddbDocClient.send(new ScanCommand({
     TableName: USERS_TABLE,
-    FilterExpression: filterParts.join(' OR '),
-    ExpressionAttributeNames: names,
-    ExpressionAttributeValues: values,
-    Limit: 1,
   }));
 
-  return result.Items && result.Items.length > 0 ? result.Items[0] : null;
+  const targetEmail = email ? normalizeEmailValue(email) : null;
+  const targetPhone = phone ? normalizePhoneValue(phone) : null;
+  const targetUsername = username ? String(username).trim() : null;
+
+  const matched = (result.Items || []).find((item) => {
+    const itemEmail = normalizeEmailValue(item.email);
+    const itemPhone = normalizePhoneValue(item.phone_number);
+    const itemUsername = String(item.username || '').trim();
+
+    return (
+      (targetEmail && itemEmail === targetEmail) ||
+      (targetPhone && itemPhone === targetPhone) ||
+      (targetUsername && itemUsername === targetUsername)
+    );
+  });
+
+  return matched || null;
 }
 
 async function resolveAuthUser(userId, username) {
@@ -260,6 +429,9 @@ async function updateProfile(userId, payload) {
     updateParts.push('#email = :email');
     names['#email'] = 'email';
     values[':email'] = String(email || '').trim() || null;
+    updateParts.push('#email_verified = :email_verified');
+    names['#email_verified'] = 'email_verified';
+    values[':email_verified'] = false;
   }
 
   if (phone !== undefined) {
@@ -269,6 +441,9 @@ async function updateProfile(userId, payload) {
     updateParts.push('#phone_number = :phone_number');
     names['#phone_number'] = 'phone_number';
     values[':phone_number'] = String(phone).trim();
+    updateParts.push('#phone_verified = :phone_verified');
+    names['#phone_verified'] = 'phone_verified';
+    values[':phone_verified'] = false;
   }
 
   if (avatarUrl !== undefined) {
@@ -355,12 +530,16 @@ async function sendEmailOTP(email) {
   }
 
   const targetEmail = String(email).trim().toLowerCase();
+  assertOtpSendAllowed('email', targetEmail);
   const otp = createOTP('email', targetEmail);
 
   await sendOtpEmail(targetEmail, otp);
+  recordOtpSendAttempt('email', targetEmail);
 
   const result = {
-    message: `Đã gửi mã OTP đến email ${maskTarget(targetEmail)}`,
+    message: `Đã gửi mã OTP xác thực của ${OTP_APP_NAME} đến email ${maskTarget(targetEmail)}.`,
+    channel: 'email',
+    target: maskTarget(targetEmail),
     expiresIn: Math.floor(OTP_TTL_MS / 1000),
   };
   if (INCLUDE_OTP_DEBUG) {
@@ -403,12 +582,16 @@ async function sendPhoneOTP(phone) {
   }
 
   const targetPhone = String(phone).trim();
+  assertOtpSendAllowed('phone', targetPhone);
   const otp = createOTP('phone', targetPhone);
 
   await sendOtpSms(targetPhone, otp);
+  recordOtpSendAttempt('phone', targetPhone);
 
   const result = {
-    message: `Đã gửi mã OTP đến số điện thoại ${maskTarget(targetPhone)}`,
+    message: `Đã gửi mã OTP xác thực của ${OTP_APP_NAME} đến số điện thoại ${maskTarget(targetPhone)}.`,
+    channel: 'phone',
+    target: maskTarget(targetPhone),
     expiresIn: Math.floor(OTP_TTL_MS / 1000),
   };
   if (INCLUDE_OTP_DEBUG) {

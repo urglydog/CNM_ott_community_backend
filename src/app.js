@@ -37,42 +37,38 @@ const server = http.createServer(app);
 // eslint-disable-next-line no-console
 console.log(`[BOOT] OTP_EMAIL_PROVIDER=${process.env.OTP_EMAIL_PROVIDER || 'console'} OTP_SMS_PROVIDER=${process.env.OTP_SMS_PROVIDER || 'console'}`);
 
-const allowedOrigins = (
-  process.env.FRONTEND_ORIGIN || "http://localhost:3000,http://localhost:3001"
-)
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-
-function isOriginAllowed(origin) {
-  if (!origin) return true;
-  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
-    return true;
-  }
-  return allowedOrigins.includes(origin);
-}
+// 1. Tách chuỗi từ .env thành một mảng các origin
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",")
+  : ["http://localhost:3000"];
 
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
-      if (isOriginAllowed(origin)) return callback(null, true);
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
       return callback(new Error("Not allowed by CORS"));
     },
-    methods: ["GET", "POST"],
+    credentials: true,
   },
 });
 
 app.set("socketio", io);
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (isOriginAllowed(origin)) return callback(null, true);
-      return callback(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  }),
-);
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    // eslint-disable-next-line no-console
+    console.warn(`[CORS Blocked]: Origin ${origin} không được phép truy cập.`);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));

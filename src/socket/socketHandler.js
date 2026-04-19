@@ -144,6 +144,18 @@ function handleSocketConnection(io, socket) {
   if (userIdKey) {
     registerSocket(userIdKey, socket.id);
     console.log(`[socket] User ${userIdKey} connected with socket ${socket.id}`);
+
+    // Auto join vào tất cả các group mà user đang tham gia để nhận thông báo realtime
+    const { getGroupsForUser } = require('../modules/chat/groupService');
+    getGroupsForUser(userIdKey)
+      .then(groups => {
+        groups.forEach(g => {
+          socket.join(String(g.groupId));
+        });
+      })
+      .catch(err => {
+        console.error(`[socket] Lỗi auto-join groups cho user ${userIdKey}:`, err.message);
+      });
   }
 
   const emitToUserSockets = (targetUserId, eventName, payload) => {
@@ -245,9 +257,19 @@ function handleSocketConnection(io, socket) {
   // SEND MESSAGE — có kiểm tra membership
   // ============================================================
   socket.on('send_message', async (payload, callback) => {
-    // Payload: { roomId, content, contentType, attachments }
-    if (!payload.roomId || !payload.content?.trim()) {
-      return _respond(callback, false, 'roomId and content are required');
+    // Payload: { roomId, content, contentType, attachments, stickerData }
+    const contentType = payload.contentType || 'text';
+
+    // sticker: không bắt buộc content; emoji/sticker: dùng stickerData thay thế
+    const hasContent = payload.content && String(payload.content).trim();
+    const hasStickerData = contentType === 'sticker' && payload.stickerData;
+    const isEmoji = contentType === 'emoji';
+
+    if (!payload.roomId) {
+      return _respond(callback, false, 'roomId is required');
+    }
+    if (!hasContent && !hasStickerData && !isEmoji) {
+      return _respond(callback, false, 'content or stickerData is required');
     }
 
     if (!userId) {
@@ -263,12 +285,15 @@ function handleSocketConnection(io, socket) {
     }
 
     try {
+      // sticker: content có thể là undefined → service sẽ tự tạo từ stickerData
+      // emoji: content luôn là emoji string
       const entityPayload = {
         conversationId: payload.roomId,
         senderId: userId,
-        content: payload.content.trim(),
-        contentType: payload.contentType || 'text',
-        attachments: payload.attachments || null
+        content: hasContent ? payload.content.trim() : payload.content,
+        contentType,
+        attachments: payload.attachments || null,
+        ...(hasStickerData ? { stickerData: payload.stickerData } : {}),
       };
 
       const savedMessage = await saveMessage(entityPayload);
@@ -569,6 +594,29 @@ function handleSocketConnection(io, socket) {
   };
 
   socket.on('call-declined', (data = {}, callback) => {
+    const targetUserId = String(data.to || data.callerId || '').trim();
+    const payload = {
+      ...data,
+      to: targetUserId,
+      from: String(userIdKey),
+      callerId: String(data.callerId || userIdKey),
+      callerName: data.callerName || socket.user?.username || '',
+    };
+
+    console.log(`[Call Signal] ${targetUserId || 'unknown-target'} bi tu choi cuoc goi`);
+
+    // Preferred path: forward directly to caller by userId -> socketId map.
+    if (targetUserId) {
+      const forwarded = emitToUserSockets(targetUserId, 'call-declined', payload);
+      if (!forwarded) {
+        _respond(callback, false, 'Caller is offline');
+        return;
+      }
+      _respond(callback, true);
+      return;
+    }
+
+    // Backward-compatible fallback for older clients using room signaling.
     forwardCallStopSignal('call-declined', data, callback);
   });
 

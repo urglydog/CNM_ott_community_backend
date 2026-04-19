@@ -13,12 +13,35 @@ const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
 
 // conversationId vẫn giữ dạng "channel:1" hoặc "direct:1" để tương thích với API hiện tại
 
+// Các giá trị contentType hợp lệ (backward compatible)
+const VALID_CONTENT_TYPES = new Set([
+  "text",
+  "image",
+  "file",
+  "video",
+  "emoji",
+  "sticker",
+]);
+
+/**
+ * Sanitize và chuẩn hóa contentType.
+ * - Giá trị không hợp lệ → mặc định "text"
+ * - Cho phép: text | image | file | video | emoji | sticker
+ */
+function normalizeContentType(raw) {
+  const ct = String(raw || "text")
+    .toLowerCase()
+    .trim();
+  return VALID_CONTENT_TYPES.has(ct) ? ct : "text";
+}
 async function enrichSenderInfo(senderId) {
   try {
-    const result = await ddbDocClient.send(new GetCommand({
-      TableName: USERS_TABLE,
-      Key: { userId: String(senderId) }
-    }));
+    const result = await ddbDocClient.send(
+      new GetCommand({
+        TableName: USERS_TABLE,
+        Key: { userId: String(senderId) },
+      }),
+    );
     const u = result.Item;
     return {
       senderDisplayName: u?.display_name || u?.username || String(senderId),
@@ -47,7 +70,7 @@ async function saveMessage(payload) {
   const newMessage = {
     id,
     senderId: payload.senderId,
-    contentType: payload.contentType || "text",
+    contentType: normalizeContentType(payload.contentType),
     content: payload.content.trim(),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
@@ -96,10 +119,12 @@ async function saveMessage(payload) {
 async function getMessagesForConversation(conversationId) {
   if (!conversationId) return [];
 
-  const res = await ddbDocClient.send(new GetCommand({
-    TableName: MESSAGES_TABLE,
-    Key: { conversationId },
-  }));
+  const res = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MESSAGES_TABLE,
+      Key: { conversationId },
+    }),
+  );
 
   if (!res.Item || !Array.isArray(res.Item.messages)) {
     return [];
@@ -128,7 +153,7 @@ async function getMessagesForConversation(conversationId) {
         senderDisplayName: info.senderDisplayName,
         senderAvatarUrl: info.senderAvatarUrl,
       };
-    })
+    }),
   );
 
   return enriched;
@@ -137,6 +162,7 @@ async function getMessagesForConversation(conversationId) {
 function resolveAttachmentType(mimetype) {
   if (!mimetype) return "file";
   if (mimetype.startsWith("image/")) return "image";
+  if (mimetype.startsWith("video/")) return "video";
   return "file";
 }
 
@@ -190,15 +216,18 @@ async function saveFileMessage(data) {
     ? `channel:${channelId}`
     : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`;
 
+  const attachmentType = resolveAttachmentType(data.attachment.mimetype);
+  const messageType = attachmentType === "video" ? "video" : "file";
+
   const fileMessage = {
     id: Date.now(),
     senderId,
-    contentType: "file",
+    contentType: messageType,
     content: data.attachment.originalname || "[file]",
     attachments: [
       {
         url: data.attachment.url,
-        type: resolveAttachmentType(data.attachment.mimetype),
+        type: attachmentType,
         size: data.attachment.size,
       },
     ],
@@ -239,17 +268,16 @@ async function saveFileMessage(data) {
     attachments: [
       {
         url: data.attachment.url,
-        type: resolveAttachmentType(data.attachment.mimetype),
+        type: attachmentType,
         size: data.attachment.size,
       },
     ],
-    type: "file",
+    type: messageType,
     created_at: new Date().toISOString(),
   };
 
   return item;
 }
-
 module.exports = {
   saveMessage,
   getMessagesForConversation,

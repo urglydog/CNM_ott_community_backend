@@ -13,6 +13,56 @@ const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
 
 // conversationId vẫn giữ dạng "channel:1" hoặc "direct:1" để tương thích với API hiện tại
 
+// Các giá trị contentType hợp lệ (backward compatible)
+const VALID_CONTENT_TYPES = new Set(["text", "file", "emoji", "sticker"]);
+
+/**
+ * Sanitize và chuẩn hóa contentType.
+ * - Giá trị không hợp lệ → mặc định "text"
+ * - Cho phép: text | file | emoji | sticker
+ */
+function normalizeContentType(raw) {
+  const ct = String(raw || "text").toLowerCase().trim();
+  return VALID_CONTENT_TYPES.has(ct) ? ct : "text";
+}
+
+/**
+ * Validate dữ liệu sticker trước khi lưu.
+ * stickerUrl hoặc stickerId phải có ít nhất 1 cái.
+ * @param {object} stickerData - { stickerId?, stickerUrl?, stickerPack?, stickerName? }
+ * @throws {Error} nếu dữ liệu sticker không hợp lệ
+ */
+function validateStickerData(stickerData) {
+  if (!stickerData || typeof stickerData !== "object") {
+    throw new Error("sticker data must be a non-null object");
+  }
+  if (!stickerData.stickerId && !stickerData.stickerUrl) {
+    throw new Error("stickerId or stickerUrl is required for sticker messages");
+  }
+  // stickerUrl nếu có phải là URL hợp lệ
+  if (stickerData.stickerUrl) {
+    try {
+      new URL(stickerData.stickerUrl);
+    } catch {
+      throw new Error("stickerUrl must be a valid URL");
+    }
+  }
+}
+
+/**
+ * Validate dữ liệu emoji.
+ * Emoji hợp lệ phải là chuỗi Unicode emoji (ít nhất 1 ký tự).
+ * @param {string} content - chuỗi emoji
+ * @throws {Error} nếu dữ liệu emoji không hợp lệ
+ */
+function validateEmojiData(content) {
+  if (!content || typeof content !== "string" || !content.trim()) {
+    throw new Error("emoji content is required and must be a non-empty string");
+  }
+  // Cho phép 1 emoji đơn hoặc chuỗi emoji (VD: "👍" hoặc "🎉🎊")
+  // Chỉ cần non-empty string là đủ, không cần kiểm tra unicode sâu
+}
+
 async function enrichSenderInfo(senderId) {
   try {
     const result = await ddbDocClient.send(new GetCommand({
@@ -37,8 +87,28 @@ async function saveMessage(payload) {
   if (!payload.senderId) {
     throw new Error("senderId is required");
   }
-  if (!payload.content || !payload.content.trim()) {
-    throw new Error("content is required");
+
+  const contentType = normalizeContentType(payload.contentType);
+
+  // Emoji và sticker KHÔNG bắt buộc payload.content (chúng dùng sticker metadata riêng)
+  if (contentType === "text" || contentType === "file") {
+    if (!payload.content || !String(payload.content).trim()) {
+      throw new Error("content is required for text/file messages");
+    }
+  }
+
+  // Validate sticker metadata
+  if (contentType === "sticker") {
+    validateStickerData(payload.stickerData || {});
+    // content của sticker = tên/ID để hiển thị, không dùng trim() rỗng
+    if (!payload.content) {
+      payload.content = payload.stickerData?.stickerId || payload.stickerData?.stickerName || "[sticker]";
+    }
+  }
+
+  // Validate emoji
+  if (contentType === "emoji") {
+    validateEmojiData(payload.content);
   }
 
   const createdAt = new Date().toISOString();
@@ -47,8 +117,12 @@ async function saveMessage(payload) {
   const newMessage = {
     id,
     senderId: payload.senderId,
-    contentType: payload.contentType || "text",
-    content: payload.content.trim(),
+    contentType,
+    content: String(payload.content || "").trim(),
+    // stickerData chỉ tồn tại khi contentType === "sticker"
+    ...(contentType === "sticker" && payload.stickerData
+      ? { stickerData: { ...payload.stickerData } }
+      : {}),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
     createdAt,
@@ -87,6 +161,7 @@ async function saveMessage(payload) {
     senderId: newMessage.senderId,
     contentType: newMessage.contentType,
     content: newMessage.content,
+    ...(newMessage.stickerData ? { stickerData: newMessage.stickerData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
     createdAt: newMessage.createdAt,
@@ -130,6 +205,7 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         senderId: msg.senderId,
         contentType: msg.contentType,
         content: msg.content,
+        ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         createdAt: msg.createdAt,
@@ -258,8 +334,30 @@ async function saveFileMessage(data) {
   return item;
 }
 
+async function saveStickerMessage(data) {
+  const senderId = data.senderId;
+  const conversationId = data.conversationId;
+
+  if (!senderId) {
+    throw new Error("senderId is required");
+  }
+  if (!conversationId) {
+    throw new Error("conversationId is required");
+  }
+  validateStickerData(data.stickerData || {});
+
+  return saveMessage({
+    senderId,
+    conversationId,
+    contentType: "sticker",
+    content: data.stickerData?.stickerName || data.stickerData?.stickerId || "[sticker]",
+    stickerData: data.stickerData,
+  });
+}
+
 module.exports = {
   saveMessage,
+  saveStickerMessage,
   getMessagesForConversation,
   uploadFileToS3,
   saveFileMessage,

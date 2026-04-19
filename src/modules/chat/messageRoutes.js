@@ -17,5 +17,7 @@ router.get("/channel/:channelId", authMiddleware, messageController.getMessagesF
 
 router.post("/", messageController.sendMessage);
 router.post("/file", upload.single("file"), messageController.sendFileMessage);
+router.post("/sticker", messageController.sendStickerMessage);
+router.post("/emoji", messageController.sendEmojiMessage);
 
 module.exports = router;

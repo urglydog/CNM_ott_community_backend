@@ -37,6 +37,90 @@ async function sendMessage(req, res) {
   }
 }
 
+/**
+ * Gửi tin nhắn sticker.
+ * Body: { senderId, conversationId, stickerData: { stickerId, stickerUrl, stickerPack, stickerName } }
+ */
+async function sendStickerMessage(req, res) {
+  try {
+    const senderId =
+      req.body.senderId || req.user?.userId || req.user?.id;
+    const conversationId = req.body.conversationId;
+
+    if (!senderId) {
+      return res.status(400).json({ message: "senderId is required" });
+    }
+    if (!conversationId) {
+      return res.status(400).json({ message: "conversationId is required" });
+    }
+
+    const stickerData = req.body.stickerData;
+    if (!stickerData) {
+      return res.status(400).json({ message: "stickerData is required" });
+    }
+    if (!stickerData.stickerId && !stickerData.stickerUrl) {
+      return res.status(400).json({ message: "stickerId or stickerUrl is required in stickerData" });
+    }
+
+    const message = await messageService.saveMessage({
+      senderId,
+      conversationId,
+      contentType: "sticker",
+      content: stickerData.stickerName || stickerData.stickerId || "[sticker]",
+      stickerData,
+    });
+
+    // Broadcast real-time
+    const io = req.app.get("socketio");
+    if (io) {
+      io.to(conversationId).emit("receive_message", message);
+    }
+
+    res.status(201).json(message);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
+/**
+ * Gửi tin nhắn emoji.
+ * Body: { senderId, conversationId, content (emoji string) }
+ */
+async function sendEmojiMessage(req, res) {
+  try {
+    const senderId =
+      req.body.senderId || req.user?.userId || req.user?.id;
+    const conversationId = req.body.conversationId;
+
+    if (!senderId) {
+      return res.status(400).json({ message: "senderId is required" });
+    }
+    if (!conversationId) {
+      return res.status(400).json({ message: "conversationId is required" });
+    }
+    if (!req.body.content || !String(req.body.content).trim()) {
+      return res.status(400).json({ message: "content (emoji) is required" });
+    }
+
+    const message = await messageService.saveMessage({
+      senderId,
+      conversationId,
+      contentType: "emoji",
+      content: req.body.content.trim(),
+    });
+
+    // Broadcast real-time
+    const io = req.app.get("socketio");
+    if (io) {
+      io.to(conversationId).emit("receive_message", message);
+    }
+
+    res.status(201).json(message);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
 async function sendFileMessage(req, res) {
   try {
     if (!req.file) {
@@ -99,4 +183,6 @@ module.exports = {
   getMessagesForChannel,
   sendMessage,
   sendFileMessage,
+  sendStickerMessage,
+  sendEmojiMessage,
 };

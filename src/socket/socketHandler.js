@@ -245,9 +245,19 @@ function handleSocketConnection(io, socket) {
   // SEND MESSAGE — có kiểm tra membership
   // ============================================================
   socket.on('send_message', async (payload, callback) => {
-    // Payload: { roomId, content, contentType, attachments }
-    if (!payload.roomId || !payload.content?.trim()) {
-      return _respond(callback, false, 'roomId and content are required');
+    // Payload: { roomId, content, contentType, attachments, stickerData }
+    const contentType = payload.contentType || 'text';
+
+    // sticker: không bắt buộc content; emoji/sticker: dùng stickerData thay thế
+    const hasContent = payload.content && String(payload.content).trim();
+    const hasStickerData = contentType === 'sticker' && payload.stickerData;
+    const isEmoji = contentType === 'emoji';
+
+    if (!payload.roomId) {
+      return _respond(callback, false, 'roomId is required');
+    }
+    if (!hasContent && !hasStickerData && !isEmoji) {
+      return _respond(callback, false, 'content or stickerData is required');
     }
 
     if (!userId) {
@@ -263,12 +273,15 @@ function handleSocketConnection(io, socket) {
     }
 
     try {
+      // sticker: content có thể là undefined → service sẽ tự tạo từ stickerData
+      // emoji: content luôn là emoji string
       const entityPayload = {
         conversationId: payload.roomId,
         senderId: userId,
-        content: payload.content.trim(),
-        contentType: payload.contentType || 'text',
-        attachments: payload.attachments || null
+        content: hasContent ? payload.content.trim() : payload.content,
+        contentType,
+        attachments: payload.attachments || null,
+        ...(hasStickerData ? { stickerData: payload.stickerData } : {}),
       };
 
       const savedMessage = await saveMessage(entityPayload);

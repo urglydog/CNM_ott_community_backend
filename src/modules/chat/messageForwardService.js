@@ -33,7 +33,10 @@ async function enrichSenderInfo(senderId) {
  * @param {string} sourceConversationId
  * @returns {Promise<{ valid: string[], missing: string[] }>}
  */
-async function validateTargetConversations(targetConversationIds, sourceConversationId) {
+async function validateTargetConversations(
+  targetConversationIds,
+  sourceConversationId,
+) {
   const uniqueTargets = [...new Set(targetConversationIds)];
   const valid = [];
   const missing = [];
@@ -77,9 +80,9 @@ async function getMessageById(conversationId, messageId) {
     return null;
   }
 
-  return getRes.Item.messages.find(
-    (m) => String(m.id) === String(messageId),
-  ) || null;
+  return (
+    getRes.Item.messages.find((m) => String(m.id) === String(messageId)) || null
+  );
 }
 
 /**
@@ -90,7 +93,11 @@ async function getMessageById(conversationId, messageId) {
  * @param {string} senderId              - The user performing the forward
  * @returns {Promise<object>}            - The newly created forwarded message
  */
-async function saveForwardedMessage(targetConversationId, originalMessage, senderId) {
+async function saveForwardedMessage(
+  targetConversationId,
+  originalMessage,
+  senderId,
+) {
   const createdAt = new Date().toISOString();
   const newId = Date.now();
 
@@ -107,9 +114,7 @@ async function saveForwardedMessage(targetConversationId, originalMessage, sende
     originalSenderId: originalMessage.senderId
       ? String(originalMessage.senderId)
       : null,
-    originalMessageId: originalMessage.id
-      ? String(originalMessage.id)
-      : null,
+    originalMessageId: originalMessage.id ? String(originalMessage.id) : null,
     originalConversationId: originalMessage.conversationId || null,
   };
 
@@ -121,8 +126,13 @@ async function saveForwardedMessage(targetConversationId, originalMessage, sende
     }),
   );
 
-  const existing = getRes.Item || { conversationId: targetConversationId, messages: [] };
-  const messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
+  const existing = getRes.Item || {
+    conversationId: targetConversationId,
+    messages: [],
+  };
+  const messages = Array.isArray(existing.messages)
+    ? existing.messages.slice()
+    : [];
   messages.push(forwardedMessage);
 
   await ddbDocClient.send(
@@ -153,7 +163,12 @@ async function saveForwardedMessage(targetConversationId, originalMessage, sende
  * @throws {Error} with code "SOURCE_NOT_FOUND"     - source conversation not in DB
  * @throws {Error} with code "MESSAGE_NOT_FOUND"   - original message not found
  */
-async function forwardMessage({ originalMessageId, sourceConversationId, targetConversationIds, senderId }) {
+async function forwardMessage({
+  originalMessageId,
+  sourceConversationId,
+  targetConversationIds,
+  senderId,
+}) {
   // ── Input validation ──────────────────────────────────────────────────────
   if (!originalMessageId) {
     const err = new Error("originalMessageId is required");
@@ -165,7 +180,10 @@ async function forwardMessage({ originalMessageId, sourceConversationId, targetC
     err.code = "BAD_REQUEST";
     throw err;
   }
-  if (!Array.isArray(targetConversationIds) || targetConversationIds.length === 0) {
+  if (
+    !Array.isArray(targetConversationIds) ||
+    targetConversationIds.length === 0
+  ) {
     const err = new Error("targetConversationIds must be a non-empty array");
     err.code = "BAD_REQUEST";
     throw err;
@@ -177,47 +195,79 @@ async function forwardMessage({ originalMessageId, sourceConversationId, targetC
   }
 
   // ── Retrieve original message ─────────────────────────────────────────────
-  let getSourceRes;
-  try {
-    getSourceRes = await ddbDocClient.send(
-      new GetCommand({
-        TableName: MESSAGES_TABLE,
-        Key: { conversationId: sourceConversationId },
-      }),
-    );
-  } catch (dbError) {
-    console.error("[messageForwardService] DynamoDB GetCommand failed:", dbError);
-    const err = new Error("Failed to fetch source conversation from database");
-    err.code = "INTERNAL_ERROR";
-    throw err;
+  // Group file/image messages có thể được lưu ở "channel:<groupId>".
+  // UI lại có thể gửi sourceConversationId dạng "<groupId>", nên cần fallback tìm ở cả 2 key.
+  const sourceCandidates = [String(sourceConversationId)];
+  if (
+    !String(sourceConversationId).startsWith("dm:") &&
+    !String(sourceConversationId).startsWith("channel:")
+  ) {
+    sourceCandidates.push(`channel:${sourceConversationId}`);
   }
 
-  if (!getSourceRes.Item) {
-    const err = new Error(`Source conversation "${sourceConversationId}" not found`);
+  let sourceDoc = null;
+  let resolvedSourceConversationId = String(sourceConversationId);
+
+  for (const candidateId of sourceCandidates) {
+    let getSourceRes;
+    try {
+      getSourceRes = await ddbDocClient.send(
+        new GetCommand({
+          TableName: MESSAGES_TABLE,
+          Key: { conversationId: candidateId },
+        }),
+      );
+    } catch (dbError) {
+      console.error(
+        "[messageForwardService] DynamoDB GetCommand failed:",
+        dbError,
+      );
+      const err = new Error(
+        "Failed to fetch source conversation from database",
+      );
+      err.code = "INTERNAL_ERROR";
+      throw err;
+    }
+
+    if (getSourceRes.Item) {
+      sourceDoc = getSourceRes.Item;
+      resolvedSourceConversationId = candidateId;
+      break;
+    }
+  }
+
+  if (!sourceDoc) {
+    const err = new Error(
+      `Source conversation "${sourceConversationId}" not found`,
+    );
     err.code = "SOURCE_NOT_FOUND";
     throw err;
   }
 
-  const sourceMessages = Array.isArray(getSourceRes.Item.messages)
-    ? getSourceRes.Item.messages
+  const sourceMessages = Array.isArray(sourceDoc.messages)
+    ? sourceDoc.messages
     : [];
   const originalMessage = sourceMessages.find(
-    (m) => String(m.id) === String(originalMessageId),
+    (m) =>
+      String(m.id) === String(originalMessageId) ||
+      String(m.message_id) === String(originalMessageId) ||
+      String(m.messageId) === String(originalMessageId),
   );
 
   if (!originalMessage) {
     const err = new Error(
-      `Message with id "${originalMessageId}" not found in source conversation "${sourceConversationId}"`,
+      `Message with id "${originalMessageId}" not found in source conversation "${resolvedSourceConversationId}"`,
     );
     err.code = "MESSAGE_NOT_FOUND";
     throw err;
   }
 
   // ── Validate & deduplicate targets ────────────────────────────────────────
-  const { valid: validTargets, missing: missingTargets } = await validateTargetConversations(
-    targetConversationIds,
-    sourceConversationId,
-  );
+  const { valid: validTargets, missing: missingTargets } =
+    await validateTargetConversations(
+      targetConversationIds,
+      resolvedSourceConversationId,
+    );
 
   // ── Create forwarded copies ───────────────────────────────────────────────
   const results = [];
@@ -225,7 +275,11 @@ async function forwardMessage({ originalMessageId, sourceConversationId, targetC
 
   for (const targetId of validTargets) {
     try {
-      const savedMsg = await saveForwardedMessage(targetId, originalMessage, senderId);
+      const savedMsg = await saveForwardedMessage(
+        targetId,
+        originalMessage,
+        senderId,
+      );
 
       // Enrich with sender display info for real-time delivery
       const enriched = await enrichSenderInfo(senderId);
@@ -243,7 +297,10 @@ async function forwardMessage({ originalMessageId, sourceConversationId, targetC
         `[messageForwardService] Failed to forward to "${targetId}":`,
         forwardError,
       );
-      errors.push({ targetConversationId: targetId, error: forwardError.message });
+      errors.push({
+        targetConversationId: targetId,
+        error: forwardError.message,
+      });
     }
   }
 

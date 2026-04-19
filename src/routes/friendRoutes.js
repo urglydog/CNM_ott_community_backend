@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-const friendController = require('../controllers/friendController');
+const friendController = require('../modules/users/friendController');
 const authMiddleware = require('../middlewares/authMiddleware');
 
 // Tất cả các route đều cần xác thực JWT

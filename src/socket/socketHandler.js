@@ -31,7 +31,7 @@ async function getUserDisplayInfo(userId) {
  * In-memory map: userId (string) -> Set of socket.id
  * Mỗi user có thể mở nhiều tab/device → Set để lưu nhiều socket.id
  */
-const onlineUsers = new Map();
+const { onlineUsers, registerSocket, unregisterSocket } = require("./socketUserRegistry");
 
 let ioInstance = null;
 
@@ -142,10 +142,7 @@ function handleSocketConnection(io, socket) {
 
   // --- Đăng ký user vào danh sách online ---
   if (userIdKey) {
-    if (!onlineUsers.has(userIdKey)) {
-      onlineUsers.set(userIdKey, new Set());
-    }
-    onlineUsers.get(userIdKey).add(socket.id);
+    registerSocket(userIdKey, socket.id);
     console.log(`[socket] User ${userIdKey} connected with socket ${socket.id}`);
   }
 
@@ -588,13 +585,7 @@ function handleSocketConnection(io, socket) {
   // ============================================================
   socket.on('disconnect', () => {
     if (userIdKey) {
-      const sockets = onlineUsers.get(userIdKey);
-      if (sockets) {
-        sockets.delete(socket.id);
-        if (sockets.size === 0) {
-          onlineUsers.delete(userIdKey);
-        }
-      }
+      unregisterSocket(userIdKey, socket.id);
       console.log(`[socket] User ${userIdKey} disconnected socket ${socket.id}`);
     }
   });

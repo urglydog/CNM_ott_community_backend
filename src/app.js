@@ -22,6 +22,7 @@ const uploadRoutes = require("./modules/media/uploadRoutes");
 const statsRoutes = require("./modules/stats/statsRoutes");
 const messageRevokeRoutes = require("./modules/chat/messageRevokeRoutes");
 const messageDeleteRoutes = require("./modules/chat/messageDeleteRoutes");
+const messageForwardRoutes = require("./modules/chat/messageForwardRoutes");
 
 // Socket Handler
 const {
@@ -91,6 +92,7 @@ app.use("/api/friends", friendRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/messages-extension", messageRevokeRoutes);
 app.use("/api/messages-extension", messageDeleteRoutes);
+app.use("/api/messages-extension", messageForwardRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/channels", channelRoutes);
 app.use("/api/calls", callRoutes);

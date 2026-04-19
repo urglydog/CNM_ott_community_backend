@@ -144,6 +144,18 @@ function handleSocketConnection(io, socket) {
   if (userIdKey) {
     registerSocket(userIdKey, socket.id);
     console.log(`[socket] User ${userIdKey} connected with socket ${socket.id}`);
+
+    // Auto join vào tất cả các group mà user đang tham gia để nhận thông báo realtime
+    const { getGroupsForUser } = require('../modules/chat/groupService');
+    getGroupsForUser(userIdKey)
+      .then(groups => {
+        groups.forEach(g => {
+          socket.join(String(g.groupId));
+        });
+      })
+      .catch(err => {
+        console.error(`[socket] Lỗi auto-join groups cho user ${userIdKey}:`, err.message);
+      });
   }
 
   const emitToUserSockets = (targetUserId, eventName, payload) => {

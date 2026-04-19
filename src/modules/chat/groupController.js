@@ -129,14 +129,161 @@ async function debugMembers(req, res) {
   }
 }
 
+async function disbandGroup(req, res) {
+  try {
+    const { groupId } = req.params;
+    const requestUserId = req.user?.userId || req.user?.id;
+    
+    if (!requestUserId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+    
+    await groupService.disbandGroup(groupId, requestUserId);
+    res.status(200).json({ message: 'Group disbanded successfully' });
+  } catch (error) {
+    if (error.status === 403) {
+      res.status(403).json({ message: error.message });
+    } else {
+      res.status(500).json({ message: error.message });
+    }
+  }
+}
+
+async function addMembers(req, res) {
+  try {
+    const { groupId } = req.params;
+    const requestUserId = req.user?.userId || req.user?.id;
+    const { userIds } = req.body;
+
+    if (!requestUserId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const result = await groupService.addMembersToGroup(groupId, requestUserId, userIds);
+    res.status(201).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ message: error.message });
+  }
+}
+
+async function kickMember(req, res) {
+  try {
+    const { groupId, userId } = req.params; // targetUserId
+    const requestUserId = req.user?.userId || req.user?.id;
+
+    if (!requestUserId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const result = await groupService.kickMember(groupId, requestUserId, userId);
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ message: error.message });
+  }
+}
+
+async function updateRole(req, res) {
+  try {
+    const { groupId, userId } = req.params; // targetUserId
+    const { role } = req.body; // newRole
+    const requestUserId = req.user?.userId || req.user?.id;
+
+    if (!requestUserId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const result = await groupService.updateRole(groupId, requestUserId, userId, role);
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ message: error.message });
+  }
+}
+
+async function leaveGroup(req, res) {
+  try {
+    const { groupId } = req.params;
+    const requestUserId = req.user?.userId || req.user?.id;
+
+    if (!requestUserId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const result = await groupService.leaveGroup(groupId, requestUserId);
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ message: error.message });
+  }
+}
+
+async function requestToJoin(req, res) {
+  try {
+    const { groupId } = req.params;
+    const userId = req.user?.userId || req.user?.id;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const result = await groupService.requestToJoin(groupId, userId);
+    res.status(201).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ message: error.message });
+  }
+}
+
+async function getPendingRequests(req, res) {
+  try {
+    const { groupId } = req.params;
+    const result = await groupService.getPendingRequests(groupId);
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ message: error.message });
+  }
+}
+
+async function handleJoinRequest(req, res) {
+  try {
+    const { groupId, userId } = req.params; // userId là targetUserId (người xin vào bù)
+    const { action } = req.body;
+    const requestUserId = req.user?.userId || req.user?.id;
+
+    if (!requestUserId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const result = await groupService.handleJoinRequest(groupId, requestUserId, userId, action);
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ message: error.message });
+  }
+}
+
+async function updateGroupSettings(req, res) {
+  try {
+    const { groupId } = req.params;
+    const requestUserId = req.user?.userId || req.user?.id;
+
+    if (!requestUserId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const result = await groupService.updateGroupSettings(groupId, requestUserId, req.body || {});
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ message: error.message });
+  }
+}
+
 module.exports = {
   createGroup,
   listGroups,
   getGroupById,
   addMemberToGroup,
+  addMembers,
+  kickMember,
+  updateRole,
+  leaveGroup,
   getGroupMembers,
   getGroupsForUser,
   getInviteInfo,
   joinGroup,
-  debugMembers
+  debugMembers,
+  disbandGroup,
+  requestToJoin,
+  getPendingRequests,
+  handleJoinRequest,
+  updateGroupSettings
 };

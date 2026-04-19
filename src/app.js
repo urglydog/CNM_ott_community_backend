@@ -1,6 +1,7 @@
 const path = require("path");
 require("dotenv").config({
   path: process.env.DOTENV_PATH || path.join(__dirname, "..", ".env"),
+  override: true,
 });
 
 const express = require("express");
@@ -30,6 +31,9 @@ const {
 
 const app = express();
 const server = http.createServer(app);
+
+// eslint-disable-next-line no-console
+console.log(`[BOOT] OTP_EMAIL_PROVIDER=${process.env.OTP_EMAIL_PROVIDER || 'console'} OTP_SMS_PROVIDER=${process.env.OTP_SMS_PROVIDER || 'console'}`);
 
 const allowedOrigins = (
   process.env.FRONTEND_ORIGIN || "http://localhost:3000,http://localhost:3001"

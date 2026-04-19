@@ -21,6 +21,7 @@ function fileFilter(req, file, cb) {
   }
   return cb(null, true);
 }
+//thu coi
 
 const upload = multer({
   storage,

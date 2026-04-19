@@ -2,8 +2,10 @@ const messageService = require("./messageService");
 
 async function getMessagesForConversation(req, res) {
   try {
+    const currentUserId = req.user?.userId ?? req.user?.id ?? null;
     const messages = await messageService.getMessagesForConversation(
       req.params.conversationId,
+      currentUserId,
     );
     res.json(messages);
   } catch (error) {
@@ -15,8 +17,11 @@ async function getMessagesForChannel(req, res) {
   try {
     const channelId = req.params.channelId;
     const conversationId = `channel:${channelId}`;
-    const messages =
-      await messageService.getMessagesForConversation(conversationId);
+    const currentUserId = req.user?.userId ?? req.user?.id ?? null;
+    const messages = await messageService.getMessagesForConversation(
+      conversationId,
+      currentUserId,
+    );
     res.json(messages);
   } catch (error) {
     res.status(500).json({ message: error.message });

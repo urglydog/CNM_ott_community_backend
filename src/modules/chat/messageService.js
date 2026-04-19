@@ -93,7 +93,7 @@ async function saveMessage(payload) {
   };
 }
 
-async function getMessagesForConversation(conversationId) {
+async function getMessagesForConversation(conversationId, currentUserId) {
   if (!conversationId) return [];
 
   const res = await ddbDocClient.send(new GetCommand({
@@ -105,8 +105,16 @@ async function getMessagesForConversation(conversationId) {
     return [];
   }
 
-  // Đảm bảo sắp xếp theo thời gian
-  const messages = res.Item.messages.slice().sort((a, b) => {
+  // Filter out messages this user has hidden via "delete for me"
+  let messages = res.Item.messages;
+  if (currentUserId) {
+    messages = messages.filter(
+      (msg) => !msg.deletedFor?.map(String).includes(String(currentUserId)),
+    );
+  }
+
+  // Sort by createdAt ascending
+  messages = messages.slice().sort((a, b) => {
     const aTime = a.createdAt || "";
     const bTime = b.createdAt || "";
     return aTime.localeCompare(bTime);

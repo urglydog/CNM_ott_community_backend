@@ -292,9 +292,11 @@ async function saveFileMessage(data) {
 
   const attachmentType = resolveAttachmentType(data.attachment.mimetype);
   const messageType = attachmentType === "video" ? "video" : "file";
+  const persistedMessageId = randomUUID();
+  const createdAt = new Date().toISOString();
 
   const fileMessage = {
-    id: Date.now(),
+    id: persistedMessageId,
     senderId,
     contentType: messageType,
     content: data.attachment.originalname || "[file]",
@@ -306,7 +308,7 @@ async function saveFileMessage(data) {
       },
     ],
     reactions: null,
-    createdAt: new Date().toISOString(),
+    createdAt,
   };
 
   // Ưu tiên lưu đồng nhất với saveMessage để không lệch schema dữ liệu.
@@ -334,7 +336,8 @@ async function saveFileMessage(data) {
   );
 
   const item = {
-    message_id: randomUUID(),
+    id: persistedMessageId,
+    message_id: persistedMessageId,
     conversation_id: conversationId,
     sender_id: senderId,
     receiver_id: receiverId,
@@ -347,7 +350,7 @@ async function saveFileMessage(data) {
       },
     ],
     type: messageType,
-    created_at: new Date().toISOString(),
+    created_at: createdAt,
   };
 
   return item;

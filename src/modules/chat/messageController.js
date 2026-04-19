@@ -43,8 +43,7 @@ async function sendMessage(req, res) {
  */
 async function sendStickerMessage(req, res) {
   try {
-    const senderId =
-      req.body.senderId || req.user?.userId || req.user?.id;
+    const senderId = req.body.senderId || req.user?.userId || req.user?.id;
     const conversationId = req.body.conversationId;
 
     if (!senderId) {
@@ -59,7 +58,11 @@ async function sendStickerMessage(req, res) {
       return res.status(400).json({ message: "stickerData is required" });
     }
     if (!stickerData.stickerId && !stickerData.stickerUrl) {
-      return res.status(400).json({ message: "stickerId or stickerUrl is required in stickerData" });
+      return res
+        .status(400)
+        .json({
+          message: "stickerId or stickerUrl is required in stickerData",
+        });
     }
 
     const message = await messageService.saveMessage({
@@ -88,8 +91,7 @@ async function sendStickerMessage(req, res) {
  */
 async function sendEmojiMessage(req, res) {
   try {
-    const senderId =
-      req.body.senderId || req.user?.userId || req.user?.id;
+    const senderId = req.body.senderId || req.user?.userId || req.user?.id;
     const conversationId = req.body.conversationId;
 
     if (!senderId) {
@@ -149,7 +151,7 @@ async function sendFileMessage(req, res) {
         : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`);
 
     const messagePayload = {
-      id: savedMessage.message_id || Date.now(),
+      id: savedMessage.id || savedMessage.message_id || Date.now(),
       conversationId,
       senderId: savedMessage.sender_id || senderId,
       contentType: savedMessage.type || "file",

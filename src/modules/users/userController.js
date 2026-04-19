@@ -79,7 +79,7 @@ async function verifyEmailOTP(req, res) {
   try {
     const { email, otp } = req.body || {};
     await userService.verifyEmailOTP(email, otp);
-    return res.json({ message: 'Xác thực email thành công' });
+    return res.json({ message: 'Xác thực email thành công.' });
   } catch (error) {
     return res.status(400).json({ message: error.message });
   }
@@ -99,7 +99,7 @@ async function verifyPhoneOTP(req, res) {
   try {
     const { phone, otp } = req.body || {};
     await userService.verifyPhoneOTP(phone, otp);
-    return res.json({ message: 'Xác thực số điện thoại thành công' });
+    return res.json({ message: 'Xác thực số điện thoại thành công.' });
   } catch (error) {
     return res.status(400).json({ message: error.message });
   }
@@ -109,7 +109,7 @@ async function resetPassword(req, res) {
   try {
     const { identifier, otp, type, newPassword } = req.body || {};
     await userService.resetPassword({ identifier, otp, type, newPassword });
-    return res.json({ message: 'Đặt lại mật khẩu thành công' });
+    return res.json({ message: 'Đặt lại mật khẩu thành công.' });
   } catch (error) {
     return res.status(400).json({ message: error.message });
   }

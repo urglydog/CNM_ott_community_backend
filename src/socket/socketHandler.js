@@ -31,7 +31,7 @@ async function getUserDisplayInfo(userId) {
  * In-memory map: userId (string) -> Set of socket.id
  * Mỗi user có thể mở nhiều tab/device → Set để lưu nhiều socket.id
  */
-const onlineUsers = new Map();
+const { onlineUsers, registerSocket, unregisterSocket } = require("./socketUserRegistry");
 
 let ioInstance = null;
 
@@ -118,7 +118,7 @@ function socketAuthMiddleware(socket, next) {
   const token = socket.handshake.auth?.token;
 
   if (!token) {
-    return next(new Error('Authentication error: Token is required'));
+    return next(new Error('Lỗi xác thực: vui lòng cung cấp token'));
   }
 
   try {
@@ -126,7 +126,7 @@ function socketAuthMiddleware(socket, next) {
     socket.user = decoded;
     next();
   } catch (err) {
-    return next(new Error('Authentication error: Invalid or expired token'));
+    return next(new Error('Lỗi xác thực: token không hợp lệ hoặc đã hết hạn'));
   }
 }
 
@@ -142,10 +142,7 @@ function handleSocketConnection(io, socket) {
 
   // --- Đăng ký user vào danh sách online ---
   if (userIdKey) {
-    if (!onlineUsers.has(userIdKey)) {
-      onlineUsers.set(userIdKey, new Set());
-    }
-    onlineUsers.get(userIdKey).add(socket.id);
+    registerSocket(userIdKey, socket.id);
     console.log(`[socket] User ${userIdKey} connected with socket ${socket.id}`);
   }
 
@@ -172,12 +169,12 @@ function handleSocketConnection(io, socket) {
   // ============================================================
   socket.on('join_room', async ({ roomId }, callback) => {
     if (!roomId) {
-      _respond(callback, false, 'roomId is required');
+      _respond(callback, false, 'Vui lòng cung cấp roomId');
       return;
     }
 
     if (!userId) {
-      _respond(callback, false, 'User not authenticated');
+      _respond(callback, false, 'Người dùng chưa được xác thực');
       return;
     }
 
@@ -186,7 +183,7 @@ function handleSocketConnection(io, socket) {
 
     if (!isMember) {
       console.warn(`[join_room] User ${userId} denied: not a member of group ${roomId}`);
-      _respond(callback, false, 'Access denied: you are not a member of this group');
+      _respond(callback, false, 'Từ chối truy cập: bạn không phải là thành viên của nhóm này');
       return;
     }
 
@@ -296,6 +293,12 @@ function handleSocketConnection(io, socket) {
           const receiverSockets = onlineUsers.get(String(receiverId));
           if (receiverSockets) {
             for (const sockId of receiverSockets) {
+              const receiverSocket = io.sockets.sockets.get(sockId);
+              const alreadyInRoom = receiverSocket?.rooms?.has(payload.roomId);
+
+              // Socket đã ở trong phòng thì đã nhận từ io.to(roomId).emit phía trên.
+              if (alreadyInRoom) continue;
+
               io.to(sockId).emit('receive_message', enrichedMessage);
             }
           }
@@ -605,13 +608,7 @@ function handleSocketConnection(io, socket) {
   // ============================================================
   socket.on('disconnect', () => {
     if (userIdKey) {
-      const sockets = onlineUsers.get(userIdKey);
-      if (sockets) {
-        sockets.delete(socket.id);
-        if (sockets.size === 0) {
-          onlineUsers.delete(userIdKey);
-        }
-      }
+      unregisterSocket(userIdKey, socket.id);
       console.log(`[socket] User ${userIdKey} disconnected socket ${socket.id}`);
     }
   });

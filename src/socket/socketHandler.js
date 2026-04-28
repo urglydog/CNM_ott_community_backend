@@ -4,7 +4,7 @@ const {
   GetCommand,
   QueryCommand,
 } = require("@aws-sdk/lib-dynamodb");
-const { saveMessage } = require("../modules/chat/messageService");
+const { saveMessage } = require("../modules/messages/messageService");
 const { verifyToken } = require("../common/utils/jwt");
 
 const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
@@ -169,7 +169,7 @@ function handleSocketConnection(io, socket) {
     );
 
     // Auto join vào tất cả các group mà user đang tham gia để nhận thông báo realtime
-    const { getGroupsForUser } = require("../modules/chat/groupService");
+    const { getGroupsForUser } = require("../modules/groups/groupService");
     getGroupsForUser(userIdKey)
       .then((groups) => {
         groups.forEach((g) => {

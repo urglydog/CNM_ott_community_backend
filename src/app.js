@@ -13,16 +13,16 @@ const { Server } = require("socket.io");
 const authRoutes = require("./modules/auth/authRoutes");
 const userRoutes = require("./modules/users/userRoutes");
 const friendRoutes = require("./modules/users/friendRoutes");
-const messageRoutes = require("./modules/chat/messageRoutes");
-const groupRoutes = require("./modules/chat/groupRoutes");
-const channelRoutes = require("./modules/chat/channelRoutes");
-const callRoutes = require("./modules/chat/callRoutes");
-const botRoutes = require("./modules/chat/botRoutes");
+const messageRoutes = require("./modules/messages/messageRoutes");
+const groupRoutes = require("./modules/groups/groupRoutes");
+const channelRoutes = require("./modules/channels/channelRoutes");
+const callRoutes = require("./modules/calls/callRoutes");
+const botRoutes = require("./modules/bots/botRoutes");
 const uploadRoutes = require("./modules/media/uploadRoutes");
 const statsRoutes = require("./modules/stats/statsRoutes");
-const messageRevokeRoutes = require("./modules/chat/messageRevokeRoutes");
-const messageDeleteRoutes = require("./modules/chat/messageDeleteRoutes");
-const messageForwardRoutes = require("./modules/chat/messageForwardRoutes");
+const messageRevokeRoutes = require("./modules/messages/messageRevokeRoutes");
+const messageDeleteRoutes = require("./modules/messages/messageDeleteRoutes");
+const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
 
 // Socket Handler
 const {

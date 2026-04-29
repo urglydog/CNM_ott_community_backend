@@ -133,6 +133,7 @@ async function sendFileMessage(req, res) {
       req.body.sender_id || req.body.senderId || req.user?.userId;
     const receiverId = req.body.receiver_id || req.body.receiverId || null;
     const channelId = req.body.channel_id || req.body.channelId || null;
+    const groupId = req.body.group_id || req.body.groupId || req.body.roomId || req.body.conversationId || null;
 
     const uploadedFile = await messageService.uploadFileToS3(req.file);
 
@@ -140,12 +141,14 @@ async function sendFileMessage(req, res) {
       sender_id: senderId,
       receiver_id: receiverId,
       channel_id: channelId,
+      group_id: groupId,
       attachment: uploadedFile,
     });
 
     const conversationId =
       savedMessage.conversationId ||
       savedMessage.conversation_id ||
+      groupId ||
       (channelId
         ? `channel:${channelId}`
         : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`);

@@ -275,18 +275,21 @@ async function saveFileMessage(data) {
   const senderId = data.sender_id || data.senderId;
   const receiverId = data.receiver_id || data.receiverId || null;
   const channelId = data.channel_id || data.channelId || null;
+  const groupId = data.group_id || data.groupId || data.roomId || data.conversationId || null;
 
   if (!senderId) {
     throw new Error("sender_id is required");
   }
-  if (!receiverId && !channelId) {
-    throw new Error("receiver_id or channel_id is required");
+  if (!receiverId && !channelId && !groupId) {
+    throw new Error("receiver_id, channel_id, or group_id is required");
   }
   if (!data.attachment || !data.attachment.url) {
     throw new Error("attachment metadata is required");
   }
 
-  const conversationId = channelId
+  const conversationId = groupId
+    ? groupId
+    : channelId
     ? `channel:${channelId}`
     : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`;
 

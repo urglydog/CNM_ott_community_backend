@@ -75,6 +75,36 @@ async function sendEmailOTP(req, res) {
   }
 }
 
+async function startPasswordRecovery(req, res) {
+  try {
+    const { identifier } = req.body || {};
+    const result = await userService.sendPasswordRecoveryOTP(identifier);
+    return res.json(result);
+  } catch (error) {
+    return res.status(400).json({ message: error.message });
+  }
+}
+
+async function verifyPasswordRecoveryOTP(req, res) {
+  try {
+    const { recoveryToken, otp } = req.body || {};
+    await userService.verifyPasswordRecoveryOTP(recoveryToken, otp);
+    return res.json({ message: 'Xác thực OTP thành công.' });
+  } catch (error) {
+    return res.status(400).json({ message: error.message });
+  }
+}
+
+async function resetPasswordWithRecovery(req, res) {
+  try {
+    const { recoveryToken, newPassword } = req.body || {};
+    await userService.resetPasswordWithRecovery(recoveryToken, newPassword);
+    return res.json({ message: 'Đặt lại mật khẩu thành công.' });
+  } catch (error) {
+    return res.status(400).json({ message: error.message });
+  }
+}
+
 async function verifyEmailOTP(req, res) {
   try {
     const { email, otp } = req.body || {};
@@ -125,5 +155,8 @@ module.exports = {
   verifyEmailOTP,
   sendPhoneOTP,
   verifyPhoneOTP,
+  startPasswordRecovery,
+  verifyPasswordRecoveryOTP,
+  resetPasswordWithRecovery,
   resetPassword,
 };

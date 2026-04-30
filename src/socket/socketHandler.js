@@ -5,6 +5,8 @@ const {
   QueryCommand,
 } = require("@aws-sdk/lib-dynamodb");
 const { saveMessage } = require("../modules/messages/messageService");
+const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
+const { notifyMessageCreated } = require("../modules/notifications/notificationService");
 const { verifyToken } = require("../common/utils/jwt");
 
 const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
@@ -89,7 +91,7 @@ function getIO() {
  * @returns {Promise<boolean>}
  */
 async function checkUserInGroup(groupId, userId) {
-  const targetGroupId = String(groupId);
+  let targetGroupId = String(groupId);
   const targetUserId = String(userId);
 
   // --- DM conversation: "dm:userA:userB" ---
@@ -104,6 +106,11 @@ async function checkUserInGroup(groupId, userId) {
     // malformed dm: treat as not a member
     console.warn(`[checkUserInGroup] Malformed DM roomId: ${targetGroupId}`);
     return false;
+  }
+
+  // Gọt bỏ chữ "channel:" nếu frontend lỡ gửi thừa
+  if (targetGroupId.startsWith("channel:")) {
+    targetGroupId = targetGroupId.replace("channel:", "");
   }
 
   // --- Group: Query bảng ott_group_members với composite key (groupId, userId) ---
@@ -411,6 +418,8 @@ function handleSocketConnection(io, socket) {
         }
       }
 
+      await notifyMessageCreated(enrichedMessage, io);
+
       _respond(callback, true, null, { message: enrichedMessage });
     } catch (error) {
       console.error("[send_message] saveMessage error:", error.message);
@@ -530,7 +539,8 @@ function handleSocketConnection(io, socket) {
   });
 
   socket.on("group-call-request", async (data = {}, callback) => {
-    const { groupId, callerName } = data;
+    let { groupId, callerName } = data;
+    const roomId = String(data.roomId || "").trim();
 
     if (!groupId) {
       _respond(callback, false, "groupId is required");
@@ -542,37 +552,65 @@ function handleSocketConnection(io, socket) {
       return;
     }
 
-    const normalizedGroupId = String(groupId).startsWith("group_")
-      ? String(groupId)
-      : `group_${groupId}`;
+    if (String(groupId).startsWith("channel:")) {
+      groupId = String(groupId).replace("channel:", "");
+    }
 
-    const isMember = await checkUserInGroup(normalizedGroupId, userId);
+    const isMember = await checkUserInGroup(groupId, userId);
     if (!isMember) {
       _respond(callback, false, "Not a member of this group");
       return;
     }
 
-    if (!socket.rooms.has(normalizedGroupId)) {
+    if (!socket.rooms.has(String(groupId)) && !socket.rooms.has(`channel:${groupId}`)) {
       console.warn(
-        `[Call Group] Caller ${userIdKey} has not joined room ${normalizedGroupId}; reject signaling`,
+        `[Call Group] Caller ${userIdKey} has not joined room ${groupId}; reject signaling`,
       );
       _respond(callback, false, "Caller has not joined the group room");
       return;
     }
 
     const payload = {
-      groupId: normalizedGroupId,
-      roomId: String(data.roomId || ""),
+      groupId: String(groupId),
+      roomId: roomId,
       callerName: callerName || socket.user?.username || "",
       callerId: String(data.callerId || userIdKey),
       isGroupCall: true,
     };
 
     console.log(
-      `[Call Group] Bao thuc phong: ${normalizedGroupId} do ${payload.callerName || userId} goi`,
+      `[Call Group] Bao thuc phong: ${groupId} do ${payload.callerName || userId} goi`,
     );
 
-    socket.to(normalizedGroupId).emit("group-call-request", payload);
+    // Register call to activeCalls so handleCallAccept can find it
+    const record = {
+      callerId: payload.callerId,
+      receiverIds: [String(groupId)], // For group, receiver is the group itself
+      status: "ringing",
+      timeoutRef: null,
+      isGroupCall: true
+    };
+    clearActiveCall(roomId);
+    activeCalls.set(roomId, record);
+    
+    record.timeoutRef = setTimeout(() => {
+      emitToCallParticipants(record, "call-timeout", {
+        roomId,
+        callerId: payload.callerId,
+        reason: "timeout",
+      });
+      // Also emit to the group room directly
+      io.to(String(groupId)).emit("call-timeout", {
+        roomId,
+        callerId: payload.callerId,
+        reason: "timeout",
+      });
+      clearActiveCall(roomId);
+    }, 30_000);
+
+    socket.to(String(groupId)).emit("group-call-request", payload);
+    // Emit sang cả room channel:... để đảm bảo clients cũ đang ở đó cũng nhận được
+    socket.to(`channel:${groupId}`).emit("group-call-request", payload);
 
     _respond(callback, true);
   });
@@ -691,6 +729,81 @@ function handleSocketConnection(io, socket) {
 
   socket.on("call-rejected", (data = {}, callback) => {
     socket.emit("call-reject", data, callback);
+  });
+
+  // ============================================================
+  // MARK READ — đánh dấu tin nhắn đã đọc (Read Receipts)
+  // ============================================================
+  socket.on("mark_read", async ({ conversationId, messageId }, callback) => {
+    if (!conversationId) {
+      return _respond(callback, false, "conversationId is required");
+    }
+    if (!messageId) {
+      return _respond(callback, false, "messageId is required");
+    }
+    if (!userId) {
+      return _respond(callback, false, "User not authenticated");
+    }
+
+    try {
+      // Verify membership
+      const isMember = await checkUserInGroup(conversationId, userId);
+      if (!isMember) {
+        return _respond(callback, false, "Not a member of this conversation");
+      }
+
+      // Get user display info for the reader
+      const readerInfo = await getUserDisplayInfo(userId);
+
+      // Save the read receipt
+      await saveReadReceipt({
+        conversationId,
+        messageId: String(messageId),
+        userId: String(userId),
+        readerName: readerInfo.displayName,
+        readerAvatar: readerInfo.avatarUrl,
+      });
+
+      console.log(`[mark_read] User ${userId} marked message ${messageId} as read in conversation ${conversationId}`);
+
+      // Determine the sender of the message to notify them
+      // For DM conversations, notify the other participant
+      if (conversationId.startsWith("dm:")) {
+        const parts = conversationId.split(":");
+        if (parts.length >= 3) {
+          const senderId = parts[1] === String(userId) ? parts[2] : parts[1];
+          // Emit to the sender's sockets
+          const readReceiptPayload = {
+            conversationId,
+            messageId: String(messageId),
+            readerId: String(userId),
+            readerName: readerInfo.displayName,
+            readerAvatar: readerInfo.avatarUrl,
+            readAt: new Date().toISOString(),
+          };
+
+          // Emit directly to the sender's sockets
+          emitToUserSockets(senderId, "message_read", readReceiptPayload);
+          console.log(`[mark_read] Notified sender ${senderId} that message ${messageId} was read`);
+        }
+      } else {
+        // For group chats, emit to the room so the sender can see who read their message
+        // The sender will receive this if they're in the room
+        socket.to(conversationId).emit("message_read", {
+          conversationId,
+          messageId: String(messageId),
+          readerId: String(userId),
+          readerName: readerInfo.displayName,
+          readerAvatar: readerInfo.avatarUrl,
+          readAt: new Date().toISOString(),
+        });
+      }
+
+      _respond(callback, true);
+    } catch (error) {
+      console.error("[mark_read] Error:", error.message);
+      _respond(callback, false, error.message);
+    }
   });
 
   // ============================================================

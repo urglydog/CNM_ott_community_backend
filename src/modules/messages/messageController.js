@@ -1,4 +1,5 @@
 const messageService = require("./messageService");
+const { notifyMessageCreated } = require("../notifications/notificationService");
 
 async function getMessagesForConversation(req, res) {
   try {
@@ -31,7 +32,48 @@ async function getMessagesForChannel(req, res) {
 async function sendMessage(req, res) {
   try {
     const message = await messageService.saveMessage(req.body);
+    const io = req.app.get("socketio");
+    if (io) {
+      io.to(message.conversationId).emit("receive_message", message);
+    }
+    await notifyMessageCreated(message, io);
     res.status(201).json(message);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
+async function searchMessages(req, res) {
+  try {
+    const currentUserId = req.user?.userId ?? req.user?.id ?? null;
+    const result = await messageService.searchMessagesInConversation({
+      conversationId: req.query.conversationId,
+      keyword: req.query.keyword,
+      senderId: req.query.senderId,
+      fromDate: req.query.fromDate || req.query.from,
+      toDate: req.query.toDate || req.query.to,
+      limit: req.query.limit,
+      currentUserId,
+    });
+
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
+async function searchMessagesGlobal(req, res) {
+  try {
+    const currentUserId = req.user?.userId ?? req.user?.id ?? null;
+    const result = await messageService.searchMessagesForUserGlobal({
+      keyword: req.query.keyword,
+      fromDate: req.query.fromDate || req.query.from,
+      toDate: req.query.toDate || req.query.to,
+      limit: req.query.limit,
+      currentUserId,
+    });
+
+    res.json(result);
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -78,6 +120,7 @@ async function sendStickerMessage(req, res) {
     if (io) {
       io.to(conversationId).emit("receive_message", message);
     }
+    await notifyMessageCreated(message, io);
 
     res.status(201).json(message);
   } catch (error) {
@@ -116,6 +159,7 @@ async function sendEmojiMessage(req, res) {
     if (io) {
       io.to(conversationId).emit("receive_message", message);
     }
+    await notifyMessageCreated(message, io);
 
     res.status(201).json(message);
   } catch (error) {
@@ -133,6 +177,7 @@ async function sendFileMessage(req, res) {
       req.body.sender_id || req.body.senderId || req.user?.userId;
     const receiverId = req.body.receiver_id || req.body.receiverId || null;
     const channelId = req.body.channel_id || req.body.channelId || null;
+    const groupId = req.body.group_id || req.body.groupId || req.body.roomId || req.body.conversationId || null;
 
     const uploadedFile = await messageService.uploadFileToS3(req.file);
 
@@ -140,12 +185,14 @@ async function sendFileMessage(req, res) {
       sender_id: senderId,
       receiver_id: receiverId,
       channel_id: channelId,
+      group_id: groupId,
       attachment: uploadedFile,
     });
 
     const conversationId =
       savedMessage.conversationId ||
       savedMessage.conversation_id ||
+      groupId ||
       (channelId
         ? `channel:${channelId}`
         : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`);
@@ -170,6 +217,7 @@ async function sendFileMessage(req, res) {
     if (io) {
       io.to(conversationId).emit("receive_message", messagePayload);
     }
+    await notifyMessageCreated(messagePayload, io);
 
     return res.status(201).json({
       message: "File message sent successfully",
@@ -184,6 +232,8 @@ module.exports = {
   getMessagesForConversation,
   getMessagesForChannel,
   sendMessage,
+  searchMessages,
+  searchMessagesGlobal,
   sendFileMessage,
   sendStickerMessage,
   sendEmojiMessage,

@@ -4,6 +4,10 @@ const bcrypt = require('bcryptjs');
 
 const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
 
+function normalizeUsername(input) {
+  return String(input || '').trim().normalize('NFKC');
+}
+
 function normalizePhoneNumber(input) {
   const raw = String(input || '').trim();
   if (!raw) return '';
@@ -27,6 +31,34 @@ function isValidPhoneNumber(phoneNumber) {
   return /^(0[3-9])[0-9]{8}$/.test(String(phoneNumber || ''));
 }
 
+const USER_PHONE_SCAN_ATTRIBUTES = {
+  '#userId': 'userId',
+  '#phone_number': 'phone_number',
+  '#username': 'username'
+};
+
+const USER_LOGIN_SCAN_ATTRIBUTES = {
+  '#userId': 'userId',
+  '#username': 'username',
+  '#phone_number': 'phone_number',
+  '#password_hash': 'password_hash'
+};
+
+const USER_LOGIN_PROFILE_SCAN_ATTRIBUTES = {
+  '#userId': 'userId',
+  '#username': 'username',
+  '#phone_number': 'phone_number',
+  '#password_hash': 'password_hash',
+  '#email': 'email',
+  '#display_name': 'display_name',
+  '#avatar_url': 'avatar_url',
+  '#email_verified': 'email_verified',
+  '#phone_verified': 'phone_verified',
+  '#status': 'status',
+  '#created_at': 'created_at',
+  '#updated_at': 'updated_at'
+};
+
 async function findUserByPhone(phoneNumber) {
   const normalizedInputPhone = normalizePhoneNumber(phoneNumber);
   if (!normalizedInputPhone) return null;
@@ -35,7 +67,8 @@ async function findUserByPhone(phoneNumber) {
   do {
     const result = await ddbDocClient.send(new ScanCommand({
       TableName: USERS_TABLE,
-      ProjectionExpression: 'userId, phone_number, username',
+      ProjectionExpression: '#userId, #phone_number, #username',
+      ExpressionAttributeNames: USER_PHONE_SCAN_ATTRIBUTES,
       ExclusiveStartKey: lastEvaluatedKey,
     }));
 
@@ -51,21 +84,60 @@ async function findUserByPhone(phoneNumber) {
 }
 
 async function findUserByUsername(username) {
-  if (!username) return null;
+  const normalizedInputUsername = normalizeUsername(username);
+  if (!normalizedInputUsername) return null;
 
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: USERS_TABLE,
-    FilterExpression: '#username = :username',
-    ExpressionAttributeNames: { '#username': 'username' },
-    ExpressionAttributeValues: { ':username': String(username).trim() },
-    Limit: 1,
-  }));
+  let lastEvaluatedKey;
+  const matches = [];
+  do {
+    const result = await ddbDocClient.send(new ScanCommand({
+      TableName: USERS_TABLE,
+      ProjectionExpression: '#userId, #username, #phone_number, #password_hash',
+      ExpressionAttributeNames: USER_LOGIN_SCAN_ATTRIBUTES,
+      ExclusiveStartKey: lastEvaluatedKey,
+    }));
 
-  return result.Items && result.Items.length > 0 ? result.Items[0] : null;
+    const matched = (result.Items || []).find((item) =>
+      normalizeUsername(item.username) === normalizedInputUsername
+    );
+
+    if (matched) matches.push(matched);
+    lastEvaluatedKey = result.LastEvaluatedKey;
+  } while (lastEvaluatedKey);
+
+  return matches.length > 0 ? matches[0] : null;
+}
+
+async function findUsersByUsername(username) {
+  const normalizedInputUsername = normalizeUsername(username);
+  if (!normalizedInputUsername) return [];
+
+  let lastEvaluatedKey;
+  const matches = [];
+  do {
+    const result = await ddbDocClient.send(new ScanCommand({
+      TableName: USERS_TABLE,
+      ProjectionExpression: '#userId, #username, #phone_number, #password_hash, #email, #display_name, #avatar_url, #email_verified, #phone_verified, #status, #created_at, #updated_at',
+      ExpressionAttributeNames: USER_LOGIN_PROFILE_SCAN_ATTRIBUTES,
+      ExclusiveStartKey: lastEvaluatedKey,
+    }));
+
+    for (const item of result.Items || []) {
+      if (normalizeUsername(item.username) === normalizedInputUsername) {
+        matches.push(item);
+      }
+    }
+
+    lastEvaluatedKey = result.LastEvaluatedKey;
+  } while (lastEvaluatedKey);
+
+  return matches;
 }
 
 async function registerUser(payload) {
-  if (!payload.username || !payload.password) {
+  const normalizedUsername = normalizeUsername(payload.username);
+
+  if (!normalizedUsername || !payload.password) {
     throw new Error('Vui lòng nhập tên đăng nhập và mật khẩu');
   }
 
@@ -82,7 +154,7 @@ async function registerUser(payload) {
     throw new Error('Số điện thoại đã được đăng ký');
   }
 
-  const existingUsername = await findUserByUsername(payload.username);
+  const existingUsername = await findUserByUsername(normalizedUsername);
   if (existingUsername) {
     throw new Error('Tên đăng nhập đã tồn tại');
   }
@@ -101,11 +173,11 @@ async function registerUser(payload) {
   const item = {
     userId,
     id,
-    username: String(payload.username).trim(),
+    username: normalizedUsername,
     password_hash: passwordHash,
     email: payload.email ? String(payload.email).trim() : null,
     phone_number: normalizedPhoneNumber,
-    display_name: payload.displayName || payload.username,
+    display_name: payload.displayName || normalizedUsername,
     avatar_url: null,
     email_verified: false,
     phone_verified: false,
@@ -123,31 +195,35 @@ async function registerUser(payload) {
 }
 
 async function loginUser(payload) {
-  if (!payload.username) {
+  const normalizedUsername = normalizeUsername(payload.username);
+
+  if (!normalizedUsername) {
     throw new Error('Vui lòng nhập tên đăng nhập');
   }
   if (!payload.password) {
     throw new Error('Vui lòng nhập mật khẩu');
   }
 
-  const result = await ddbDocClient.send(new ScanCommand({
-    TableName: USERS_TABLE,
-    FilterExpression: '#username = :u',
-    ExpressionAttributeNames: { '#username': 'username' },
-    ExpressionAttributeValues: { ':u': payload.username }
-  }));
+  const matchingUsers = await findUsersByUsername(normalizedUsername);
 
-  if (!result.Items || result.Items.length === 0) {
+  if (matchingUsers.length === 0) {
     throw new Error('Không tìm thấy tài khoản, vui lòng đăng ký trước');
   }
 
-  const userRow = result.Items[0];
-  const passwordMatch = await bcrypt.compare(payload.password, userRow.password_hash);
-  if (!passwordMatch) {
+  let authenticatedUser = null;
+  for (const userRow of matchingUsers) {
+    const passwordMatch = await bcrypt.compare(payload.password, userRow.password_hash);
+    if (passwordMatch) {
+      authenticatedUser = userRow;
+      break;
+    }
+  }
+
+  if (!authenticatedUser) {
     throw new Error('Tên đăng nhập hoặc mật khẩu không đúng');
   }
 
-  const { password_hash, ...userWithoutPassword } = userRow;
+  const { password_hash, ...userWithoutPassword } = authenticatedUser;
   return userWithoutPassword;
 }
 

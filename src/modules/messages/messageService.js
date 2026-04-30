@@ -1,8 +1,9 @@
 const { ddbDocClient } = require("../../config/awsConfig");
-const { PutCommand, GetCommand } = require("@aws-sdk/lib-dynamodb");
+const { PutCommand, GetCommand, ScanCommand } = require("@aws-sdk/lib-dynamodb");
 const { PutObjectCommand } = require("@aws-sdk/client-s3");
 const { randomUUID } = require("crypto");
 const { s3Client } = require("../../config/awsConfig");
+const { getGroupsForUser } = require("../groups/groupService");
 
 // Bảng messages trong DynamoDB (primary key: conversationId (S))
 // Mỗi conversationId sẽ là 1 document chứa mảng messages
@@ -237,6 +238,7 @@ function resolveAttachmentType(mimetype) {
   if (!mimetype) return "file";
   if (mimetype.startsWith("image/")) return "image";
   if (mimetype.startsWith("video/")) return "video";
+  if (mimetype.startsWith("audio/")) return "voice";
   return "file";
 }
 
@@ -275,23 +277,26 @@ async function saveFileMessage(data) {
   const senderId = data.sender_id || data.senderId;
   const receiverId = data.receiver_id || data.receiverId || null;
   const channelId = data.channel_id || data.channelId || null;
+  const groupId = data.group_id || data.groupId || data.roomId || data.conversationId || null;
 
   if (!senderId) {
     throw new Error("sender_id is required");
   }
-  if (!receiverId && !channelId) {
-    throw new Error("receiver_id or channel_id is required");
+  if (!receiverId && !channelId && !groupId) {
+    throw new Error("receiver_id, channel_id, or group_id is required");
   }
   if (!data.attachment || !data.attachment.url) {
     throw new Error("attachment metadata is required");
   }
 
-  const conversationId = channelId
+  const conversationId = groupId
+    ? groupId
+    : channelId
     ? `channel:${channelId}`
     : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`;
 
   const attachmentType = resolveAttachmentType(data.attachment.mimetype);
-  const messageType = attachmentType === "video" ? "video" : "file";
+  const messageType = attachmentType === "voice" ? "voice" : attachmentType === "video" ? "video" : "file";
   const persistedMessageId = randomUUID();
   const createdAt = new Date().toISOString();
 
@@ -378,10 +383,286 @@ async function saveStickerMessage(data) {
     stickerData: data.stickerData,
   });
 }
+
+function toLowerSafe(value) {
+  return String(value ?? "").toLowerCase();
+}
+
+function normalizeDateInput(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function parseDateBoundary(value, bound) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const suffix = bound === "end" ? "T23:59:59.999" : "T00:00:00.000";
+    const date = new Date(`${raw}${suffix}`);
+    return Number.isNaN(date.getTime()) ? null : date.getTime();
+  }
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.getTime();
+}
+
+function getMessageTimeMs(message) {
+  const createdAt = normalizeDateInput(message?.createdAt);
+  return createdAt ? createdAt.getTime() : null;
+}
+
+function messageMatchesSearchFilters(message, { keyword, senderId, fromMs, toMs }) {
+  if (senderId && String(message.senderId) !== senderId) {
+    return false;
+  }
+
+  const createdAtMs = getMessageTimeMs(message);
+  if ((fromMs != null || toMs != null) && createdAtMs == null) {
+    return false;
+  }
+  if (fromMs != null && createdAtMs != null && createdAtMs < fromMs) {
+    return false;
+  }
+  if (toMs != null && createdAtMs != null && createdAtMs > toMs) {
+    return false;
+  }
+
+  if (!keyword) return true;
+  return toLowerSafe(buildSearchHaystack(message)).includes(keyword);
+}
+
+function isDmConversationAccessible(conversationId, userId) {
+  if (!conversationId.startsWith("dm:")) return false;
+  const parts = conversationId.slice(3).split(":").map((p) => String(p).trim());
+  if (parts.length !== 2) return false;
+  return parts.includes(String(userId));
+}
+
+function buildSearchHaystack(message) {
+  const attachmentText = Array.isArray(message.attachments)
+    ? message.attachments
+        .map((attachment) => [attachment?.name, attachment?.url, attachment?.type]
+          .filter(Boolean)
+          .join(" "))
+        .join(" ")
+    : "";
+
+  const stickerText = message.stickerData
+    ? [message.stickerData.stickerId, message.stickerData.stickerName, message.stickerData.stickerPack]
+        .filter(Boolean)
+        .join(" ")
+    : "";
+
+  return [
+    message.content,
+    message.contentType,
+    message.senderDisplayName,
+    message.senderUsername,
+    attachmentText,
+    stickerText,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+async function searchMessagesInConversation({
+  conversationId,
+  keyword,
+  senderId,
+  fromDate,
+  toDate,
+  limit = 50,
+  currentUserId,
+}) {
+  if (!conversationId) {
+    throw new Error("conversationId is required");
+  }
+
+  const res = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MESSAGES_TABLE,
+      Key: { conversationId },
+    }),
+  );
+
+  let messages = Array.isArray(res.Item?.messages) ? res.Item.messages.slice() : [];
+
+  if (currentUserId) {
+    messages = messages.filter(
+      (msg) => !msg.deletedFor?.map(String).includes(String(currentUserId)),
+    );
+  }
+
+  const normalizedKeyword = toLowerSafe(keyword).trim();
+  const normalizedSenderId = senderId != null && String(senderId).trim() !== ""
+    ? String(senderId).trim()
+    : "";
+  const fromMs = parseDateBoundary(fromDate, "start");
+  const toMs = parseDateBoundary(toDate, "end");
+
+  let filtered = messages.filter((msg) => {
+    return messageMatchesSearchFilters(msg, {
+      keyword: normalizedKeyword,
+      senderId: normalizedSenderId,
+      fromMs,
+      toMs,
+    });
+  });
+
+  filtered = filtered
+    .slice()
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+
+  const maxResults = Math.max(1, Math.min(Number(limit) || 50, 200));
+  const paged = filtered.slice(0, maxResults);
+
+  const enriched = await Promise.all(
+    paged.map(async (msg) => {
+      const info = await enrichSenderInfo(msg.senderId);
+      return {
+        id: msg.id,
+        conversationId,
+        senderId: msg.senderId,
+        contentType: msg.contentType,
+        content: msg.content,
+        ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
+        attachments: msg.attachments || null,
+        reactions: msg.reactions || null,
+        createdAt: msg.createdAt,
+        senderDisplayName: info.senderDisplayName,
+        senderAvatarUrl: info.senderAvatarUrl,
+      };
+    }),
+  );
+
+  return {
+    conversationId,
+    keyword: normalizedKeyword,
+    filters: {
+      senderId: normalizedSenderId || null,
+      fromDate: fromDate || null,
+      toDate: toDate || null,
+      limit: maxResults,
+    },
+    count: enriched.length,
+    data: enriched,
+  };
+}
+
+async function searchMessagesForUserGlobal({
+  keyword,
+  fromDate,
+  toDate,
+  limit = 50,
+  currentUserId,
+}) {
+  if (!currentUserId) {
+    throw new Error("currentUserId is required");
+  }
+
+  const userId = String(currentUserId);
+  const normalizedKeyword = toLowerSafe(keyword).trim();
+  const fromMs = parseDateBoundary(fromDate, "start");
+  const toMs = parseDateBoundary(toDate, "end");
+  const maxResults = Math.max(1, Math.min(Number(limit) || 50, 200));
+
+  let userGroups = [];
+  try {
+    userGroups = await getGroupsForUser(userId);
+  } catch {
+    userGroups = [];
+  }
+  const allowedGroupIds = new Set(
+    (userGroups || []).map((group) => String(group.groupId || "")).filter(Boolean),
+  );
+
+  const rows = [];
+  let lastEvaluatedKey;
+  do {
+    const scanRes = await ddbDocClient.send(
+      new ScanCommand({
+        TableName: MESSAGES_TABLE,
+        ExclusiveStartKey: lastEvaluatedKey,
+      }),
+    );
+
+    for (const item of scanRes.Items || []) {
+      const conversationId = String(item?.conversationId || "").trim();
+      if (!conversationId) continue;
+
+      const accessible = conversationId.startsWith("dm:")
+        ? isDmConversationAccessible(conversationId, userId)
+        : allowedGroupIds.has(conversationId);
+
+      if (!accessible) continue;
+
+      const messages = Array.isArray(item.messages) ? item.messages : [];
+      for (const msg of messages) {
+        if (msg?.deletedFor?.map(String).includes(userId)) {
+          continue;
+        }
+
+        const match = messageMatchesSearchFilters(msg, {
+          keyword: normalizedKeyword,
+          senderId: "",
+          fromMs,
+          toMs,
+        });
+        if (!match) continue;
+
+        rows.push({ ...msg, conversationId });
+      }
+    }
+
+    lastEvaluatedKey = scanRes.LastEvaluatedKey;
+  } while (lastEvaluatedKey);
+
+  rows.sort((a, b) => {
+    const aMs = getMessageTimeMs(a) || 0;
+    const bMs = getMessageTimeMs(b) || 0;
+    return bMs - aMs;
+  });
+
+  const paged = rows.slice(0, maxResults);
+  const enriched = await Promise.all(
+    paged.map(async (msg) => {
+      const info = await enrichSenderInfo(msg.senderId);
+      return {
+        id: msg.id,
+        conversationId: msg.conversationId,
+        senderId: msg.senderId,
+        contentType: msg.contentType,
+        content: msg.content,
+        ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
+        attachments: msg.attachments || null,
+        reactions: msg.reactions || null,
+        createdAt: msg.createdAt,
+        senderDisplayName: info.senderDisplayName,
+        senderAvatarUrl: info.senderAvatarUrl,
+      };
+    }),
+  );
+
+  return {
+    keyword: normalizedKeyword,
+    filters: {
+      fromDate: fromDate || null,
+      toDate: toDate || null,
+      limit: maxResults,
+    },
+    count: enriched.length,
+    data: enriched,
+  };
+}
 module.exports = {
   saveMessage,
   saveStickerMessage,
   getMessagesForConversation,
   uploadFileToS3,
   saveFileMessage,
+  searchMessagesInConversation,
+  searchMessagesForUserGlobal,
 };

@@ -13,6 +13,10 @@ router.post('/verify/email/confirm', userController.verifyEmailOTP);
 router.post('/verify/phone/send', userController.sendPhoneOTP);
 router.post('/verify/phone/confirm', userController.verifyPhoneOTP);
 
+router.post('/recovery/start', userController.startPasswordRecovery);
+router.post('/recovery/verify', userController.verifyPasswordRecoveryOTP);
+router.post('/recovery/reset', userController.resetPasswordWithRecovery);
+
 router.post('/reset-password', userController.resetPassword);
 
 router.get('/:userId', userController.getUserById);

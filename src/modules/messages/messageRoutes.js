@@ -14,6 +14,8 @@ router.get(
 );
 // shortcut: lấy messages theo channelId, dùng conversationId dạng "channel:id"
 router.get("/channel/:channelId", authMiddleware, messageController.getMessagesForChannel);
+router.get("/search", authMiddleware, messageController.searchMessages);
+router.get("/search/global", authMiddleware, messageController.searchMessagesGlobal);
 
 router.post("/", messageController.sendMessage);
 router.post("/file", upload.single("file"), messageController.sendFileMessage);

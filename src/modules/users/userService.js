@@ -1,3 +1,4 @@
+const { randomUUID } = require('crypto');
 const { ddbDocClient } = require('../../config/awsConfig');
 const { GetCommand, ScanCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const bcrypt = require('bcryptjs');
@@ -7,6 +8,7 @@ const OTP_TTL_MS = Number(process.env.OTP_TTL_MS || 5 * 60 * 1000);
 const OTP_SEND_COOLDOWN_MS = Number(process.env.OTP_SEND_COOLDOWN_MS || 60 * 1000);
 const OTP_SEND_WINDOW_MS = Number(process.env.OTP_SEND_WINDOW_MS || 10 * 60 * 1000);
 const OTP_SEND_MAX_PER_WINDOW = Number(process.env.OTP_SEND_MAX_PER_WINDOW || 3);
+const PASSWORD_RECOVERY_TTL_MS = Number(process.env.PASSWORD_RECOVERY_TTL_MS || 10 * 60 * 1000);
 const OTP_APP_NAME = process.env.OTP_APP_NAME || 'OTT Community';
 const EMAIL_PROVIDER = (process.env.OTP_EMAIL_PROVIDER || 'console').trim().toLowerCase();
 const SMS_PROVIDER = (process.env.OTP_SMS_PROVIDER || 'console').trim().toLowerCase();
@@ -14,6 +16,7 @@ const INCLUDE_OTP_DEBUG = String(process.env.OTP_INCLUDE_IN_RESPONSE || '').toLo
 
 const otpStore = new Map();
 const otpSendStore = new Map();
+const recoveryStore = new Map();
 
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').trim());
@@ -21,6 +24,10 @@ function isValidEmail(email) {
 
 function isValidPhone(phone) {
   return /^(0[3-9])[0-9]{8}$/.test(String(phone || '').trim());
+}
+
+function isValidUsername(username) {
+  return /^[a-zA-Z0-9_]{3,30}$/.test(String(username || '').trim());
 }
 
 function isStrongPassword(password) {
@@ -162,6 +169,174 @@ function recordOtpSendAttempt(type, target) {
     attempts: recentAttempts,
     lastSentAt: now,
   });
+}
+
+function getRecoverySession(token) {
+  const recoveryToken = String(token || '').trim();
+  if (!recoveryToken) return null;
+
+  const session = recoveryStore.get(recoveryToken);
+  if (!session) return null;
+
+  if (session.expiresAt < Date.now()) {
+    recoveryStore.delete(recoveryToken);
+    return null;
+  }
+
+  return session;
+}
+
+function saveRecoverySession(session) {
+  recoveryStore.set(session.token, session);
+}
+
+async function sendPasswordRecoveryOTP(identifier) {
+  const trimmedIdentifier = String(identifier || '').trim();
+  if (!trimmedIdentifier) {
+    throw new Error('Vui lòng nhập email hoặc số điện thoại');
+  }
+
+  const isPhoneIdentifier = isValidPhone(trimmedIdentifier);
+  const isEmailIdentifier = isValidEmail(trimmedIdentifier);
+
+  if (!isPhoneIdentifier && !isEmailIdentifier) {
+    throw new Error('Email hoặc số điện thoại không hợp lệ');
+  }
+
+  const user = await findUserByIdentifier(
+    isPhoneIdentifier
+      ? { phone: trimmedIdentifier }
+      : { email: trimmedIdentifier.toLowerCase() }
+  );
+
+  if (!user?.userId) {
+    throw new Error('Không tìm thấy tài khoản tương ứng');
+  }
+
+  let channel = 'phone';
+  let target = normalizePhoneValue(user.phone_number || trimmedIdentifier);
+
+  if (isPhoneIdentifier) {
+    if (!isValidPhone(target)) {
+      throw new Error('Số điện thoại không hợp lệ');
+    }
+  } else {
+    const normalizedEmail = normalizeEmailValue(user.email || trimmedIdentifier);
+    if (!isValidEmail(normalizedEmail)) {
+      throw new Error('Email không hợp lệ');
+    }
+    channel = 'email';
+    target = normalizedEmail;
+  }
+
+  assertOtpSendAllowed(channel, target);
+
+  if (channel === 'email') {
+    await sendOtpEmail(target, createOTP('email', target));
+  } else {
+    await sendOtpSms(target, createOTP('phone', target));
+  }
+
+  recordOtpSendAttempt(channel, target);
+
+  const token = randomUUID();
+  const now = Date.now();
+  saveRecoverySession({
+    token,
+    userId: String(user.userId),
+    identifier: trimmedIdentifier,
+    identifierType: isPhoneIdentifier ? 'phone' : 'username',
+    channel,
+    target,
+    verifiedAt: null,
+    createdAt: now,
+    expiresAt: now + PASSWORD_RECOVERY_TTL_MS,
+  });
+
+  return {
+    recoveryToken: token,
+    channel,
+    target: maskTarget(target),
+    expiresIn: Math.floor(PASSWORD_RECOVERY_TTL_MS / 1000),
+  };
+}
+
+async function verifyPasswordRecoveryOTP(recoveryToken, otp) {
+  const session = getRecoverySession(recoveryToken);
+  if (!session) {
+    throw new Error('Phiên xác thực đã hết hạn hoặc không tồn tại');
+  }
+
+  verifyStoredOTP(session.channel, session.target, otp);
+
+  if (session.channel === 'email' && isValidEmail(session.target)) {
+    await ddbDocClient.send(new UpdateCommand({
+      TableName: USERS_TABLE,
+      Key: { userId: String(session.userId) },
+      UpdateExpression: 'SET #email_verified = :email_verified, #updated_at = :updated_at',
+      ExpressionAttributeNames: {
+        '#email_verified': 'email_verified',
+        '#updated_at': 'updated_at',
+      },
+      ExpressionAttributeValues: {
+        ':email_verified': true,
+        ':updated_at': new Date().toISOString(),
+      },
+    }));
+  }
+
+  if (session.channel === 'phone' && isValidPhone(session.target)) {
+    await ddbDocClient.send(new UpdateCommand({
+      TableName: USERS_TABLE,
+      Key: { userId: String(session.userId) },
+      UpdateExpression: 'SET #phone_verified = :phone_verified, #updated_at = :updated_at',
+      ExpressionAttributeNames: {
+        '#phone_verified': 'phone_verified',
+        '#updated_at': 'updated_at',
+      },
+      ExpressionAttributeValues: {
+        ':phone_verified': true,
+        ':updated_at': new Date().toISOString(),
+      },
+    }));
+  }
+
+  saveRecoverySession({
+    ...session,
+    verifiedAt: Date.now(),
+  });
+}
+
+async function resetPasswordWithRecovery(recoveryToken, newPassword) {
+  const session = getRecoverySession(recoveryToken);
+  if (!session) {
+    throw new Error('Phiên đặt lại mật khẩu đã hết hạn hoặc không tồn tại');
+  }
+
+  if (!session.verifiedAt) {
+    throw new Error('Vui lòng xác thực OTP trước khi đặt lại mật khẩu');
+  }
+
+  if (!isStrongPassword(newPassword)) {
+    throw new Error('Mật khẩu mới phải có ít nhất 8 ký tự, gồm chữ hoa, chữ thường và số');
+  }
+
+  const newHash = await bcrypt.hash(String(newPassword), 10);
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: USERS_TABLE,
+    Key: { userId: String(session.userId) },
+    UpdateExpression: 'SET #password_hash = :password_hash, #updated_at = :updated_at',
+    ExpressionAttributeNames: {
+      '#password_hash': 'password_hash',
+      '#updated_at': 'updated_at',
+    },
+    ExpressionAttributeValues: {
+      ':password_hash': newHash,
+      ':updated_at': new Date().toISOString(),
+    },
+  }));
+
+  recoveryStore.delete(session.token);
 }
 
 async function sendOtpEmail(email, otp) {
@@ -682,6 +857,9 @@ module.exports = {
   listUsers,
   updateProfile,
   changePassword,
+  sendPasswordRecoveryOTP,
+  verifyPasswordRecoveryOTP,
+  resetPasswordWithRecovery,
   sendEmailOTP,
   verifyEmailOTP,
   sendPhoneOTP,

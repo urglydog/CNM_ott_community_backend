@@ -922,6 +922,45 @@ function notifyFriendAccepted(senderId, receiverInfo) {
   }
 }
 
+/**
+ * Join một user vào socket room
+ */
+function joinUserToRoom(userId, roomId) {
+  const io = getIO();
+  if (!io) return;
+  const sockets = onlineUsers.get(String(userId));
+  if (sockets && sockets.size > 0) {
+    for (const socketId of sockets) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) socket.join(roomId);
+    }
+  }
+}
+
+/**
+ * Kick một user ra khỏi socket room
+ */
+function leaveUserFromRoom(userId, roomId) {
+  const io = getIO();
+  if (!io) return;
+  const sockets = onlineUsers.get(String(userId));
+  if (sockets && sockets.size > 0) {
+    for (const socketId of sockets) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) socket.leave(roomId);
+    }
+  }
+}
+
+/**
+ * Emit sự kiện tới một room cụ thể
+ */
+function emitToRoom(roomId, event, payload) {
+  const io = getIO();
+  if (!io) return;
+  io.to(roomId).emit(event, payload);
+}
+
 module.exports = {
   handleSocketConnection,
   socketAuthMiddleware,
@@ -931,4 +970,7 @@ module.exports = {
   isUserOnline,
   notifyNewFriendRequest,
   notifyFriendAccepted,
+  joinUserToRoom,
+  leaveUserFromRoom,
+  emitToRoom
 };

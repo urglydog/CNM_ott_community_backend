@@ -482,9 +482,35 @@ function handleSocketConnection(io, socket) {
     socket.to(roomId).emit("user_stopped_typing", {
       roomId,
       userId,
+      userName: socket.user?.username || "",
     });
 
     _respond(callback, true);
+  });
+
+  // ============================================================
+  // TYPING STOP ALL — gửi stop typing cho tất cả conversations khi logout
+  // ============================================================
+  socket.on("typing_stop_all", async ({ conversations = [] }, callback) => {
+    if (!userId) {
+      _respond(callback, false, "User not authenticated");
+      return;
+    }
+
+    const userName = socket.user?.username || "";
+    // Gửi user_stopped_typing cho tất cả conversations được cung cấp
+    const rooms = Array.isArray(conversations) ? conversations : [];
+    rooms.forEach((roomId) => {
+      if (!roomId || typeof roomId !== "string") return;
+      socket.to(roomId).emit("user_stopped_typing", {
+        roomId,
+        userId,
+        userName,
+      });
+    });
+
+    console.log(`[typing] User ${userId} sent stopped_typing to ${rooms.length} rooms`);
+    _respond(callback, true, null, { count: rooms.length });
   });
 
   // ============================================================
@@ -811,6 +837,24 @@ function handleSocketConnection(io, socket) {
   // ============================================================
   socket.on("disconnect", () => {
     if (userIdKey) {
+      // Gửi user_stopped_typing cho tất cả các room mà user đang tham gia
+      // để người nhận không còn thấy "đang soạn tin" khi user offline
+      const rooms = Array.from(socket.rooms || []);
+      const userName = socket.user?.username || "";
+      rooms.forEach((roomId) => {
+        // Bỏ qua socket ID của chính socket này (không phải conversation room)
+        if (roomId === socket.id) return;
+        // Bỏ qua các room hệ thống (nếu có prefix đặc biệt)
+        if (roomId.startsWith("_")) return;
+
+        io.to(roomId).emit("user_stopped_typing", {
+          roomId,
+          userId,
+          userName,
+        });
+        console.log(`[typing] User ${userIdKey} disconnected - sent stopped_typing to room ${roomId}`);
+      });
+
       unregisterSocket(userIdKey, socket.id);
       console.log(
         `[socket] User ${userIdKey} disconnected socket ${socket.id}`,

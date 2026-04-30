@@ -31,7 +31,12 @@ async function getMessagesForChannel(req, res) {
 
 async function sendMessage(req, res) {
   try {
-    const message = await messageService.saveMessage(req.body);
+    // Chấp nhận replyTo từ body nếu có
+    const messageData = {
+      ...req.body,
+      // replyTo sẽ được xử lý trong messageService.saveMessage
+    };
+    const message = await messageService.saveMessage(messageData);
     const io = req.app.get("socketio");
     if (io) {
       io.to(message.conversationId).emit("receive_message", message);
@@ -81,7 +86,7 @@ async function searchMessagesGlobal(req, res) {
 
 /**
  * Gửi tin nhắn sticker.
- * Body: { senderId, conversationId, stickerData: { stickerId, stickerUrl, stickerPack, stickerName } }
+ * Body: { senderId, conversationId, stickerData: { stickerId, stickerUrl, stickerPack, stickerName }, replyTo? }
  */
 async function sendStickerMessage(req, res) {
   try {
@@ -113,6 +118,7 @@ async function sendStickerMessage(req, res) {
       contentType: "sticker",
       content: stickerData.stickerName || stickerData.stickerId || "[sticker]",
       stickerData,
+      replyTo: req.body.replyTo || null,
     });
 
     // Broadcast real-time
@@ -130,7 +136,7 @@ async function sendStickerMessage(req, res) {
 
 /**
  * Gửi tin nhắn emoji.
- * Body: { senderId, conversationId, content (emoji string) }
+ * Body: { senderId, conversationId, content (emoji string), replyTo? }
  */
 async function sendEmojiMessage(req, res) {
   try {
@@ -152,6 +158,7 @@ async function sendEmojiMessage(req, res) {
       conversationId,
       contentType: "emoji",
       content: req.body.content.trim(),
+      replyTo: req.body.replyTo || null,
     });
 
     // Broadcast real-time

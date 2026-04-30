@@ -89,7 +89,7 @@ function getIO() {
  * @returns {Promise<boolean>}
  */
 async function checkUserInGroup(groupId, userId) {
-  const targetGroupId = String(groupId);
+  let targetGroupId = String(groupId);
   const targetUserId = String(userId);
 
   // --- DM conversation: "dm:userA:userB" ---
@@ -104,6 +104,11 @@ async function checkUserInGroup(groupId, userId) {
     // malformed dm: treat as not a member
     console.warn(`[checkUserInGroup] Malformed DM roomId: ${targetGroupId}`);
     return false;
+  }
+
+  // Gọt bỏ chữ "channel:" nếu frontend lỡ gửi thừa
+  if (targetGroupId.startsWith("channel:")) {
+    targetGroupId = targetGroupId.replace("channel:", "");
   }
 
   // --- Group: Query bảng ott_group_members với composite key (groupId, userId) ---
@@ -530,7 +535,8 @@ function handleSocketConnection(io, socket) {
   });
 
   socket.on("group-call-request", async (data = {}, callback) => {
-    const { groupId, callerName } = data;
+    let { groupId, callerName } = data;
+    const roomId = String(data.roomId || "").trim();
 
     if (!groupId) {
       _respond(callback, false, "groupId is required");
@@ -542,37 +548,65 @@ function handleSocketConnection(io, socket) {
       return;
     }
 
-    const normalizedGroupId = String(groupId).startsWith("group_")
-      ? String(groupId)
-      : `group_${groupId}`;
+    if (String(groupId).startsWith("channel:")) {
+      groupId = String(groupId).replace("channel:", "");
+    }
 
-    const isMember = await checkUserInGroup(normalizedGroupId, userId);
+    const isMember = await checkUserInGroup(groupId, userId);
     if (!isMember) {
       _respond(callback, false, "Not a member of this group");
       return;
     }
 
-    if (!socket.rooms.has(normalizedGroupId)) {
+    if (!socket.rooms.has(String(groupId)) && !socket.rooms.has(`channel:${groupId}`)) {
       console.warn(
-        `[Call Group] Caller ${userIdKey} has not joined room ${normalizedGroupId}; reject signaling`,
+        `[Call Group] Caller ${userIdKey} has not joined room ${groupId}; reject signaling`,
       );
       _respond(callback, false, "Caller has not joined the group room");
       return;
     }
 
     const payload = {
-      groupId: normalizedGroupId,
-      roomId: String(data.roomId || ""),
+      groupId: String(groupId),
+      roomId: roomId,
       callerName: callerName || socket.user?.username || "",
       callerId: String(data.callerId || userIdKey),
       isGroupCall: true,
     };
 
     console.log(
-      `[Call Group] Bao thuc phong: ${normalizedGroupId} do ${payload.callerName || userId} goi`,
+      `[Call Group] Bao thuc phong: ${groupId} do ${payload.callerName || userId} goi`,
     );
 
-    socket.to(normalizedGroupId).emit("group-call-request", payload);
+    // Register call to activeCalls so handleCallAccept can find it
+    const record = {
+      callerId: payload.callerId,
+      receiverIds: [String(groupId)], // For group, receiver is the group itself
+      status: "ringing",
+      timeoutRef: null,
+      isGroupCall: true
+    };
+    clearActiveCall(roomId);
+    activeCalls.set(roomId, record);
+    
+    record.timeoutRef = setTimeout(() => {
+      emitToCallParticipants(record, "call-timeout", {
+        roomId,
+        callerId: payload.callerId,
+        reason: "timeout",
+      });
+      // Also emit to the group room directly
+      io.to(String(groupId)).emit("call-timeout", {
+        roomId,
+        callerId: payload.callerId,
+        reason: "timeout",
+      });
+      clearActiveCall(roomId);
+    }, 30_000);
+
+    socket.to(String(groupId)).emit("group-call-request", payload);
+    // Emit sang cả room channel:... để đảm bảo clients cũ đang ở đó cũng nhận được
+    socket.to(`channel:${groupId}`).emit("group-call-request", payload);
 
     _respond(callback, true);
   });

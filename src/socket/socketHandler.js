@@ -5,6 +5,7 @@ const {
   QueryCommand,
 } = require("@aws-sdk/lib-dynamodb");
 const { saveMessage } = require("../modules/messages/messageService");
+const { notifyMessageCreated } = require("../modules/notifications/notificationService");
 const { verifyToken } = require("../common/utils/jwt");
 
 const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
@@ -410,6 +411,8 @@ function handleSocketConnection(io, socket) {
           }
         }
       }
+
+      await notifyMessageCreated(enrichedMessage, io);
 
       _respond(callback, true, null, { message: enrichedMessage });
     } catch (error) {

@@ -23,6 +23,7 @@ const statsRoutes = require("./modules/stats/statsRoutes");
 const messageRevokeRoutes = require("./modules/messages/messageRevokeRoutes");
 const messageDeleteRoutes = require("./modules/messages/messageDeleteRoutes");
 const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
+const notificationRoutes = require("./modules/notifications/notificationRoutes");
 
 // Socket Handler
 const {
@@ -89,6 +90,7 @@ app.use("/api/messages", messageRoutes);
 app.use("/api/messages-extension", messageRevokeRoutes);
 app.use("/api/messages-extension", messageDeleteRoutes);
 app.use("/api/messages-extension", messageForwardRoutes);
+app.use("/api/notifications", notificationRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/channels", channelRoutes);
 app.use("/api/calls", callRoutes);

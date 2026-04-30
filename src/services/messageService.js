@@ -66,10 +66,9 @@ async function saveMessage(payload) {
   const conversationId = buildConversationIdFromPayload(payload);
   if (!conversationId) {
     throw new Error("conversationId is required");
-  // ── Validate ──────────────────────────────────────────────
-  if (!payload.conversationId) {
-    throw new Error('conversationId is required');
   }
+
+  // ── Validate ──────────────────────────────────────────────
   if (!payload.senderId) {
     throw new Error("senderId is required");
   }

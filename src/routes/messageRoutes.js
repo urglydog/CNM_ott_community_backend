@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 
-const messageController = require('../modules/chat/messageController');
+const messageController = require('../modules/messages/messageController');
 
 router.get(
   "/conversations/:conversationId",

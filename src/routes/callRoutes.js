@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-const callController = require('../modules/chat/callController');
+const callController = require('../modules/calls/callController');
 
 router.get('/token', callController.getCallToken);
 

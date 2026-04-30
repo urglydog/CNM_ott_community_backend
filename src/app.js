@@ -13,15 +13,16 @@ const { Server } = require("socket.io");
 const authRoutes = require("./modules/auth/authRoutes");
 const userRoutes = require("./modules/users/userRoutes");
 const friendRoutes = require("./modules/users/friendRoutes");
-const messageRoutes = require("./modules/chat/messageRoutes");
-const groupRoutes = require("./modules/chat/groupRoutes");
-const channelRoutes = require("./modules/chat/channelRoutes");
-const callRoutes = require("./modules/chat/callRoutes");
-const botRoutes = require("./modules/chat/botRoutes");
+const messageRoutes = require("./modules/messages/messageRoutes");
+const groupRoutes = require("./modules/groups/groupRoutes");
+const channelRoutes = require("./modules/channels/channelRoutes");
+const callRoutes = require("./modules/calls/callRoutes");
+const botRoutes = require("./modules/bots/botRoutes");
 const uploadRoutes = require("./modules/media/uploadRoutes");
 const statsRoutes = require("./modules/stats/statsRoutes");
-const messageRevokeRoutes = require("./modules/chat/messageRevokeRoutes");
-const messageDeleteRoutes = require("./modules/chat/messageDeleteRoutes");
+const messageRevokeRoutes = require("./modules/messages/messageRevokeRoutes");
+const messageDeleteRoutes = require("./modules/messages/messageDeleteRoutes");
+const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
 
 // Socket Handler
 const {
@@ -36,42 +37,38 @@ const server = http.createServer(app);
 // eslint-disable-next-line no-console
 console.log(`[BOOT] OTP_EMAIL_PROVIDER=${process.env.OTP_EMAIL_PROVIDER || 'console'} OTP_SMS_PROVIDER=${process.env.OTP_SMS_PROVIDER || 'console'}`);
 
-const allowedOrigins = (
-  process.env.FRONTEND_ORIGIN || "http://localhost:3000,http://localhost:3001"
-)
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-
-function isOriginAllowed(origin) {
-  if (!origin) return true;
-  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
-    return true;
-  }
-  return allowedOrigins.includes(origin);
-}
+// 1. Tách chuỗi từ .env thành một mảng các origin
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",")
+  : ["http://localhost:3000"];
 
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
-      if (isOriginAllowed(origin)) return callback(null, true);
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
       return callback(new Error("Not allowed by CORS"));
     },
-    methods: ["GET", "POST"],
+    credentials: true,
   },
 });
 
 app.set("socketio", io);
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (isOriginAllowed(origin)) return callback(null, true);
-      return callback(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  }),
-);
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    // eslint-disable-next-line no-console
+    console.warn(`[CORS Blocked]: Origin ${origin} không được phép truy cập.`);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -91,6 +88,7 @@ app.use("/api/friends", friendRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/messages-extension", messageRevokeRoutes);
 app.use("/api/messages-extension", messageDeleteRoutes);
+app.use("/api/messages-extension", messageForwardRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/channels", channelRoutes);
 app.use("/api/calls", callRoutes);

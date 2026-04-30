@@ -1,7 +1,7 @@
 const { ddbDocClient } = require('../../config/awsConfig');
 const { PutCommand, GetCommand, ScanCommand, UpdateCommand, QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const crypto = require('crypto');
-const socketService = require('../../services/socketService');
+
 const socketHandler = require('../../socket/socketHandler');
 const { onlineUsers } = require('../../socket/socketUserRegistry');
 
@@ -10,8 +10,7 @@ const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || 'ott_group_members';
 const REQUESTS_TABLE = process.env.DDB_GROUP_REQUESTS_TABLE || 'ott_group_requests';
 
 function getActiveIO() {
-  // Dự án có hai file lưu ioInstance (tùy file đang config ở app.js), ưu tiên thử lấy io từ 2 source
-  return socketHandler.getIO() || socketService.getIO();
+  return socketHandler.getIO();
 }
 
 function forceJoinGroup(userId, groupId) {
@@ -380,7 +379,7 @@ async function updateRole(groupId, requestUserId, targetUserId, newRole) {
   return { message: 'Role updated successfully', newRole: roleUpper };
 }
 
-async function leaveGroup(groupId, requestUserId) {
+async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
   const groupKey = String(groupId);
   const reqUserKey = String(requestUserId);
 
@@ -396,10 +395,58 @@ async function leaveGroup(groupId, requestUserId) {
     throw err;
   }
 
+  // Get all members to check count
+  const allMembersRes = await ddbDocClient.send(new QueryCommand({
+    TableName: MEMBERS_TABLE,
+    KeyConditionExpression: 'groupId = :gid',
+    ExpressionAttributeValues: { ':gid': groupKey }
+  }));
+  const allMembers = allMembersRes.Items || [];
+
   if ((reqMember.role || '').toUpperCase() === 'OWNER') {
-    const err = new Error('Bạn phải nhường quyền Trưởng nhóm (OWNER) cho người khác trước khi rời');
-    err.status = 400;
-    throw err;
+    if (allMembers.length > 1) {
+      if (!newOwnerId) {
+        const err = new Error('Bạn phải nhường quyền Trưởng nhóm (OWNER) cho người khác trước khi rời');
+        err.status = 400;
+        throw err;
+      }
+      
+      const newOwnerKey = String(newOwnerId);
+      const newOwner = allMembers.find(m => m.userId === newOwnerKey);
+      if (!newOwner) {
+        const err = new Error('Người được chọn làm Trưởng nhóm mới không có trong nhóm');
+        err.status = 400;
+        throw err;
+      }
+
+      // Promote new owner
+      await ddbDocClient.send(new UpdateCommand({
+        TableName: MEMBERS_TABLE,
+        Key: { groupId: groupKey, userId: newOwnerKey },
+        UpdateExpression: 'SET #role = :roleVal',
+        ExpressionAttributeNames: { '#role': 'role' },
+        ExpressionAttributeValues: { ':roleVal': 'OWNER' }
+      }));
+      
+      // Update creator in GROUPS_TABLE
+      await ddbDocClient.send(new UpdateCommand({
+        TableName: GROUPS_TABLE,
+        Key: { groupId: groupKey },
+        UpdateExpression: 'SET created_by = :newOwner',
+        ExpressionAttributeValues: { ':newOwner': newOwnerKey }
+      }));
+      
+      // Emit event owner_transferred
+      const io = getActiveIO();
+      if (io) {
+        io.to(groupKey).emit('group:owner_transferred', { newOwnerId: newOwnerKey, oldOwnerId: reqUserKey });
+        // And also update role socket for frontend compatibility
+        io.to(groupKey).emit('SERVER:ROLE_UPDATED', { targetUserId: newOwnerKey, newRole: 'OWNER', groupId: groupKey });
+      }
+    } else {
+      // It's the last member (owner), disband the group entirely
+      return await disbandGroup(groupKey, reqUserKey);
+    }
   }
 
   await ddbDocClient.send(new DeleteCommand({

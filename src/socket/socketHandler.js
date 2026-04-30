@@ -5,6 +5,7 @@ const {
   QueryCommand,
 } = require("@aws-sdk/lib-dynamodb");
 const { saveMessage } = require("../modules/messages/messageService");
+const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
 const { notifyMessageCreated } = require("../modules/notifications/notificationService");
 const { verifyToken } = require("../common/utils/jwt");
 
@@ -728,6 +729,81 @@ function handleSocketConnection(io, socket) {
 
   socket.on("call-rejected", (data = {}, callback) => {
     socket.emit("call-reject", data, callback);
+  });
+
+  // ============================================================
+  // MARK READ — đánh dấu tin nhắn đã đọc (Read Receipts)
+  // ============================================================
+  socket.on("mark_read", async ({ conversationId, messageId }, callback) => {
+    if (!conversationId) {
+      return _respond(callback, false, "conversationId is required");
+    }
+    if (!messageId) {
+      return _respond(callback, false, "messageId is required");
+    }
+    if (!userId) {
+      return _respond(callback, false, "User not authenticated");
+    }
+
+    try {
+      // Verify membership
+      const isMember = await checkUserInGroup(conversationId, userId);
+      if (!isMember) {
+        return _respond(callback, false, "Not a member of this conversation");
+      }
+
+      // Get user display info for the reader
+      const readerInfo = await getUserDisplayInfo(userId);
+
+      // Save the read receipt
+      await saveReadReceipt({
+        conversationId,
+        messageId: String(messageId),
+        userId: String(userId),
+        readerName: readerInfo.displayName,
+        readerAvatar: readerInfo.avatarUrl,
+      });
+
+      console.log(`[mark_read] User ${userId} marked message ${messageId} as read in conversation ${conversationId}`);
+
+      // Determine the sender of the message to notify them
+      // For DM conversations, notify the other participant
+      if (conversationId.startsWith("dm:")) {
+        const parts = conversationId.split(":");
+        if (parts.length >= 3) {
+          const senderId = parts[1] === String(userId) ? parts[2] : parts[1];
+          // Emit to the sender's sockets
+          const readReceiptPayload = {
+            conversationId,
+            messageId: String(messageId),
+            readerId: String(userId),
+            readerName: readerInfo.displayName,
+            readerAvatar: readerInfo.avatarUrl,
+            readAt: new Date().toISOString(),
+          };
+
+          // Emit directly to the sender's sockets
+          emitToUserSockets(senderId, "message_read", readReceiptPayload);
+          console.log(`[mark_read] Notified sender ${senderId} that message ${messageId} was read`);
+        }
+      } else {
+        // For group chats, emit to the room so the sender can see who read their message
+        // The sender will receive this if they're in the room
+        socket.to(conversationId).emit("message_read", {
+          conversationId,
+          messageId: String(messageId),
+          readerId: String(userId),
+          readerName: readerInfo.displayName,
+          readerAvatar: readerInfo.avatarUrl,
+          readAt: new Date().toISOString(),
+        });
+      }
+
+      _respond(callback, true);
+    } catch (error) {
+      console.error("[mark_read] Error:", error.message);
+      _respond(callback, false, error.message);
+    }
   });
 
   // ============================================================

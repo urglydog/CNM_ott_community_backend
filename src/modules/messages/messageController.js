@@ -1,4 +1,5 @@
 const messageService = require("./messageService");
+const { notifyMessageCreated } = require("../notifications/notificationService");
 
 async function getMessagesForConversation(req, res) {
   try {
@@ -31,7 +32,48 @@ async function getMessagesForChannel(req, res) {
 async function sendMessage(req, res) {
   try {
     const message = await messageService.saveMessage(req.body);
+    const io = req.app.get("socketio");
+    if (io) {
+      io.to(message.conversationId).emit("receive_message", message);
+    }
+    await notifyMessageCreated(message, io);
     res.status(201).json(message);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
+async function searchMessages(req, res) {
+  try {
+    const currentUserId = req.user?.userId ?? req.user?.id ?? null;
+    const result = await messageService.searchMessagesInConversation({
+      conversationId: req.query.conversationId,
+      keyword: req.query.keyword,
+      senderId: req.query.senderId,
+      fromDate: req.query.fromDate || req.query.from,
+      toDate: req.query.toDate || req.query.to,
+      limit: req.query.limit,
+      currentUserId,
+    });
+
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
+async function searchMessagesGlobal(req, res) {
+  try {
+    const currentUserId = req.user?.userId ?? req.user?.id ?? null;
+    const result = await messageService.searchMessagesForUserGlobal({
+      keyword: req.query.keyword,
+      fromDate: req.query.fromDate || req.query.from,
+      toDate: req.query.toDate || req.query.to,
+      limit: req.query.limit,
+      currentUserId,
+    });
+
+    res.json(result);
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -78,6 +120,7 @@ async function sendStickerMessage(req, res) {
     if (io) {
       io.to(conversationId).emit("receive_message", message);
     }
+    await notifyMessageCreated(message, io);
 
     res.status(201).json(message);
   } catch (error) {
@@ -116,6 +159,7 @@ async function sendEmojiMessage(req, res) {
     if (io) {
       io.to(conversationId).emit("receive_message", message);
     }
+    await notifyMessageCreated(message, io);
 
     res.status(201).json(message);
   } catch (error) {
@@ -173,6 +217,7 @@ async function sendFileMessage(req, res) {
     if (io) {
       io.to(conversationId).emit("receive_message", messagePayload);
     }
+    await notifyMessageCreated(messagePayload, io);
 
     return res.status(201).json({
       message: "File message sent successfully",
@@ -187,6 +232,8 @@ module.exports = {
   getMessagesForConversation,
   getMessagesForChannel,
   sendMessage,
+  searchMessages,
+  searchMessagesGlobal,
   sendFileMessage,
   sendStickerMessage,
   sendEmojiMessage,

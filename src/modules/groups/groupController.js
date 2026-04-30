@@ -1,6 +1,13 @@
 const groupService = require('./groupService');
-const { joinUserToRoom, leaveUserFromRoom, emitToRoom, getIO } = require('../../socket/socketHandler');
 const { emitToUserSockets } = require('../../socket/socketUserRegistry');
+
+function getSocketHandler() {
+  return require('../../socket/socketHandler');
+}
+function joinUserToRoom(...args) { return getSocketHandler().joinUserToRoom(...args); }
+function leaveUserFromRoom(...args) { return getSocketHandler().leaveUserFromRoom(...args); }
+function emitToRoom(...args) { return getSocketHandler().emitToRoom(...args); }
+function getIO() { return getSocketHandler().getIO(); }
 
 async function createGroup(req, res) {
   try {
@@ -14,6 +21,10 @@ async function createGroup(req, res) {
     // Join owner vào room socket
     if (body.ownerId) {
       joinUserToRoom(body.ownerId, group.groupId);
+      const io = getIO();
+      if (io) {
+        emitToUserSockets(io, body.ownerId, "chat:new_conversation", { conversationData: group });
+      }
     }
 
     res.status(201).json(group);
@@ -151,6 +162,11 @@ async function disbandGroup(req, res) {
     // Báo cho cả phòng chat biết nhóm đã bị giải tán
     emitToRoom(groupId, "group:deleted", { groupId, disbandedBy: requestUserId });
 
+    const io = getIO();
+    if (io) {
+      io.in(groupId).socketsLeave(groupId);
+    }
+
     res.status(200).json({ message: 'Group disbanded successfully' });
   } catch (error) {
     if (error.status === 403) {
@@ -180,6 +196,7 @@ async function addMembers(req, res) {
       joinUserToRoom(uid, groupId);
       if (io) {
         emitToUserSockets(io, uid, "group:you_were_added", { groupData, addedBy: requestUserId });
+        emitToUserSockets(io, uid, "chat:new_conversation", { conversationData: groupData });
       }
     });
 
@@ -206,12 +223,24 @@ async function kickMember(req, res) {
 
     const result = await groupService.kickMember(groupId, requestUserId, userId);
 
+    const msgSvc = require('../messages/messageService');
+    const systemMsg = await msgSvc.saveMessage({
+      conversationId: groupId,
+      senderId: requestUserId,
+      contentType: 'system',
+      content: 'đã xóa một thành viên khỏi nhóm'
+    });
+
     // Báo cho phòng chat biết có người bị kick
     emitToRoom(groupId, "group:member_removed", { 
       groupId, 
       removedMember: userId,
-      kickedBy: requestUserId 
+      kickedBy: requestUserId,
+      systemMessage: systemMsg
     });
+
+    // Bắn thẳng tin nhắn hệ thống vào phòng chat
+    emitToRoom(groupId, "receive_message", systemMsg);
 
     // Báo cho người bị kick biết và bắt họ leave room
     const io = getIO();
@@ -253,11 +282,23 @@ async function leaveGroup(req, res) {
 
     const result = await groupService.leaveGroup(groupId, requestUserId, newOwnerId);
 
+    const msgSvc = require('../messages/messageService');
+    const systemMsg = await msgSvc.saveMessage({
+      conversationId: groupId,
+      senderId: requestUserId,
+      contentType: 'system',
+      content: 'đã rời nhóm'
+    });
+
     // Báo cho cả phòng biết có người tự out
     emitToRoom(groupId, "group:member_left", { 
       groupId, 
-      leftMember: requestUserId 
+      leftMember: requestUserId,
+      systemMessage: systemMsg
     });
+
+    // Bắn thẳng tin nhắn hệ thống vào phòng chat
+    emitToRoom(groupId, "receive_message", systemMsg);
 
     // Rời khỏi phòng chat
     leaveUserFromRoom(requestUserId, groupId);

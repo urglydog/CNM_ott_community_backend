@@ -237,6 +237,7 @@ function resolveAttachmentType(mimetype) {
   if (!mimetype) return "file";
   if (mimetype.startsWith("image/")) return "image";
   if (mimetype.startsWith("video/")) return "video";
+  if (mimetype.startsWith("audio/")) return "voice";
   return "file";
 }
 
@@ -291,7 +292,7 @@ async function saveFileMessage(data) {
     : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`;
 
   const attachmentType = resolveAttachmentType(data.attachment.mimetype);
-  const messageType = attachmentType === "video" ? "video" : "file";
+  const messageType = attachmentType === "voice" ? "voice" : attachmentType === "video" ? "video" : "file";
   const persistedMessageId = randomUUID();
   const createdAt = new Date().toISOString();
 

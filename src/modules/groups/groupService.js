@@ -2,7 +2,6 @@ const { ddbDocClient } = require('../../config/awsConfig');
 const { PutCommand, GetCommand, ScanCommand, UpdateCommand, QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const crypto = require('crypto');
 
-const socketHandler = require('../../socket/socketHandler');
 const { onlineUsers } = require('../../socket/socketUserRegistry');
 
 const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || 'ott_groups';
@@ -10,7 +9,7 @@ const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || 'ott_group_members';
 const REQUESTS_TABLE = process.env.DDB_GROUP_REQUESTS_TABLE || 'ott_group_requests';
 
 function getActiveIO() {
-  return socketHandler.getIO();
+  return require('../../socket/socketHandler').getIO();
 }
 
 function forceJoinGroup(userId, groupId) {

@@ -331,7 +331,7 @@ function handleSocketConnection(io, socket) {
   // SEND MESSAGE — có kiểm tra membership
   // ============================================================
   socket.on("send_message", async (payload, callback) => {
-    // Payload: { roomId, content, contentType, attachments, stickerData }
+    // Payload: { roomId, content, contentType, attachments, stickerData, replyTo }
     const contentType = payload.contentType || "text";
 
     // sticker: không bắt buộc content; emoji/sticker: dùng stickerData thay thế
@@ -370,6 +370,8 @@ function handleSocketConnection(io, socket) {
         contentType,
         attachments: payload.attachments || null,
         ...(hasStickerData ? { stickerData: payload.stickerData } : {}),
+        // Thêm replyTo nếu có - ID của tin nhắn đang được trả lời
+        ...(payload.replyTo ? { replyTo: payload.replyTo } : {}),
       };
 
       const savedMessage = await saveMessage(entityPayload);

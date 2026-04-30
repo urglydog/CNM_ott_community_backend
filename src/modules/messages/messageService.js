@@ -38,6 +38,50 @@ function normalizeContentType(raw) {
 }
 
 /**
+ * Lấy thông tin cơ bản của tin nhắn gốc để hiển thị trong reply preview.
+ * @param {string} conversationId - ID của cuộc trò chuyện
+ * @param {string|number} replyToId - ID của tin nhắn cần trả lời
+ * @returns {Promise<object|null>} - Thông tin cơ bản của tin nhắn gốc
+ */
+async function getRepliedMessageInfo(conversationId, replyToId) {
+  if (!replyToId) return null;
+
+  try {
+    const res = await ddbDocClient.send(
+      new GetCommand({
+        TableName: MESSAGES_TABLE,
+        Key: { conversationId },
+      }),
+    );
+
+    if (!res.Item || !Array.isArray(res.Item.messages)) {
+      return null;
+    }
+
+    const originalMessage = res.Item.messages.find(
+      (msg) => String(msg.id) === String(replyToId),
+    );
+
+    if (!originalMessage) return null;
+
+    const senderInfo = await enrichSenderInfo(originalMessage.senderId);
+
+    return {
+      id: originalMessage.id,
+      content: originalMessage.content,
+      contentType: originalMessage.contentType,
+      senderId: originalMessage.senderId,
+      senderDisplayName: senderInfo.senderDisplayName,
+      senderAvatarUrl: senderInfo.senderAvatarUrl,
+      attachments: originalMessage.attachments || null,
+    };
+  } catch (error) {
+    console.error("[getRepliedMessageInfo] Error fetching replied message:", error.message);
+    return null;
+  }
+}
+
+/**
  * Validate dữ liệu sticker trước khi lưu.
  * stickerUrl hoặc stickerId phải có ít nhất 1 cái.
  * @param {object} stickerData - { stickerId?, stickerUrl?, stickerPack?, stickerName? }
@@ -129,6 +173,12 @@ async function saveMessage(payload) {
   const createdAt = new Date().toISOString();
   const id = Date.now();
 
+  // Lấy thông tin tin nhắn gốc nếu có replyTo
+  let replyTo = null;
+  if (payload.replyTo) {
+    replyTo = await getRepliedMessageInfo(payload.conversationId, payload.replyTo);
+  }
+
   const newMessage = {
     id,
     senderId: payload.senderId,
@@ -140,6 +190,8 @@ async function saveMessage(payload) {
       : {}),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
+    // replyTo: lưu ID của tin nhắn gốc đang được trả lời
+    replyTo: payload.replyTo || null,
     createdAt,
   };
 
@@ -179,6 +231,9 @@ async function saveMessage(payload) {
     ...(newMessage.stickerData ? { stickerData: newMessage.stickerData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
+    replyTo: newMessage.replyTo,
+    // Trả về đầy đủ thông tin replyTo đã populate để frontend hiển thị
+    ...(replyTo ? { replyToMessage: replyTo } : {}),
     createdAt: newMessage.createdAt,
   };
 }
@@ -212,10 +267,35 @@ async function getMessagesForConversation(conversationId, currentUserId) {
     return aTime.localeCompare(bTime);
   });
 
-  // Enrich mỗi tin nhắn với displayName/avatarUrl của người gửi
+  // Build a map of messageId -> message for quick lookup of replied messages
+  const messageMap = new Map();
+  messages.forEach((msg) => {
+    messageMap.set(String(msg.id), msg);
+  });
+
+  // Enrich mỗi tin nhắn với displayName/avatarUrl của người gửi và thông tin replyTo
   const enriched = await Promise.all(
     messages.map(async (msg) => {
       const info = await enrichSenderInfo(msg.senderId);
+
+      // Lấy thông tin tin nhắn gốc nếu có replyTo
+      let replyToMessage = null;
+      if (msg.replyTo) {
+        const repliedMsg = messageMap.get(String(msg.replyTo));
+        if (repliedMsg) {
+          const repliedSenderInfo = await enrichSenderInfo(repliedMsg.senderId);
+          replyToMessage = {
+            id: repliedMsg.id,
+            content: repliedMsg.content,
+            contentType: repliedMsg.contentType,
+            senderId: repliedMsg.senderId,
+            senderDisplayName: repliedSenderInfo.senderDisplayName,
+            senderAvatarUrl: repliedSenderInfo.senderAvatarUrl,
+            attachments: repliedMsg.attachments || null,
+          };
+        }
+      }
+
       return {
         id: msg.id,
         conversationId,
@@ -225,9 +305,12 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
+        replyTo: msg.replyTo || null,
         createdAt: msg.createdAt,
         senderDisplayName: info.senderDisplayName,
         senderAvatarUrl: info.senderAvatarUrl,
+        // Trả về đầy đủ thông tin replyTo đã populate
+        ...(replyToMessage ? { replyToMessage } : {}),
       };
     }),
   );
@@ -662,6 +745,7 @@ module.exports = {
   saveMessage,
   saveStickerMessage,
   getMessagesForConversation,
+  getRepliedMessageInfo,
   uploadFileToS3,
   saveFileMessage,
   searchMessagesInConversation,

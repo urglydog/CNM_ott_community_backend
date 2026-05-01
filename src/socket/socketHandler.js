@@ -13,6 +13,36 @@ const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
 const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
 
 // ============================================================
+// READ RECEIPT DEDUPLICATION CACHE
+// Prevents duplicate mark_read events from the same user for the same message
+// ============================================================
+const readReceiptDedupeCache = new Map(); // key: `${conversationId}:${messageId}:${userId}`, value: timestamp
+const DEDUPE_WINDOW_MS = 2000; // 2 second window
+
+function isDuplicateReadReceipt(conversationId, messageId, userId) {
+  const key = `${conversationId}:${messageId}:${userId}`;
+  const now = Date.now();
+  const lastTime = readReceiptDedupeCache.get(key);
+
+  if (lastTime && now - lastTime < DEDUPE_WINDOW_MS) {
+    console.log(`[mark_read] DEDUP: Ignoring duplicate mark_read from ${userId} for ${messageId} (${now - lastTime}ms since last)`);
+    return true;
+  }
+
+  readReceiptDedupeCache.set(key, now);
+
+  // Cleanup old entries periodically
+  if (readReceiptDedupeCache.size > 10000) {
+    const cutoff = now - DEDUPE_WINDOW_MS * 2;
+    for (const [k, v] of readReceiptDedupeCache) {
+      if (v < cutoff) readReceiptDedupeCache.delete(k);
+    }
+  }
+
+  return false;
+}
+
+// ============================================================
 // CALL MANAGER (Server-authoritative)
 // ============================================================
 // roomId -> { callerId, receiverIds: string[], status, timeoutRef }
@@ -771,6 +801,11 @@ function handleSocketConnection(io, socket) {
     }
     if (!userId) {
       return _respond(callback, false, "User not authenticated");
+    }
+
+    // Server-side deduplication check
+    if (isDuplicateReadReceipt(conversationId, messageId, userId)) {
+      return _respond(callback, true); // Still respond OK but don't process
     }
 
     try {

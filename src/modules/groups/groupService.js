@@ -148,7 +148,7 @@ async function getGroupById(groupId) {
     createdBy: g.created_by,
     createdAt: g.created_at,
     isApprovalRequired: !!g.isApprovalRequired,
-    pinnedMessages: g.pinnedMessages || []
+    pinnedMessages: g.pinnedMessages || [],
     allowSendLinks: g.allowSendLinks || 'ALL',
     spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
   };
@@ -516,7 +516,7 @@ async function getGroupsForUser(userId) {
       createdBy: g.created_by,
       createdAt: g.created_at,
       isApprovalRequired: !!g.isApprovalRequired,
-      pinnedMessages: g.pinnedMessages || []
+      pinnedMessages: g.pinnedMessages || [],
       allowSendLinks: g.allowSendLinks || 'ALL',
       spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
     }));

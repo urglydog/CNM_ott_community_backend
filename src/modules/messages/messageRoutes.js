@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const messageController = require("./messageController");
+const readReceiptController = require("./readReceiptController");
 const authMiddleware = require("../../common/middlewares/authMiddleware");
 const upload = require("../../common/middlewares/uploadMiddleware");
 
@@ -21,5 +22,33 @@ router.post("/", messageController.sendMessage);
 router.post("/file", upload.single("file"), messageController.sendFileMessage);
 router.post("/sticker", messageController.sendStickerMessage);
 router.post("/emoji", messageController.sendEmojiMessage);
+// Gửi tin nhắn vị trí tĩnh (Current Location) — lưu vào DB và broadcast qua socket
+router.post("/location", authMiddleware, messageController.sendLocationMessage);
+// Bắt đầu phiên live location — tạo tin nhắn với isLive: true
+router.post("/location/live/start", authMiddleware, messageController.startLiveLocationMessage);
+// Dừng phiên live location — cập nhật isLive: false, broadcast socket event
+router.patch("/location/live/:messageId/stop", authMiddleware, messageController.stopLiveLocationMessage);
+
+// ─── Read Receipt Routes ───────────────────────────────────────────
+router.get(
+  "/read-receipts/:conversationId/:messageId",
+  authMiddleware,
+  readReceiptController.getReadReceiptsForMessage,
+);
+router.get(
+  "/read-receipts/conversation/:conversationId",
+  authMiddleware,
+  readReceiptController.getReadStatusForMessages,
+);
+router.get(
+  "/read-receipts/last-read/:conversationId",
+  authMiddleware,
+  readReceiptController.getLastReadPosition,
+);
+router.post(
+  "/read-receipts",
+  authMiddleware,
+  readReceiptController.markAsRead,
+);
 
 module.exports = router;

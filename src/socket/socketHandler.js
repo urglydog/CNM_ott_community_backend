@@ -790,6 +790,97 @@ function handleSocketConnection(io, socket) {
   });
 
   // ============================================================
+  // LIVE LOCATION — Chia sẻ vị trí trực tiếp (realtime)
+  // KHÔNG lưu vào DB để tránh quá tải; chỉ broadcast trong room.
+  //
+  // Events:
+  //   start_live_location  { roomId }          → báo bắt đầu chia sẻ
+  //   update_live_location { roomId, lat, lng } → cập nhật tọa độ liên tục
+  //   stop_live_location   { roomId }          → dừng chia sẻ
+  // ============================================================
+
+  socket.on("start_live_location", async ({ roomId }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
+      return;
+    }
+    if (!userId) {
+      _respond(callback, false, "User not authenticated");
+      return;
+    }
+
+    // Kiểm tra membership trước khi cho phép chia sẻ
+    const isMember = await checkUserInGroup(roomId, userId);
+    if (!isMember) {
+      _respond(callback, false, "Not a member of this room");
+      return;
+    }
+
+    const senderInfo = await getUserDisplayInfo(userId);
+
+    // Thông báo cho các thành viên khác biết có người bắt đầu chia sẻ live location
+    socket.to(roomId).emit("live_location_started", {
+      roomId,
+      senderId: userId,
+      senderDisplayName: senderInfo.displayName,
+      senderAvatarUrl: senderInfo.avatarUrl,
+      startedAt: new Date().toISOString(),
+    });
+
+    console.log(`[live_location] User ${userId} started sharing in room ${roomId}`);
+    _respond(callback, true);
+  });
+
+  socket.on("update_live_location", async ({ roomId, lat, lng }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
+      return;
+    }
+    if (typeof lat !== "number" || typeof lng !== "number") {
+      _respond(callback, false, "lat và lng (number) là bắt buộc");
+      return;
+    }
+    if (!userId) {
+      _respond(callback, false, "User not authenticated");
+      return;
+    }
+
+    // Broadcast tọa độ mới đến tất cả thành viên khác trong phòng
+    // Không gửi lại cho người gửi (socket.to thay vì io.to)
+    socket.to(roomId).emit("live_location_updated", {
+      roomId,
+      senderId: userId,
+      lat,
+      lng,
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Không cần callback trong trường hợp này vì event xảy ra rất thường xuyên
+    _respond(callback, true);
+  });
+
+  socket.on("stop_live_location", async ({ roomId }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
+      return;
+    }
+    if (!userId) {
+      _respond(callback, false, "User not authenticated");
+      return;
+    }
+
+    // Thông báo cho các thành viên khác biết người dùng đã dừng chia sẻ
+    socket.to(roomId).emit("live_location_stopped", {
+      roomId,
+      senderId: userId,
+      stoppedAt: new Date().toISOString(),
+    });
+
+    console.log(`[live_location] User ${userId} stopped sharing in room ${roomId}`);
+    _respond(callback, true);
+  });
+
+  // ============================================================
   // MARK READ — đánh dấu tin nhắn đã đọc (Read Receipts)
   // ============================================================
   socket.on("mark_read", async ({ conversationId, messageId }, callback) => {

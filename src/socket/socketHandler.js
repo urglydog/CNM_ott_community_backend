@@ -1133,6 +1133,14 @@ function emitToRoom(roomId, event, payload) {
   io.to(roomId).emit(event, payload);
 }
 
+/**
+ * Emit event call_log tới room cụ thể
+ */
+function emitCallLogToRoom(io, conversationId, callLogData) {
+  if (!io) return;
+  io.to(String(conversationId)).emit("receive_message", callLogData);
+}
+
 module.exports = {
   handleSocketConnection,
   socketAuthMiddleware,

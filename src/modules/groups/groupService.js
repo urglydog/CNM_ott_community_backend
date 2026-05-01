@@ -62,7 +62,9 @@ async function createGroup(payload) {
     created_by: ownerId,
     created_at: now,
     inviteCode: generateInviteCode(),
-    isApprovalRequired: false
+    isApprovalRequired: false,
+    allowSendLinks: payload.allowSendLinks || 'ALL', // 'ALL' hoặc 'ADMINS_ONLY'
+    spamFilterLevel: payload.spamFilterLevel !== undefined ? payload.spamFilterLevel : 1 // 0: Tắt, 1: Vừa, 2: Gắt gao
   };
 
   await ddbDocClient.send(new PutCommand({
@@ -120,7 +122,10 @@ async function listGroups() {
     avatarUrl: g.avatar_url,
     memberCount: g.member_count,
     createdBy: g.created_by,
-    createdAt: g.created_at
+    createdAt: g.created_at,
+    isApprovalRequired: !!g.isApprovalRequired,
+    allowSendLinks: g.allowSendLinks || 'ALL',
+    spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
   }));
 }
 
@@ -142,7 +147,9 @@ async function getGroupById(groupId) {
     memberCount: g.member_count,
     createdBy: g.created_by,
     createdAt: g.created_at,
-    isApprovalRequired: !!g.isApprovalRequired
+    isApprovalRequired: !!g.isApprovalRequired,
+    allowSendLinks: g.allowSendLinks || 'ALL',
+    spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
   };
 }
 
@@ -507,7 +514,9 @@ async function getGroupsForUser(userId) {
       memberCount: g.member_count,
       createdBy: g.created_by,
       createdAt: g.created_at,
-      isApprovalRequired: !!g.isApprovalRequired
+      isApprovalRequired: !!g.isApprovalRequired,
+      allowSendLinks: g.allowSendLinks || 'ALL',
+      spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
     }));
 }
 
@@ -686,6 +695,20 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
     changed = true;
   }
 
+  if (settings.allowSendLinks !== undefined) {
+    updateExpr += '#allowSend = :allowSend, ';
+    exprNames['#allowSend'] = 'allowSendLinks';
+    exprValues[':allowSend'] = String(settings.allowSendLinks);
+    changed = true;
+  }
+
+  if (settings.spamFilterLevel !== undefined) {
+    updateExpr += '#spamLvl = :spamLvl, ';
+    exprNames['#spamLvl'] = 'spamFilterLevel';
+    exprValues[':spamLvl'] = Number(settings.spamFilterLevel);
+    changed = true;
+  }
+
   // Bỏ dấu phẩy thừa ở cuối
   updateExpr = updateExpr.replace(/, $/, '');
 
@@ -697,6 +720,18 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
       ExpressionAttributeNames: exprNames,
       ExpressionAttributeValues: exprValues
     }));
+
+    const io = getActiveIO();
+    if (io) {
+      io.to(groupKey).emit('SERVER:GROUP_SETTINGS_UPDATED', {
+        groupId: groupKey,
+        settings: {
+          isApprovalRequired: settings.isApprovalRequired,
+          allowSendLinks: settings.allowSendLinks,
+          spamFilterLevel: settings.spamFilterLevel
+        }
+      });
+    }
   }
 
   return { message: 'Settings updated successfully' };

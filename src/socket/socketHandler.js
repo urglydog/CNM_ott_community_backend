@@ -319,6 +319,53 @@ function handleSocketConnection(io, socket) {
     _respond(callback, true, null, { roomId });
   });
 
+  // --- Ghim tin nhắn ---
+  socket.on("pin_message", async (data, callback) => {
+    try {
+      const { roomId, message } = data;
+      const groupService = require("../modules/groups/groupService");
+      const friendService = require("../modules/users/friendService");
+
+      let pinnedList = [];
+      if (roomId.startsWith("group_")) {
+        pinnedList = await groupService.pinMessage(roomId, message, userIdKey);
+      } else if (roomId.startsWith("dm:")) {
+        const parts = roomId.split(":");
+        const rec = await friendService.findExistingRecord(parts[1], parts[2]);
+        if (!rec) throw new Error("Không tìm thấy thông tin bạn bè");
+        pinnedList = await friendService.pinMessage(rec.friendshipId, message, userIdKey);
+      }
+
+      io.to(roomId).emit("message_pinned_updated", { roomId, pinnedMessages: pinnedList });
+      _respond(callback, true, null, { pinnedMessages: pinnedList });
+    } catch (error) {
+      _respond(callback, false, error.message);
+    }
+  });
+
+  socket.on("unpin_message", async (data, callback) => {
+    try {
+      const { roomId, messageId } = data;
+      const groupService = require("../modules/groups/groupService");
+      const friendService = require("../modules/users/friendService");
+
+      let pinnedList = [];
+      if (roomId.startsWith("group_")) {
+        pinnedList = await groupService.unpinMessage(roomId, messageId, userIdKey);
+      } else if (roomId.startsWith("dm:")) {
+        const parts = roomId.split(":");
+        const rec = await friendService.findExistingRecord(parts[1], parts[2]);
+        if (!rec) throw new Error("Không tìm thấy thông tin bạn bè");
+        pinnedList = await friendService.unpinMessage(rec.friendshipId, messageId, userIdKey);
+      }
+
+      io.to(roomId).emit("message_pinned_updated", { roomId, pinnedMessages: pinnedList });
+      _respond(callback, true, null, { pinnedMessages: pinnedList });
+    } catch (error) {
+      _respond(callback, false, error.message);
+    }
+  });
+
   // --- Tham gia phòng chat (legacy alias) ---
   // KHÔNG dùng socket.emit vì emit không truyền callback qua chain,
   // dẫn đến lỗi rơi vào "No callback provided" thay vì phản hồi client.
@@ -528,6 +575,27 @@ function handleSocketConnection(io, socket) {
   });
 
   // ============================================================
+  // CHAT BACKGROUND UPDATE — Real-time sync
+  // ============================================================
+  socket.on("chat_background_updated", async (data, callback) => {
+    try {
+      const { friendshipId, bgUrl, receiverId } = data;
+      if (!friendshipId) return _respond(callback, false, "friendshipId is required");
+
+      // Gửi cho receiver qua các socket của họ
+      if (receiverId) {
+        emitToUserSockets(receiverId, "chat_background_updated", { 
+          friendshipId, 
+          bgUrl,
+          updatedBy: userIdKey 
+        });
+      }
+
+      _respond(callback, true);
+    } catch (error) {
+      console.error("[chat_background_updated] error:", error.message);
+      _respond(callback, false, error.message);
+    }
   // TYPING STOP ALL — gửi stop typing cho tất cả conversations khi logout
   // ============================================================
   socket.on("typing_stop_all", async ({ conversations = [] }, callback) => {

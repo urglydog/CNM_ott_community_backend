@@ -596,6 +596,8 @@ function handleSocketConnection(io, socket) {
       console.error("[chat_background_updated] error:", error.message);
       _respond(callback, false, error.message);
     }
+  });
+
   // TYPING STOP ALL — gửi stop typing cho tất cả conversations khi logout
   // ============================================================
   socket.on("typing_stop_all", async ({ conversations = [] }, callback) => {

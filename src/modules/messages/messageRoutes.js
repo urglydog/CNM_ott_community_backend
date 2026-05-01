@@ -22,6 +22,12 @@ router.post("/", messageController.sendMessage);
 router.post("/file", upload.single("file"), messageController.sendFileMessage);
 router.post("/sticker", messageController.sendStickerMessage);
 router.post("/emoji", messageController.sendEmojiMessage);
+// Gửi tin nhắn vị trí tĩnh (Current Location) — lưu vào DB và broadcast qua socket
+router.post("/location", authMiddleware, messageController.sendLocationMessage);
+// Bắt đầu phiên live location — tạo tin nhắn với isLive: true
+router.post("/location/live/start", authMiddleware, messageController.startLiveLocationMessage);
+// Dừng phiên live location — cập nhật isLive: false, broadcast socket event
+router.patch("/location/live/:messageId/stop", authMiddleware, messageController.stopLiveLocationMessage);
 
 // ─── Read Receipt Routes ───────────────────────────────────────────
 router.get(

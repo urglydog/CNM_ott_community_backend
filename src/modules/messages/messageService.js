@@ -1,5 +1,5 @@
 const { ddbDocClient } = require("../../config/awsConfig");
-const { PutCommand, GetCommand, ScanCommand } = require("@aws-sdk/lib-dynamodb");
+const { PutCommand, GetCommand, ScanCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
 const { PutObjectCommand } = require("@aws-sdk/client-s3");
 const { randomUUID } = require("crypto");
 const { s3Client } = require("../../config/awsConfig");
@@ -23,6 +23,8 @@ const VALID_CONTENT_TYPES = new Set([
   "emoji",
   "sticker",
   "system",
+  // Loại tin nhắn vị trí — lưu tọa độ {lat, lng} dưới dạng locationData
+  "location",
 ]);
 
 /**
@@ -170,6 +172,18 @@ async function saveMessage(payload) {
     validateEmojiData(payload.content);
   }
 
+  // Validate location: phải có locationData với lat và lng hợp lệ
+  if (contentType === "location") {
+    const loc = payload.locationData;
+    if (!loc || typeof loc.lat !== "number" || typeof loc.lng !== "number") {
+      throw new Error("locationData với lat và lng (number) là bắt buộc cho tin nhắn vị trí");
+    }
+    // Content mặc định hiển thị tọa độ nếu không được truyền vào
+    if (!payload.content) {
+      payload.content = `📍 ${loc.lat.toFixed(6)}, ${loc.lng.toFixed(6)}`;
+    }
+  }
+
   const createdAt = new Date().toISOString();
   const id = Date.now();
 
@@ -187,6 +201,19 @@ async function saveMessage(payload) {
     // stickerData chỉ tồn tại khi contentType === "sticker"
     ...(contentType === "sticker" && payload.stickerData
       ? { stickerData: { ...payload.stickerData } }
+      : {}),
+    // locationData chỉ tồn tại khi contentType === "location" — lưu {lat, lng, label?, isLive?, liveUntil?}
+    ...(contentType === "location" && payload.locationData
+      ? {
+          locationData: {
+            lat: payload.locationData.lat,
+            lng: payload.locationData.lng,
+            label: payload.locationData.label || null,
+            // Fields live location
+            isLive: payload.locationData.isLive === true,
+            liveUntil: payload.locationData.liveUntil || null,
+          },
+        }
       : {}),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
@@ -229,6 +256,8 @@ async function saveMessage(payload) {
     contentType: newMessage.contentType,
     content: newMessage.content,
     ...(newMessage.stickerData ? { stickerData: newMessage.stickerData } : {}),
+    // Trả về locationData để frontend render bản đồ
+    ...(newMessage.locationData ? { locationData: newMessage.locationData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
     replyTo: newMessage.replyTo,
@@ -303,6 +332,8 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         contentType: msg.contentType,
         content: msg.content,
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
+        // locationData được giữ nguyên khi đọc lại từ DB
+        ...(msg.locationData ? { locationData: msg.locationData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         replyTo: msg.replyTo || null,
@@ -741,6 +772,63 @@ async function searchMessagesForUserGlobal({
     data: enriched,
   };
 }
+/**
+ * Dừng phên chia sẻ vị trí trực tiếp.
+ * Cập nhật field locationData.isLive = false và locationData.liveUntil = now
+ * cho tin nhắn tương ứng trong DynamoDB.
+ *
+ * @param {string} conversationId - ID phòng
+ * @param {string|number} messageId - ID tin nhắn live location
+ * @param {string} stoppedAt - ISO string thời điểm dừng
+ * @returns {Promise<object|null>} tin nhắn đã cập nhật, hoặc null nếu không tìm thấy
+ */
+async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
+  if (!conversationId || !messageId) {
+    throw new Error("conversationId và messageId là bắt buộc");
+  }
+
+  const res = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MESSAGES_TABLE,
+      Key: { conversationId },
+    })
+  );
+
+  if (!res.Item || !Array.isArray(res.Item.messages)) {
+    return null;
+  }
+
+  const messages = res.Item.messages.slice();
+  const idx = messages.findIndex((m) => String(m.id) === String(messageId));
+  if (idx === -1) return null;
+
+  const msg = messages[idx];
+  if (!msg.locationData) return null;
+
+  // Cập nhật in-place
+  messages[idx] = {
+    ...msg,
+    locationData: {
+      ...msg.locationData,
+      isLive: false,
+      liveUntil: stoppedAt || new Date().toISOString(),
+    },
+  };
+
+  // Ghi lại toàn bộ mảng messages (DynamoDB document store)
+  await ddbDocClient.send(
+    new PutCommand({
+      TableName: MESSAGES_TABLE,
+      Item: {
+        conversationId,
+        messages,
+      },
+    })
+  );
+
+  return messages[idx];
+}
+
 module.exports = {
   saveMessage,
   saveStickerMessage,
@@ -750,4 +838,5 @@ module.exports = {
   saveFileMessage,
   searchMessagesInConversation,
   searchMessagesForUserGlobal,
+  stopLiveLocationMessage,
 };

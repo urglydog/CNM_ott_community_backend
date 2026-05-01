@@ -4,7 +4,7 @@ const {
   GetCommand,
   QueryCommand,
 } = require("@aws-sdk/lib-dynamodb");
-const { saveMessage } = require("../modules/messages/messageService");
+const { saveMessage, saveCallLogMessage } = require("../modules/messages/messageService");
 const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
 const { notifyMessageCreated } = require("../modules/notifications/notificationService");
 const { verifyToken } = require("../common/utils/jwt");
@@ -47,6 +47,13 @@ function isDuplicateReadReceipt(conversationId, messageId, userId) {
 // ============================================================
 // roomId -> { callerId, receiverIds: string[], status, timeoutRef }
 const activeCalls = new Map();
+
+// Map ZegoCloud roomId (call_1vs1_...) -> conversationId (dm:...)
+// Được ghi khi call-request, dùng bởi Webhook để trầ cứu conversationId đúng
+const roomToConversation = new Map();
+
+// Map ZegoCloud roomId -> startedAt (ms) — dùng để tính duration khi Zego webhook không gửi timestamp
+const roomStartedAt = new Map();
 
 /**
  * Lấy displayName và avatarUrl của user từ bảng ott_users.
@@ -561,13 +568,22 @@ function handleSocketConnection(io, socket) {
     const record = {
       callerId,
       receiverIds: [receiverId],
+      conversationId: String(data.conversationId || ""), // lưu conversationId thật (dm:...) để dùng khi lưu call log
       status: "ringing",
+      startedAt: null, // sẽ được set khi call-accepted
       timeoutRef: null,
     };
 
     // Override any existing call for this room
     clearActiveCall(roomId);
     activeCalls.set(roomId, record);
+
+    // Lưu mapping roomId (Zego) → conversationId (dm:...) để Webhook tra cứu
+    if (data.conversationId) {
+      roomToConversation.set(roomId, String(data.conversationId));
+      roomStartedAt.set(roomId, Date.now()); // ← lưu thời điểm bắt đầu
+      console.log(`[call-request] Mapped roomId=${roomId} → conversationId=${data.conversationId}`);
+    }
 
     record.timeoutRef = setTimeout(() => {
       const payload = {
@@ -644,13 +660,23 @@ function handleSocketConnection(io, socket) {
     const record = {
       callerId: payload.callerId,
       receiverIds: [String(groupId)], // For group, receiver is the group itself
+      conversationId: String(data.conversationId || groupId), // lưu conversationId thật (group_...) để dùng khi lưu call log
       status: "ringing",
+      startedAt: Date.now(),  // ← set ngay khi tạo phòng để tính duration đúng
       timeoutRef: null,
       isGroupCall: true
     };
     clearActiveCall(roomId);
     activeCalls.set(roomId, record);
-    
+
+    // Lưu mapping roomId (Zego: group_call_...) → conversationId thật (group_...)
+    const resolvedConvId = String(data.conversationId || groupId);
+    if (resolvedConvId) {
+      roomToConversation.set(roomId, resolvedConvId);
+      roomStartedAt.set(roomId, Date.now()); // ← lưu thời điểm bắt đầu
+      console.log(`[group-call-request] Mapped roomId=${roomId} → conversationId=${resolvedConvId}`);
+    }
+
     record.timeoutRef = setTimeout(() => {
       emitToCallParticipants(record, "call-timeout", {
         roomId,
@@ -669,6 +695,43 @@ function handleSocketConnection(io, socket) {
     socket.to(String(groupId)).emit("group-call-request", payload);
     // Emit sang cả room channel:... để đảm bảo clients cũ đang ở đó cũng nhận được
     socket.to(`channel:${groupId}`).emit("group-call-request", payload);
+
+    // ── Lưu tin nhắn hệ thống "group_call_started" để hiển thị banner [Tham gia] ──
+    try {
+      const callerInfo = await (async () => {
+        try {
+          const res = await ddbDocClient.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: String(payload.callerId) } }));
+          return { displayName: res.Item?.displayName || res.Item?.username || "Ai đó", avatarUrl: res.Item?.avatarUrl || null };
+        } catch { return { displayName: "Ai đó", avatarUrl: null }; }
+      })();
+
+      const startMsg = await saveCallLogMessage({
+        conversationId: resolvedConvId,
+        senderId: String(payload.callerId),
+        callData: {
+          callType: "video",
+          status: "started",       // trạng thái đặc biệt — đang diễn ra
+          duration: 0,
+          roomId,                  // để nút [Tham gia] biết join vào phòng nào
+          messageType: "group_call_started",
+        },
+      });
+
+      // Override messageType để frontend phân biệt với call_log thông thường
+      const enrichedStartMsg = {
+        ...startMsg,
+        messageType: "group_call_started",
+        contentType: "group_call_started",
+        content: `📞 ${callerInfo.displayName} đang gọi nhóm`,
+        senderDisplayName: callerInfo.displayName,
+        senderAvatarUrl: callerInfo.avatarUrl,
+      };
+
+      io.to(resolvedConvId).emit("receive_message", enrichedStartMsg);
+      console.log(`[group-call-request] Đã gửi banner group_call_started → room ${resolvedConvId}`);
+    } catch (err) {
+      console.error("[group-call-request] Không thể lưu group_call_started:", err.message);
+    }
 
     _respond(callback, true);
   });
@@ -694,6 +757,7 @@ function handleSocketConnection(io, socket) {
     }
 
     record.status = "in_call";
+    record.startedAt = Date.now(); // ⏱️ Ghi nhận mốc bắt đầu để tính duration chính xác
 
     const payload = {
       ...data,
@@ -711,7 +775,43 @@ function handleSocketConnection(io, socket) {
   socket.on("call-accepted", handleCallAccept);
   socket.on("call-accept", handleCallAccept);
 
-  socket.on("call-reject", (data = {}, callback) => {
+  // ============================================================
+  // HELPER: Lưu call log vào DynamoDB và phát realtime
+  // Được gọi sau khi một cuộc gọi kết thúc (end, reject, cancel, timeout)
+  // ============================================================
+  const saveCallLog = async ({ conversationId, callerId, callType, status, durationSec = 0 }) => {
+    try {
+      console.log(`📞 [saveCallLog] Bắt đầu lưu: conversationId=${conversationId}, callerId=${callerId}, status=${status}, duration=${durationSec}s`);
+      const callLogItem = await saveCallLogMessage({
+        conversationId: String(conversationId),
+        senderId: String(callerId || "system"),
+        callData: {
+          callType: callType || "video",
+          status,
+          duration: Number(durationSec) || 0,
+        },
+      });
+      console.log(`✅ [saveCallLog] Đã lưu call log: messageId=${callLogItem?.messageId}`);
+
+      // Phát realtime tới tất cả người trong phòng
+      io.to(conversationId).emit("receive_message", callLogItem);
+
+      // DM fallback: emit số đảo room id
+      if (conversationId.startsWith("dm:")) {
+        const parts = conversationId.split(":");
+        if (parts.length >= 3) {
+          const reversedRoomId = `dm:${parts[2]}:${parts[1]}`;
+          if (reversedRoomId !== conversationId) {
+            io.to(reversedRoomId).emit("receive_message", callLogItem);
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`❌ [saveCallLog] Thất bại lưu call log:`, err.message, err.stack);
+    }
+  };
+
+  socket.on("call-reject", async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     if (!roomId) {
       _respond(callback, false, "roomId is required");
@@ -731,10 +831,25 @@ function handleSocketConnection(io, socket) {
       reason: "rejected",
     });
 
+    // ── Lưu Call Log (missed) vào DynamoDB ────────────────────────────────
+    // dùng data.conversationId (dm:...) — KHÔNG dùng roomId (call_1vs1_...)
+    const rejectConversationId = String(data.conversationId || record.conversationId || "");
+    if (!rejectConversationId) {
+      console.error(`❌ [call-reject] Thiếu conversationId, không thể lưu call log. data.conversationId=${data.conversationId}`);
+    } else {
+      await saveCallLog({
+        conversationId: rejectConversationId,
+        callerId: record.callerId,
+        callType: data.callType || "video",
+        status: "missed",
+        durationSec: 0,
+      });
+    }
+
     _respond(callback, true);
   });
 
-  socket.on("call-cancel", (data = {}, callback) => {
+  socket.on("call-cancel", async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     if (!roomId) {
       _respond(callback, false, "roomId is required");
@@ -754,10 +869,25 @@ function handleSocketConnection(io, socket) {
       reason: "canceled",
     });
 
+    // ── Lưu Call Log (canceled/missed) vào DynamoDB ───────────────────────
+    // dùng data.conversationId (dm:...) — KHÔNG dùng roomId (call_1vs1_...)
+    const cancelConversationId = String(data.conversationId || record.conversationId || "");
+    if (!cancelConversationId) {
+      console.error(`❌ [call-cancel] Thiếu conversationId, không thể lưu call log. data.conversationId=${data.conversationId}`);
+    } else {
+      await saveCallLog({
+        conversationId: cancelConversationId,
+        callerId: record.callerId,
+        callType: data.callType || "video",
+        status: "missed",
+        durationSec: 0,
+      });
+    }
+
     _respond(callback, true);
   });
 
-  socket.on("end-call", (data = {}, callback) => {
+  socket.on("end-call", async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     if (!roomId) {
       _respond(callback, false, "roomId is required");
@@ -770,12 +900,32 @@ function handleSocketConnection(io, socket) {
       return;
     }
 
+    // Tính duration từ thời điểm bắt đầu (nếu record có startedAt)
+    const durationSec = record.startedAt
+      ? Math.floor((Date.now() - record.startedAt) / 1000)
+      : (Number(data.duration) || 0);
+
     clearActiveCall(roomId);
     emitToCallParticipants(record, "call-ended", {
       ...data,
       roomId,
       reason: "ended",
     });
+
+    // ── Lưu Call Log vào DynamoDB ──────────────────────────────────────────
+    // dùng data.conversationId (dm:...) — KHÔNG dùng roomId (call_1vs1_...)
+    const endConversationId = String(data.conversationId || record.conversationId || "");
+    if (!endConversationId) {
+      console.error(`❌ [end-call] Thiếu conversationId, không thể lưu call log. data.conversationId=${data.conversationId}`);
+    } else {
+      await saveCallLog({
+        conversationId: endConversationId,
+        callerId: record.callerId || userIdKey,
+        callType: data.callType || "video",
+        status: "completed",
+        durationSec,
+      });
+    }
 
     _respond(callback, true);
   });
@@ -1152,5 +1302,7 @@ module.exports = {
   notifyFriendAccepted,
   joinUserToRoom,
   leaveUserFromRoom,
-  emitToRoom
+  emitToRoom,
+  roomToConversation,
+  roomStartedAt,
 };

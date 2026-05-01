@@ -829,8 +829,63 @@ async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
   return messages[idx];
 }
 
+/**
+ * Lưu log cuộc gọi (Call Log) từ ZegoCloud Webhook vào DynamoDB.
+ * @param {object} payload - { conversationId, senderId, callData: { callType, status, duration } }
+ */
+async function saveCallLogMessage({ conversationId, senderId, callData }) {
+  if (!conversationId) throw new Error("conversationId is required");
+  if (!senderId) throw new Error("senderId is required");
+  if (!callData) throw new Error("callData is required");
+
+  const id = Date.now();
+  const messageId = randomUUID();
+  const createdAt = new Date().toISOString();
+
+  const newMessage = {
+    id,
+    messageId,
+    senderId: String(senderId),
+    contentType: "call_log", // backward compatible
+    messageType: "call_log", // user specific request
+    content: "Cuộc gọi " + (callData.callType === "video" ? "video" : "thoại"),
+    callData, // { callType, status, duration }
+    createdAt,
+  };
+
+  const getRes = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MESSAGES_TABLE,
+      Key: { conversationId: String(conversationId) },
+    })
+  );
+
+  const existing = getRes.Item || { conversationId: String(conversationId), messages: [] };
+  const messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
+  messages.push(newMessage);
+
+  await ddbDocClient.send(
+    new PutCommand({
+      TableName: MESSAGES_TABLE,
+      Item: {
+        conversationId: String(conversationId),
+        messages,
+      },
+    })
+  );
+
+  const info = await enrichSenderInfo(senderId);
+  return {
+    ...newMessage,
+    conversationId: String(conversationId),
+    senderDisplayName: info.senderDisplayName,
+    senderAvatarUrl: info.senderAvatarUrl,
+  };
+}
+
 module.exports = {
   saveMessage,
+  saveCallLogMessage,
   saveStickerMessage,
   getMessagesForConversation,
   getRepliedMessageInfo,

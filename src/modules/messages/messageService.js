@@ -22,6 +22,7 @@ const VALID_CONTENT_TYPES = new Set([
   "video",
   "emoji",
   "sticker",
+  "system",
 ]);
 
 /**

@@ -144,7 +144,8 @@ async function getGroupById(groupId) {
     memberCount: g.member_count,
     createdBy: g.created_by,
     createdAt: g.created_at,
-    isApprovalRequired: !!g.isApprovalRequired
+    isApprovalRequired: !!g.isApprovalRequired,
+    pinnedMessages: g.pinnedMessages || []
   };
 }
 
@@ -461,7 +462,8 @@ async function getGroupsForUser(userId) {
       memberCount: g.member_count,
       createdBy: g.created_by,
       createdAt: g.created_at,
-      isApprovalRequired: !!g.isApprovalRequired
+      isApprovalRequired: !!g.isApprovalRequired,
+      pinnedMessages: g.pinnedMessages || []
     }));
 }
 
@@ -884,5 +886,91 @@ module.exports = {
   requestToJoin,
   getPendingRequests,
   handleJoinRequest,
-  updateGroupSettings
+  updateGroupSettings,
+  pinMessage,
+  unpinMessage,
 };
+
+async function pinMessage(groupId, message, requestUserId) {
+  const groupKey = String(groupId);
+  const result = await ddbDocClient.send(new GetCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey }
+  }));
+  const g = result.Item;
+  if (!g) throw new Error('Group not found');
+
+  // Kiểm tra quyền (OWNER/DEPUTY)
+  const memberRes = await ddbDocClient.send(new GetCommand({
+    TableName: MEMBERS_TABLE,
+    Key: { groupId: groupKey, userId: String(requestUserId) }
+  }));
+  const member = memberRes.Item;
+  if (!member || (member.role !== 'OWNER' && member.role !== 'owner' && member.role !== 'DEPUTY' && member.role !== 'deputy')) {
+    throw new Error('Only OWNER or DEPUTY can pin messages');
+  }
+
+  let pinned = Array.isArray(g.pinnedMessages) ? g.pinnedMessages : [];
+  pinned = pinned.filter(m => String(m.id) !== String(message.id));
+
+  const pinObj = {
+    ...message,
+    pinnedBy: String(requestUserId),
+    pinnedAt: new Date().toISOString()
+  };
+  pinned.unshift(pinObj);
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey },
+    UpdateExpression: 'SET pinnedMessages = :p',
+    ExpressionAttributeValues: { ':p': pinned }
+  }));
+
+  return pinned;
+}
+
+async function unpinMessage(groupId, messageId, requestUserId) {
+  const groupKey = String(groupId);
+  const result = await ddbDocClient.send(new GetCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey }
+  }));
+  const g = result.Item;
+  if (!g) throw new Error('Group not found');
+
+  // Kiểm tra quyền
+  const memberRes = await ddbDocClient.send(new GetCommand({
+    TableName: MEMBERS_TABLE,
+    Key: { groupId: groupKey, userId: String(requestUserId) }
+  }));
+  const member = memberRes.Item;
+  if (!member || (member.role !== 'OWNER' && member.role !== 'owner' && member.role !== 'DEPUTY' && member.role !== 'deputy')) {
+    throw new Error('Only OWNER or DEPUTY can unpin messages');
+  }
+
+  let pinned = Array.isArray(g.pinnedMessages) ? g.pinnedMessages : [];
+
+  // Kiểm tra quyền: 
+  // 1. Nếu là OWNER/DEPUTY thì được gỡ mọi ghim
+  // 2. Nếu là MEMBER thì chỉ được gỡ ghim do chính mình tạo
+  const pinToUnpin = pinned.find(m => String(m.id) === String(messageId));
+  
+  const isPinner = pinToUnpin && String(pinToUnpin.pinnedBy) === String(requestUserId);
+  const isHighRole = member && (member.role === 'OWNER' || member.role === 'owner' || member.role === 'DEPUTY' || member.role === 'deputy');
+
+  if (pinToUnpin && pinToUnpin.pinnedBy && !isPinner && !isHighRole) {
+    throw new Error('Bạn không có quyền gỡ tin nhắn này');
+  }
+
+  pinned = pinned.filter(m => String(m.id) !== String(messageId));
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey },
+    UpdateExpression: 'SET pinnedMessages = :p',
+    ExpressionAttributeValues: { ':p': pinned }
+  }));
+
+  return pinned;
+}

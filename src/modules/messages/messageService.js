@@ -25,6 +25,8 @@ const VALID_CONTENT_TYPES = new Set([
   "system",
   // Loại tin nhắn vị trí — lưu tọa độ {lat, lng} dưới dạng locationData
   "location",
+  // Loại tin nhắn log cuộc gọi từ ZegoCloud webhook
+  "call_log",
 ]);
 
 /**
@@ -330,7 +332,9 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         conversationId,
         senderId: msg.senderId,
         contentType: msg.contentType,
+        messageType: msg.messageType,           // ← cần cho call_log UI
         content: msg.content,
+        callData: msg.callData || null,          // ← cần cho call_log UI
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
         // locationData được giữ nguyên khi đọc lại từ DB
         ...(msg.locationData ? { locationData: msg.locationData } : {}),
@@ -834,9 +838,14 @@ async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
  * @param {object} payload - { conversationId, senderId, callData: { callType, status, duration } }
  */
 async function saveCallLogMessage({ conversationId, senderId, callData }) {
-  if (!conversationId) throw new Error("conversationId is required");
-  if (!senderId) throw new Error("senderId is required");
-  if (!callData) throw new Error("callData is required");
+  // ── Validate & Sanitize đầu vào ──────────────────────────────────────────
+  if (!conversationId) throw new Error("[saveCallLogMessage] conversationId is required");
+  if (!callData) throw new Error("[saveCallLogMessage] callData is required");
+
+  // senderId có thể thiếu từ ZegoCloud webhook → fallback về 'zego_webhook'
+  const resolvedSenderId = senderId && String(senderId).trim()
+    ? String(senderId).trim()
+    : "zego_webhook";
 
   const id = Date.now();
   const messageId = randomUUID();
@@ -845,36 +854,60 @@ async function saveCallLogMessage({ conversationId, senderId, callData }) {
   const newMessage = {
     id,
     messageId,
-    senderId: String(senderId),
+    senderId: resolvedSenderId,
     contentType: "call_log", // backward compatible
     messageType: "call_log", // user specific request
     content: "Cuộc gọi " + (callData.callType === "video" ? "video" : "thoại"),
-    callData, // { callType, status, duration }
+    callData: {
+      callType: callData.callType || "voice",
+      status: callData.status || "missed",
+      duration: Number(callData.duration) || 0,
+    },
     createdAt,
   };
 
-  const getRes = await ddbDocClient.send(
-    new GetCommand({
-      TableName: MESSAGES_TABLE,
-      Key: { conversationId: String(conversationId) },
-    })
-  );
+  // ── Bước 1: Lấy document hiện tại từ DynamoDB ───────────────────────────
+  let messages = [];
+  try {
+    const getRes = await ddbDocClient.send(
+      new GetCommand({
+        TableName: MESSAGES_TABLE,
+        Key: { conversationId: String(conversationId) },
+      })
+    );
+    const existing = getRes.Item || { conversationId: String(conversationId), messages: [] };
+    messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
+  } catch (getError) {
+    console.error("❌ [DYNAMODB GET ERROR] Không đọc được messages cũ:", getError.message, getError.stack);
+    // Tiếp tục với mảng rỗng — sẽ tạo document mới
+    messages = [];
+  }
 
-  const existing = getRes.Item || { conversationId: String(conversationId), messages: [] };
-  const messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
   messages.push(newMessage);
 
-  await ddbDocClient.send(
-    new PutCommand({
-      TableName: MESSAGES_TABLE,
-      Item: {
-        conversationId: String(conversationId),
-        messages,
-      },
-    })
-  );
+  // ── Bước 2: Ghi document cập nhật vào DynamoDB ──────────────────────────
+  const itemToSave = {
+    conversationId: String(conversationId),
+    messages,
+  };
 
-  const info = await enrichSenderInfo(senderId);
+  console.log("📦 [DYNAMODB PAYLOAD]:", JSON.stringify(itemToSave, null, 2));
+
+  try {
+    await ddbDocClient.send(
+      new PutCommand({
+        TableName: MESSAGES_TABLE,
+        Item: itemToSave,
+      })
+    );
+    console.log(`✅ [DYNAMODB PUT OK] conversationId=${conversationId}, messageId=${messageId}`);
+  } catch (error) {
+    console.error("❌ [DYNAMODB ERROR]:", error.message, error.stack);
+    throw error; // re-throw để controller biết lưu thất bại
+  }
+
+  // ── Bước 3: Enrich thông tin người gọi để trả về Frontend ───────────────
+  const info = await enrichSenderInfo(resolvedSenderId);
   return {
     ...newMessage,
     conversationId: String(conversationId),

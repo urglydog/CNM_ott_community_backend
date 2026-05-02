@@ -12,6 +12,7 @@ const { verifyToken } = require("../common/utils/jwt");
 
 const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
 const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
+const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
 
 // ============================================================
 // READ RECEIPT DEDUPLICATION CACHE
@@ -424,19 +425,20 @@ function handleSocketConnection(io, socket) {
   // SEND MESSAGE — có kiểm tra membership
   // ============================================================
   socket.on("send_message", async (payload, callback) => {
-    // Payload: { roomId, content, contentType, attachments, stickerData, replyTo }
+    // Payload: { roomId, content, contentType, attachments, stickerData, replyTo, pollData }
     const contentType = payload.contentType || "text";
 
     // sticker: không bắt buộc content; emoji/sticker: dùng stickerData thay thế
     const hasContent = payload.content && String(payload.content).trim();
     const hasStickerData = contentType === "sticker" && payload.stickerData;
     const isEmoji = contentType === "emoji";
+    const isPoll = contentType === "poll";
 
     if (!payload.roomId) {
       return _respond(callback, false, "roomId is required");
     }
-    if (!hasContent && !hasStickerData && !isEmoji) {
-      return _respond(callback, false, "content or stickerData is required");
+    if (!hasContent && !hasStickerData && !isEmoji && !isPoll) {
+      return _respond(callback, false, "content or stickerData or pollData is required");
     }
 
     if (!userId) {
@@ -456,6 +458,7 @@ function handleSocketConnection(io, socket) {
     try {
       // sticker: content có thể là undefined → service sẽ tự tạo từ stickerData
       // emoji: content luôn là emoji string
+      // poll: content là câu hỏi, pollData chứa options
       const entityPayload = {
         conversationId: payload.roomId,
         senderId: userId,
@@ -464,6 +467,8 @@ function handleSocketConnection(io, socket) {
         attachments: payload.attachments || null,
         mentions: Array.isArray(payload.mentions) ? payload.mentions.map(String) : [],
         ...(hasStickerData ? { stickerData: payload.stickerData } : {}),
+        // Thêm pollData nếu là tin nhắn bình chọn
+        ...(isPoll && payload.pollData ? { pollData: payload.pollData } : {}),
         // Thêm replyTo nếu có - ID của tin nhắn đang được trả lời
         ...(payload.replyTo ? { replyTo: payload.replyTo } : {}),
       };
@@ -572,6 +577,107 @@ function handleSocketConnection(io, socket) {
   // --- Gửi tin nhắn (legacy alias cho backward compatibility) ---
   socket.on("send-message", async (payload, callback) => {
     socket.emit("send_message", payload, callback);
+  });
+
+  // ============================================================
+  // POLL VOTING — Bình chọn trong chat
+  // ============================================================
+
+  /**
+   * vote_poll: Xử lý vote cho một lựa chọn trong poll
+   * Payload: { roomId, messageId, optionId }
+   */
+  socket.on("vote_poll", async (data, callback) => {
+    const { roomId, messageId, optionId } = data;
+
+    console.log(`[vote_poll] Received vote request: roomId=${roomId}, messageId=${messageId}, optionId=${optionId}, userId=${userId}`);
+
+    if (!roomId) return _respond(callback, false, "roomId is required");
+    if (!messageId) return _respond(callback, false, "messageId is required");
+    if (!optionId) return _respond(callback, false, "optionId is required");
+    if (!userId) return _respond(callback, false, "User not authenticated");
+
+    const isMember = await checkUserInGroup(roomId, userId);
+    if (!isMember) return _respond(callback, false, "Not a member of this group");
+
+    try {
+      // Lấy tin nhắn poll từ DynamoDB
+      console.log(`[vote_poll] Fetching conversation ${roomId} from ${MESSAGES_TABLE}`);
+      const convRes = await ddbDocClient.send(
+        new GetCommand({ TableName: MESSAGES_TABLE, Key: { conversationId: roomId } })
+      );
+
+      if (!convRes.Item || !Array.isArray(convRes.Item.messages)) {
+        return _respond(callback, false, "Không tìm thấy cuộc trò chuyện");
+      }
+
+      const messages = convRes.Item.messages.slice();
+      const msgIndex = messages.findIndex((m) => String(m.id) === String(messageId));
+
+      if (msgIndex === -1) {
+        return _respond(callback, false, "Không tìm thấy tin nhắn bình chọn");
+      }
+
+      const msg = messages[msgIndex];
+
+      if (msg.contentType !== "poll" || !msg.pollData) {
+        return _respond(callback, false, "Tin nhắn không phải là bình chọn");
+      }
+
+      const pollData = { ...msg.pollData };
+      const optionIndex = pollData.pollOptions.findIndex((o) => String(o.id) === String(optionId));
+
+      if (optionIndex === -1) {
+        return _respond(callback, false, "Không tìm thấy lựa chọn");
+      }
+
+      const userIdStr = String(userId);
+      const option = pollData.pollOptions[optionIndex];
+      const voterIds = option.voterIds || [];
+
+      // Kiểm tra xem user đã vote cho option này chưa
+      if (voterIds.includes(userIdStr)) {
+        // User đã vote → bỏ vote (toggle behavior)
+        option.voterIds = voterIds.filter((id) => id !== userIdStr);
+      } else {
+        // User chưa vote → thêm vote
+        // Nếu không phải multiple choice, bỏ vote các option khác trước
+        if (!pollData.pollSettings?.multipleChoice) {
+          pollData.pollOptions.forEach((opt) => {
+            if (Array.isArray(opt.voterIds)) {
+              opt.voterIds = opt.voterIds.filter((id) => id !== userIdStr);
+            }
+          });
+        }
+        option.voterIds = [...voterIds, userIdStr];
+      }
+
+      // Cập nhật message trong mảng
+      messages[msgIndex] = { ...msg, pollData };
+
+      // Lưu lại vào DynamoDB
+      console.log(`[vote_poll] Saving vote to ${MESSAGES_TABLE}, conversationId=${roomId}, messageId=${messageId}`);
+      await ddbDocClient.send(
+        new PutCommand({
+          TableName: MESSAGES_TABLE,
+          Item: { conversationId: roomId, messages },
+        })
+      );
+      console.log(`[vote_poll] Vote saved successfully for message ${messageId}`);
+
+      // Broadcast cập nhật poll tới tất cả thành viên trong phòng
+      io.to(roomId).emit("poll_updated", {
+        roomId,
+        messageId: String(messageId),
+        pollData,
+      });
+
+      console.log(`[vote_poll] User ${userId} voted for option ${optionId} in poll ${messageId}`);
+      _respond(callback, true, null, { pollData });
+    } catch (error) {
+      console.error("[vote_poll] Error:", error.message, error.stack);
+      _respond(callback, false, error.message);
+    }
   });
 
   // ============================================================

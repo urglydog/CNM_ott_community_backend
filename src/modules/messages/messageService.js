@@ -27,6 +27,8 @@ const VALID_CONTENT_TYPES = new Set([
   "location",
   // Loại tin nhắn log cuộc gọi từ ZegoCloud webhook
   "call_log",
+  // Loại tin nhắn bình chọn (poll)
+  "poll",
 ]);
 
 /**
@@ -174,6 +176,27 @@ async function saveMessage(payload) {
     validateEmojiData(payload.content);
   }
 
+  // Validate poll: phải có pollData với pollOptions (tối thiểu 2 options)
+  if (contentType === "poll") {
+    const pollData = payload.pollData;
+    if (!pollData || typeof pollData !== "object") {
+      throw new Error("pollData là bắt buộc cho tin nhắn bình chọn");
+    }
+    if (!Array.isArray(pollData.pollOptions) || pollData.pollOptions.length < 2) {
+      throw new Error("pollOptions phải có ít nhất 2 lựa chọn");
+    }
+    // Mỗi option phải có text
+    for (const option of pollData.pollOptions) {
+      if (!option.text || typeof option.text !== "string" || !option.text.trim()) {
+        throw new Error("Mỗi lựa chọn bình chọn phải có nội dung text");
+      }
+    }
+    // Content (question) là bắt buộc cho poll
+    if (!payload.content || !String(payload.content).trim()) {
+      throw new Error("content (câu hỏi bình chọn) là bắt buộc");
+    }
+  }
+
   // Validate location: phải có locationData với lat và lng hợp lệ
   if (contentType === "location") {
     const loc = payload.locationData;
@@ -214,6 +237,22 @@ async function saveMessage(payload) {
             // Fields live location
             isLive: payload.locationData.isLive === true,
             liveUntil: payload.locationData.liveUntil || null,
+          },
+        }
+      : {}),
+    // pollData chỉ tồn tại khi contentType === "poll" — lưu pollOptions và pollSettings
+    ...(contentType === "poll" && payload.pollData
+      ? {
+          pollData: {
+            pollOptions: payload.pollData.pollOptions.map((opt) => ({
+              id: opt.id || String(Date.now() + Math.random()),
+              text: String(opt.text).trim(),
+              voterIds: Array.isArray(opt.voterIds) ? opt.voterIds : [],
+            })),
+            pollSettings: {
+              multipleChoice: payload.pollData.pollSettings?.multipleChoice === true,
+              allowAddOption: payload.pollData.pollSettings?.allowAddOption === true,
+            },
           },
         }
       : {}),
@@ -261,6 +300,8 @@ async function saveMessage(payload) {
     ...(newMessage.stickerData ? { stickerData: newMessage.stickerData } : {}),
     // Trả về locationData để frontend render bản đồ
     ...(newMessage.locationData ? { locationData: newMessage.locationData } : {}),
+    // Trả về pollData để frontend hiển thị bình chọn
+    ...(newMessage.pollData ? { pollData: newMessage.pollData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
     replyTo: newMessage.replyTo,
@@ -340,6 +381,8 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
         // locationData được giữ nguyên khi đọc lại từ DB
         ...(msg.locationData ? { locationData: msg.locationData } : {}),
+        // pollData được giữ nguyên khi đọc lại từ DB
+        ...(msg.pollData ? { pollData: msg.pollData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         replyTo: msg.replyTo || null,
@@ -651,6 +694,7 @@ async function searchMessagesInConversation({
         contentType: msg.contentType,
         content: msg.content,
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
+        ...(msg.pollData ? { pollData: msg.pollData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         createdAt: msg.createdAt,
@@ -759,6 +803,7 @@ async function searchMessagesForUserGlobal({
         contentType: msg.contentType,
         content: msg.content,
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
+        ...(msg.pollData ? { pollData: msg.pollData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         createdAt: msg.createdAt,

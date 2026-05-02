@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const { saveCallLogMessage } = require("../messages/messageService");
-const { emitToRoom, roomToConversation, roomStartedAt } = require("../../socket/socketHandler");
+const { emitToRoom, roomToConversation, roomStartedAt, groupCallBannerSaved } = require("../../socket/socketHandler");
+
 
 
 
@@ -139,6 +140,12 @@ async function handleZegoWebhook(req, res) {
       try {
         callLogItem = await saveCallLogMessage({ conversationId, senderId, callData });
         console.log(`✅ [ZegoWebhook] Lưu DB thành công: conversationId=${conversationId}, messageId=${callLogItem?.messageId}`);
+
+        // Dọn banner Set — lần gọi tiếp theo có thể tạo banner mới
+        groupCallBannerSaved.delete(zegoRoomId);
+        roomStartedAt.delete(zegoRoomId);  // cũng dọn startedAt
+        roomToConversation.delete(zegoRoomId);
+        console.log(`[ZegoWebhook] 🧹 Đã dọn maps cho roomId=${zegoRoomId}`);
       } catch (dbError) {
         console.error("❌ [ZegoWebhook] Lưu DB thất bại:", dbError.message, dbError.stack);
         return res.status(200).json({ code: 0, message: "ok (db write failed, check server logs)" });

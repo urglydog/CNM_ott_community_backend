@@ -221,6 +221,7 @@ async function saveMessage(payload) {
     reactions: payload.reactions || null,
     // replyTo: lưu ID của tin nhắn gốc đang được trả lời
     replyTo: payload.replyTo || null,
+    mentions: Array.isArray(payload.mentions) ? payload.mentions.map(String) : [],
     createdAt,
   };
 
@@ -263,6 +264,7 @@ async function saveMessage(payload) {
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
     replyTo: newMessage.replyTo,
+    mentions: newMessage.mentions,
     // Trả về đầy đủ thông tin replyTo đã populate để frontend hiển thị
     ...(replyTo ? { replyToMessage: replyTo } : {}),
     createdAt: newMessage.createdAt,
@@ -341,6 +343,7 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         replyTo: msg.replyTo || null,
+        mentions: msg.mentions || [],
         createdAt: msg.createdAt,
         senderDisplayName: info.senderDisplayName,
         senderAvatarUrl: info.senderAvatarUrl,
@@ -862,6 +865,10 @@ async function saveCallLogMessage({ conversationId, senderId, callData }) {
       callType: callData.callType || "voice",
       status: callData.status || "missed",
       duration: Number(callData.duration) || 0,
+      // Giữ roomId nếu có (dùng cho banner group_call_started → nút [Tham gia])
+      ...(callData.roomId ? { roomId: String(callData.roomId) } : {}),
+      // Giữ messageType nếu có (phân biệt group_call_started vs call_log thông thường)
+      ...(callData.messageType ? { messageType: String(callData.messageType) } : {}),
     },
     createdAt,
   };
@@ -916,9 +923,72 @@ async function saveCallLogMessage({ conversationId, senderId, callData }) {
   };
 }
 
+/**
+ * Tìm tin nhắn group_call_started (callData.roomId === roomId && status === "started")
+ * trong conversation và UPDATE tại chỗ thành status completed/missed với duration.
+ * KHÔNG tạo tin nhắn mới — chỉ cập nhật existing message.
+ *
+ * @returns {object|null} - Message đã được update, hoặc null nếu không tìm thấy
+ */
+async function updateCallLogMessage({ conversationId, roomId, status, durationSec, messageId }) {
+  if (!conversationId || !messageId) throw new Error("[updateCallLogMessage] conversationId và messageId là bắt buộc");
+
+  // Bước 1: Đọc document hiện tại
+  const getRes = await ddbDocClient.send(
+    new GetCommand({ TableName: MESSAGES_TABLE, Key: { conversationId: String(conversationId) } })
+  );
+  const existing = getRes.Item || { conversationId: String(conversationId), messages: [] };
+  const messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
+
+  // Bước 2: Tìm message cần update - BẮT BUỘC theo messageId
+  const targetIdx = messages.findIndex(
+    (m) => String(m.messageId) === String(messageId)
+  );
+
+  if (targetIdx === -1) {
+    console.warn(`[updateCallLogMessage] Không tìm thấy message cho messageId=${messageId} trong ${conversationId}`);
+    return null;
+  }
+
+  // Bước 3: Update tại chỗ
+  const updatedMsg = {
+    ...messages[targetIdx],
+    callData: {
+      ...messages[targetIdx].callData,
+      status,
+      duration: Number(durationSec) || 0,
+      // Xóa messageType "group_call_started" — giờ là call_log hoàn thành
+      messageType: undefined,
+    },
+    contentType: "call_log",
+    messageType: "call_log",
+    content: "Cuộc gọi " + (messages[targetIdx].callData?.callType === "video" ? "video" : "thoại"),
+  };
+  // Dọn undefined keys
+  if (updatedMsg.callData.messageType === undefined) delete updatedMsg.callData.messageType;
+
+  messages[targetIdx] = updatedMsg;
+
+  // Bước 4: Ghi lại DynamoDB
+  await ddbDocClient.send(
+    new PutCommand({ TableName: MESSAGES_TABLE, Item: { conversationId: String(conversationId), messages } })
+  );
+  console.log(`✅ [updateCallLogMessage] Updated messageId=${updatedMsg.messageId} → status=${status}, duration=${durationSec}s`);
+
+  // Bước 5: Enrich sender info để trả về
+  const info = await enrichSenderInfo(updatedMsg.senderId);
+  return {
+    ...updatedMsg,
+    conversationId: String(conversationId),
+    senderDisplayName: info.senderDisplayName,
+    senderAvatarUrl: info.senderAvatarUrl,
+  };
+}
+
 module.exports = {
   saveMessage,
   saveCallLogMessage,
+  updateCallLogMessage,
   saveStickerMessage,
   getMessagesForConversation,
   getRepliedMessageInfo,

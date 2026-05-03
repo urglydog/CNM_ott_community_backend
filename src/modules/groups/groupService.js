@@ -236,15 +236,8 @@ async function addMembersToGroup(groupId, requestUserId, userIds) {
       ExpressionAttributeValues: { ':inc': newMembers.length, ':zero': 0 }
     }));
 
-    // Real-time
-    newMembers.forEach(uid => forceJoinGroup(uid, groupKey));
-    const io = getActiveIO();
-    if (io) {
-      io.to(groupKey).emit('SERVER:MEMBER_ADDED', {
-        groupId: groupKey,
-        addedMembers: newMemberObjects
-      });
-    }
+    // NOTE: socket emit 'group:members_added' is handled by groupController.addMembers
+    // to ensure only 1 emit with full payload (including groupData). No emit here to avoid duplication.
   }
 
   return { addedCount: newMembers.length, addedMembers: newMemberObjects };
@@ -312,14 +305,6 @@ async function kickMember(groupId, requestUserId, targetUserId) {
   }));
 
   forceLeaveGroup(targetKey, groupKey);
-  const io = getActiveIO();
-  if (io) {
-    io.to(groupKey).emit('SERVER:MEMBER_KICKED', {
-      groupId: groupKey,
-      targetUserId: targetKey,
-      actionBy: reqUserKey
-    });
-  }
 
   return { message: 'Member kicked successfully' };
 }
@@ -469,13 +454,6 @@ async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
   }));
 
   forceLeaveGroup(reqUserKey, groupKey);
-  const io = getActiveIO();
-  if (io) {
-    io.to(groupKey).emit('SERVER:MEMBER_LEFT', {
-      groupId: groupKey,
-      userId: reqUserKey
-    });
-  }
 
   return { message: 'Successfully left the group' };
 }
@@ -660,9 +638,11 @@ async function joinGroupByInviteCode(userId, inviteCode) {
   forceJoinGroup(userKey, groupId);
   const io = getActiveIO();
   if (io) {
-    io.to(groupId).emit('SERVER:MEMBER_ADDED', {
+    console.log(`[joinGroupByInviteCode] 📡 EMIT group:members_added → room=${groupId}, user=${userKey}`);
+    io.to(groupId).emit('group:members_added', {
       groupId,
-      addedMembers: [newMemberObj]
+      newMembers: [newMemberObj],
+      addedBy: userKey
     });
   }
 
@@ -927,9 +907,10 @@ async function handleJoinRequest(groupId, requestUserId, targetUserId, action) {
     forceJoinGroup(targetKey, groupKey);
     const io = getActiveIO();
     if (io) {
-      io.to(groupKey).emit('SERVER:MEMBER_ADDED', {
+      io.to(groupKey).emit('group:members_added', {
         groupId: groupKey,
-        addedMembers: [newMemberObj]
+        newMembers: [newMemberObj],
+        addedBy: reqUserKey
       });
       // also emit to targetUser privately so their UI updates
       io.to(targetKey).emit('SERVER:JOIN_REQUEST_APPROVED', { groupId: groupKey });

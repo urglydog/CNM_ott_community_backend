@@ -187,25 +187,49 @@ async function addMembers(req, res) {
 
     const result = await groupService.addMembersToGroup(groupId, requestUserId, userIds);
 
-    // Fetch thông tin nhóm để gửi cho frontend
+    // Fetch thông tin nhóm để gửi cho user mới được thêm
     const groupData = await groupService.getGroupById(groupId);
 
-    // Báo cho các user mới biết họ được add
     const io = getIO();
+
+    // ── 1. Báo cho NHỮNG NGƯỜI ĐANG Ở SẴN TRONG NHÓM ──────────────────────
+    // Những thành viên đang trong nhóm cần biết có người mới được thêm
+    if (io) {
+      const roomPayload = {
+        groupId: groupId,
+        newMembers: result.addedMembers || [],
+        newMembersCount: groupData?.memberCount || 0,
+        addedBy: requestUserId,
+      };
+      console.log(`[addMembers] 📡 EMIT group:members_added → room=${groupId}, payload=`, JSON.stringify(roomPayload));
+      io.to(groupId.toString()).emit('group:members_added', roomPayload);
+    } else {
+      console.warn(`[addMembers] ⚠️ io is null, cannot emit group:members_added`);
+    }
+
+    // ── 2. Báo cho CHÍNH NHỮNG NGƯỜI VỪA ĐƯỢC THÊM VÀO ───────────────────
     userIds.forEach(uid => {
       joinUserToRoom(uid, groupId);
       if (io) {
-        emitToUserSockets(io, uid, "group:you_were_added", { groupData, addedBy: requestUserId });
-        emitToUserSockets(io, uid, "chat:new_conversation", { conversationData: groupData });
+        const userPayload = {
+          groupDetails: groupData,
+          addedBy: requestUserId,
+        };
+        console.log(`[addMembers] 📡 EMIT group:added_to_group → user=${uid}, groupId=${groupId}`);
+
+        // group:added_to_group — payload đầy đủ thông tin group để Frontend vẽ lên Chat List
+        emitToUserSockets(io, uid, 'group:added_to_group', userPayload);
+        // Giữ lại event cũ để tương thích ngược
+        console.log(`[addMembers] 📡 EMIT group:you_were_added → user=${uid}`);
+        emitToUserSockets(io, uid, 'group:you_were_added', { groupData, addedBy: requestUserId });
+        console.log(`[addMembers] 📡 EMIT chat:new_conversation → user=${uid}`);
+        emitToUserSockets(io, uid, 'chat:new_conversation', { conversationData: groupData });
+      } else {
+        console.warn(`[addMembers] ⚠️ io is null, cannot emit to user ${uid}`);
       }
     });
 
-    // Báo cho cả phòng biết có người mới
-    emitToRoom(groupId, "group:members_added", { 
-      groupId, 
-      newMembers: userIds, 
-      addedBy: requestUserId 
-    });
+    console.log(`[addMembers] ✅ Done. group=${groupId}, addedCount=${result.addedCount}, userIds=`, userIds);
 
     res.status(201).json(result);
   } catch (error) {

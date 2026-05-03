@@ -247,8 +247,8 @@ async function sendFileMessage(req, res) {
 async function sendLocationMessage(req, res) {
   try {
     const senderId = req.body.senderId || req.user?.userId || req.user?.id;
-    const conversationId = req.body.conversationId;
-    const locationData = req.body.locationData; // { lat, lng, label? }
+    const conversationId = req.body.conversationId || req.body.groupId;
+    const locationData = req.body.locationData || req.body.location; // { lat, lng, label? }
 
     if (!senderId) {
       return res.status(400).json({ message: "senderId is required" });
@@ -302,8 +302,8 @@ async function sendLocationMessage(req, res) {
 async function startLiveLocationMessage(req, res) {
   try {
     const senderId = req.body.senderId || req.user?.userId || req.user?.id;
-    const conversationId = req.body.conversationId;
-    const locationData = req.body.locationData; // { lat, lng, label? }
+    const conversationId = req.body.conversationId || req.body.groupId;
+    const locationData = req.body.locationData || req.body.location; // { lat, lng, label? }
 
     if (!senderId) {
       return res.status(400).json({ message: "senderId is required" });

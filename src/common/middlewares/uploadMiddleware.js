@@ -12,6 +12,9 @@ const ALLOWED_MIME_TYPES = new Set([
   "audio/mpeg",
   "audio/wav",
   "audio/ogg",
+  "audio/m4a",
+  "audio/aac",
+  "audio/x-m4a"
 ]);
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB

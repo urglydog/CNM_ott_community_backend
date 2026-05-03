@@ -137,21 +137,25 @@ async function findUsersByUsername(username) {
 async function registerUser(payload) {
   const normalizedUsername = normalizeUsername(payload.username);
 
-  if (!normalizedUsername || !payload.password) {
-    throw new Error('Vui lòng nhập tên đăng nhập và mật khẩu');
+  if (!normalizedUsername) {
+    throw new Error('Vui lòng nhập tên đăng nhập');
+  }
+  if (!payload.password || !/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{6,}$/.test(payload.password)) {
+    throw new Error('Mật khẩu phải có ít nhất 6 ký tự, bao gồm chữ hoa, chữ thường và số');
   }
 
-  const normalizedPhoneNumber = normalizePhoneNumber(payload.phoneNumber || payload.phone);
+  const normalizedPhoneNumber = normalizePhoneNumber(payload.phone || payload.phoneNumber || payload.phone_number);
   if (!normalizedPhoneNumber) {
     throw new Error('Vui lòng nhập số điện thoại');
   }
   if (!isValidPhoneNumber(normalizedPhoneNumber)) {
-    throw new Error('Số điện thoại không hợp lệ');
+    throw new Error('Số điện thoại không hợp lệ (phải bắt đầu bằng 0 và đủ 10 số)');
   }
 
+  // KIỂM TRA DUY NHẤT: Giống Zalo, 1 SĐT chỉ 1 tài khoản
   const existingPhone = await findUserByPhone(normalizedPhoneNumber);
   if (existingPhone) {
-    throw new Error('Số điện thoại đã được đăng ký');
+    throw new Error('Số điện thoại này đã được đăng ký, vui lòng đăng nhập hoặc dùng số khác');
   }
 
   const existingUsername = await findUserByUsername(normalizedUsername);
@@ -177,7 +181,7 @@ async function registerUser(payload) {
     password_hash: passwordHash,
     email: payload.email ? String(payload.email).trim() : null,
     phone_number: normalizedPhoneNumber,
-    display_name: payload.displayName || normalizedUsername,
+    display_name: payload.display_name || payload.displayName || normalizedUsername,
     avatar_url: null,
     email_verified: false,
     phone_verified: false,
@@ -195,35 +199,50 @@ async function registerUser(payload) {
 }
 
 async function loginUser(payload) {
-  const normalizedUsername = normalizeUsername(payload.username);
+  const identifier = String(payload.username || '').trim();
 
-  if (!normalizedUsername) {
-    throw new Error('Vui lòng nhập tên đăng nhập');
+  if (!identifier) {
+    throw new Error('Vui lòng nhập tên đăng nhập hoặc số điện thoại');
   }
   if (!payload.password) {
     throw new Error('Vui lòng nhập mật khẩu');
   }
 
-  const matchingUsers = await findUsersByUsername(normalizedUsername);
+  let userToAuth = null;
 
-  if (matchingUsers.length === 0) {
-    throw new Error('Không tìm thấy tài khoản, vui lòng đăng ký trước');
-  }
-
-  let authenticatedUser = null;
-  for (const userRow of matchingUsers) {
-    const passwordMatch = await bcrypt.compare(payload.password, userRow.password_hash);
-    if (passwordMatch) {
-      authenticatedUser = userRow;
-      break;
+  // Thử tìm theo số điện thoại trước nếu chuỗi chứa toàn số
+  if (/^\d+$/.test(identifier) && identifier.length >= 8) {
+    userToAuth = await findUserByPhone(identifier);
+    if (userToAuth) {
+      // Re-fetch with password_hash because findUserByPhone projection might be limited
+      const fullUserRes = await ddbDocClient.send(new ScanCommand({
+        TableName: USERS_TABLE,
+        FilterExpression: '#userId = :uid',
+        ExpressionAttributeNames: { '#userId': 'userId' },
+        ExpressionAttributeValues: { ':uid': userToAuth.userId }
+      }));
+      userToAuth = fullUserRes.Items?.[0] || null;
     }
   }
 
-  if (!authenticatedUser) {
+  // Nếu không tìm thấy theo SĐT, thử tìm theo username
+  if (!userToAuth) {
+    const matchingUsers = await findUsersByUsername(identifier);
+    if (matchingUsers.length > 0) {
+      userToAuth = matchingUsers[0];
+    }
+  }
+
+  if (!userToAuth) {
+    throw new Error('Không tìm thấy tài khoản, vui lòng đăng ký trước');
+  }
+
+  const passwordMatch = await bcrypt.compare(payload.password, userToAuth.password_hash);
+  if (!passwordMatch) {
     throw new Error('Tên đăng nhập hoặc mật khẩu không đúng');
   }
 
-  const { password_hash, ...userWithoutPassword } = authenticatedUser;
+  const { password_hash, ...userWithoutPassword } = userToAuth;
   return userWithoutPassword;
 }
 

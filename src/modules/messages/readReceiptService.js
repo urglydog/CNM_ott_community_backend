@@ -4,7 +4,7 @@
  * Uses DynamoDB for persistence
  */
 const { ddbDocClient } = require("../../config/awsConfig");
-const { PutCommand, GetCommand, UpdateCommand, QueryCommand } = require("@aws-sdk/lib-dynamodb");
+const { PutCommand, GetCommand, UpdateCommand, QueryCommand, ScanCommand } = require("@aws-sdk/lib-dynamodb");
 
 const READ_RECEIPTS_TABLE = process.env.DDB_READ_RECEIPTS_TABLE;
 
@@ -95,9 +95,23 @@ async function getReadReceiptsForMessage(conversationId, messageId) {
 
     return result.Items || [];
   } catch (error) {
-    // If index doesn't exist, fall back to scan
     console.warn(`[readReceipts] GSI not found, using scan fallback:`, error.message);
-    return [];
+    try {
+      const scanResult = await ddbDocClient.send(
+        new ScanCommand({
+          TableName: READ_RECEIPTS_TABLE,
+          FilterExpression: "conversationId = :cid AND messageId = :mid",
+          ExpressionAttributeValues: {
+            ":cid": conversationId,
+            ":mid": String(messageId),
+          },
+        })
+      );
+      return scanResult.Items || [];
+    } catch (scanError) {
+      console.error(`[readReceipts] Scan fallback also failed:`, scanError.message);
+      return [];
+    }
   }
 }
 
@@ -134,8 +148,28 @@ async function getUserLastReadMessage(conversationId, userId) {
     }
     return null;
   } catch (error) {
-    console.warn(`[readReceipts] Error getting last read message:`, error.message);
-    return null;
+    console.warn(`[readReceipts] Error getting last read message (Index failed), trying scan:`, error.message);
+    try {
+      const scanResult = await ddbDocClient.send(
+        new ScanCommand({
+          TableName: READ_RECEIPTS_TABLE,
+          FilterExpression: "userId = :uid AND conversationId = :cid",
+          ExpressionAttributeValues: {
+            ":uid": String(userId),
+            ":cid": conversationId,
+          },
+        })
+      );
+      
+      if (scanResult.Items && scanResult.Items.length > 0) {
+        const sorted = scanResult.Items.sort((a, b) => new Date(b.readAt) - new Date(a.readAt));
+        return sorted[0];
+      }
+      return null;
+    } catch (scanError) {
+      console.error(`[readReceipts] Scan fallback failed for last read:`, scanError.message);
+      return null;
+    }
   }
 }
 

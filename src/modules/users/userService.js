@@ -583,6 +583,7 @@ async function updateProfile(userId, payload) {
   const email = payload.email;
   const phone = payload.phone || payload.phoneNumber || payload.phone_number;
   const avatarUrl = payload.avatarUrl || payload.avatar_url;
+  const coverImage = payload.coverImage || payload.cover_url;
 
   const updateParts = [];
   const names = {};
@@ -625,6 +626,12 @@ async function updateProfile(userId, payload) {
     updateParts.push('#avatar_url = :avatar_url');
     names['#avatar_url'] = 'avatar_url';
     values[':avatar_url'] = String(avatarUrl || '').trim() || null;
+  }
+
+  if (coverImage !== undefined) {
+    updateParts.push('#coverImage = :coverImage');
+    names['#coverImage'] = 'coverImage';
+    values[':coverImage'] = String(coverImage || '').trim() || null;
   }
 
   if (updateParts.length === 0) {

@@ -1099,7 +1099,10 @@ function handleSocketConnection(io, socket) {
     _respond(callback, true);
   });
 
-  // ── leave_group_call: thành viên cúp máy rời phòng ────────────────────────
+  // ── leave_group_call: thành viên rời phòng gọi nhóm ─────────────────────
+  // ============================================================
+  // ✅ SERVER-AUTHORITATIVE: Backend quản lý trạng thái cuộc gọi nhóm
+  // ============================================================
   socket.on("leave_group_call", async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     if (!roomId) { _respond(callback, false, "roomId required"); return; }
@@ -1111,16 +1114,51 @@ function handleSocketConnection(io, socket) {
       return;
     }
 
+    // ============================================================
+    // ✅ Guard: Chỉ xử lý 1 lần - nếu room đã pending cleanup → bỏ qua
+    // ============================================================
+    if (room.cleaned) {
+      console.log(`[leave_group_call] Room đã được cleanup trước đó, bỏ qua. roomId=${roomId}`);
+      _respond(callback, true);
+      return;
+    }
+
+    // ============================================================
+    // ✅ Cập nhật membersCount CHÍNH XÁC trước khi kiểm tra
+    // ============================================================
     room.membersCount = Math.max(0, room.membersCount - 1);
+    const isLastMember = room.membersCount === 0;
+
     console.log(`[leave_group_call] userId=${data.userId} rời phòng ${roomId}, members còn lại=${room.membersCount}`);
 
-    if (room.membersCount === 0) {
-      // Người cuối cùng rời — cập nhật call_log NGAY LẬP TỨC (không tạo mới)
+    // ============================================================
+    // ✅ Emit 'call-ended' CHO NGƯỜI RỜI ĐI để họ cleanup UI
+    // ============================================================
+    // Người rời đi cần nhận 'call-ended' → SocketContext.handleCallEnded
+    // → gracefulLeave() → setActiveCall(null) → unmount VideoCallRoom
+    emitToUserSockets(data.userId, "call-ended", {
+      roomId,
+      callerId: room.callerId,
+      reason: isLastMember ? "ended" : "left",
+      duration: Math.round((Date.now() - room.startTime) / 1000),
+    });
+
+    console.log(`[leave_group_call] ✅ Emitted call-ended to user ${data.userId}`);
+
+    // ============================================================
+    // ✅ CHỈ người cuối cùng rời → cập nhật call_log (started → completed/missed)
+    // ============================================================
+    if (isLastMember) {
       const durationSec = Math.round((Date.now() - room.startTime) / 1000);
       const status = durationSec >= 3 ? "completed" : "missed";
-      console.log(`[leave_group_call] 🎯 Phòng ${roomId} trống! Cập nhật call_log: status=${status}, duration=${durationSec}s`);
+      console.log(`[leave_group_call] 🎯 Người cuối cùng rời! Cập nhật call_log: status=${status}, duration=${durationSec}s`);
 
       const convId = room.conversationId || String(data.conversationId || "");
+
+      // Mark room as cleaned TRƯỚC KHI emit để ngăn double-processing
+      room.cleaned = true;
+
+      // Dọn memory TRƯỚC KHI emit để tránh race condition
       activeGroupCallRooms.delete(roomId);
       activeRooms.delete(roomId);
       groupCallBannerSaved.delete(roomId);
@@ -1128,7 +1166,7 @@ function handleSocketConnection(io, socket) {
       roomStartedAt.delete(roomId);
 
       try {
-        // Cập nhật message cũ (status=started) → completed/missed bằng messageId từ tracking
+        // Cập nhật message cũ (status=started) → completed/missed
         const updatedMsg = await updateCallLogMessage({
           conversationId: convId,
           roomId,
@@ -1137,22 +1175,43 @@ function handleSocketConnection(io, socket) {
           messageId: room.messageId,
         });
 
+        // ============================================================
+        // ✅ Emit update_message ĐẾN TẤT CẢ thành viên trong nhóm
+        // Bao gồm cả những người không tham gia nhưng đang thấy banner
+        // ============================================================
         if (updatedMsg) {
-          // Emit update_message — Frontend tìm message theo id và cập nhật tại chỗ
+          // Phát đến conversation room — TẤT CẢ thành viên nhóm
           io.to(convId).emit("update_message", updatedMsg);
-          console.log(`✅ [leave_group_call] Emit update_message → room ${convId}, messageId=${updatedMsg.messageId}`);
+          console.log(`✅ [leave_group_call] Emit update_message đến room ${convId}`);
+
+          // DM fallback: emit số đảo room id
+          if (convId.startsWith("dm:")) {
+            const parts = convId.split(":");
+            if (parts.length >= 3) {
+              const reversed = `dm:${parts[2]}:${parts[1]}`;
+              if (reversed !== convId) {
+                io.to(reversed).emit("update_message", updatedMsg);
+              }
+            }
+          }
         } else {
-          // Fallback: không tìm thấy banner cũ → tạo mới
+          // Fallback: tạo call_log mới nếu không tìm thấy banner cũ
           console.warn(`[leave_group_call] Không tìm thấy banner cũ, tạo call_log mới.`);
-          const callLogItem = await saveCallLogMessage({
-            conversationId: convId,
-            senderId: room.callerId,
-            callData: { callType: "video", status, duration: durationSec },
-          });
-          io.to(convId).emit("receive_message", callLogItem);
+          try {
+            const callLogItem = await saveCallLogMessage({
+              conversationId: convId,
+              senderId: room.callerId,
+              callData: { callType: "video", status, duration: durationSec },
+            });
+            io.to(convId).emit("receive_message", callLogItem);
+            console.log(`[leave_group_call] ✅ Created new call_log message`);
+          } catch (saveErr) {
+            console.error(`[leave_group_call] Lỗi tạo call_log mới:`, saveErr.message);
+          }
         }
       } catch (err) {
-        console.error(`❌ [leave_group_call] Lỗi khi cập nhật call_log:`, err.message);
+        console.error(`❌ [leave_group_call] Lỗi cập nhật call_log:`, err.message);
+        // ⚠️ Vẫn tiếp tục - không block client
       }
     }
 
@@ -1353,6 +1412,18 @@ function handleSocketConnection(io, socket) {
       return;
     }
 
+    // ============================================================
+    // ✅ Guard: Chỉ xử lý 1 lần - nếu call đã pending end → bỏ qua
+    // ============================================================
+    if (record.status === "ended") {
+      console.log(`[end-call] Call đã được end trước đó, bỏ qua double-emit. roomId=${roomId}`);
+      _respond(callback, true); // trả về success để client không retry
+      return;
+    }
+
+    // Mark as ended NGAY LẬP TỨC để tránh double-processing
+    record.status = "ended";
+
     // Tính duration từ thời điểm bắt đầu (nếu record có startedAt)
     const durationSec = record.startedAt
       ? Math.floor((Date.now() - record.startedAt) / 1000)
@@ -1361,6 +1432,10 @@ function handleSocketConnection(io, socket) {
     clearActiveCall(roomId);
     const calculatedDuration = calculateDuration(roomId); // dọn activeRooms.get(roomId)
     const finalDuration = calculatedDuration > 0 ? calculatedDuration : durationSec;
+
+    // ============================================================
+    // ✅ Emit 'call-ended' CHO TẤT CẢ participants để cleanup Zego
+    // ============================================================
     emitToCallParticipants(record, "call-ended", {
       ...data,
       roomId,
@@ -1368,19 +1443,26 @@ function handleSocketConnection(io, socket) {
       duration: finalDuration,
     });
 
+    console.log(`[end-call] ✅ Emitted call-ended to participants. roomId=${roomId}, duration=${finalDuration}s`);
+
     // ── Lưu Call Log vào DynamoDB ──────────────────────────────────────────
     // dùng data.conversationId (dm:...) — KHÔNG dùng roomId (call_1vs1_...)
     const endConversationId = String(data.conversationId || record.conversationId || "");
     if (!endConversationId) {
       console.error(`❌ [end-call] Thiếu conversationId, không thể lưu call log. data.conversationId=${data.conversationId}`);
     } else {
-      await saveCallLog({
-        conversationId: endConversationId,
-        callerId: record.callerId || userIdKey,
-        callType: data.callType || "video",
-        status: "completed",
-        durationSec: finalDuration,
-      });
+      try {
+        await saveCallLog({
+          conversationId: endConversationId,
+          callerId: record.callerId || userIdKey,
+          callType: data.callType || "video",
+          status: "completed",
+          durationSec: finalDuration,
+        });
+        console.log(`[end-call] ✅ Call log saved. conversationId=${endConversationId}, duration=${finalDuration}s`);
+      } catch (err) {
+        console.error(`[end-call] Lỗi lưu call log:`, err.message);
+      }
     }
 
     _respond(callback, true);

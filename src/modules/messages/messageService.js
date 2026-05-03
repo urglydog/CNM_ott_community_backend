@@ -399,11 +399,20 @@ async function getMessagesForConversation(conversationId, currentUserId) {
   return enriched;
 }
 
-function resolveAttachmentType(mimetype) {
-  if (!mimetype) return "file";
-  if (mimetype.startsWith("image/")) return "image";
-  if (mimetype.startsWith("video/")) return "video";
-  if (mimetype.startsWith("audio/")) return "voice";
+function resolveAttachmentType(mimetype, originalname) {
+  if (mimetype) {
+    if (mimetype.startsWith("image/")) return "image";
+    if (mimetype.startsWith("video/")) return "video";
+    if (mimetype.startsWith("audio/")) return "voice";
+  }
+  
+  if (originalname) {
+    const ext = String(originalname).split('.').pop().toLowerCase();
+    if (['wav', 'mp3', 'm4a', 'aac', 'webm', 'ogg'].includes(ext)) return "voice";
+    if (['mp4', 'mov', 'avi'].includes(ext)) return "video";
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return "image";
+  }
+  
   return "file";
 }
 
@@ -460,8 +469,8 @@ async function saveFileMessage(data) {
     ? `channel:${channelId}`
     : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`;
 
-  const attachmentType = resolveAttachmentType(data.attachment.mimetype);
-  const messageType = attachmentType === "voice" ? "voice" : attachmentType === "video" ? "video" : "file";
+  const attachmentType = resolveAttachmentType(data.attachment.mimetype, data.attachment.originalname);
+  const messageType = attachmentType;
   const persistedMessageId = randomUUID();
   const createdAt = new Date().toISOString();
 
@@ -1042,4 +1051,5 @@ module.exports = {
   searchMessagesInConversation,
   searchMessagesForUserGlobal,
   stopLiveLocationMessage,
+  enrichSenderInfo,
 };

@@ -204,11 +204,15 @@ async function sendFileMessage(req, res) {
         ? `channel:${channelId}`
         : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`);
 
+    const senderInfo = await messageService.enrichSenderInfo(senderId);
+
     const messagePayload = {
       id: savedMessage.id || savedMessage.message_id || Date.now(),
       conversationId,
       senderId: savedMessage.sender_id || senderId,
-      contentType: savedMessage.type || "file",
+      senderDisplayName: senderInfo.senderDisplayName,
+      senderAvatarUrl: senderInfo.senderAvatarUrl,
+      contentType: savedMessage.contentType || savedMessage.type || "file",
       content: req.file.originalname,
       attachments: savedMessage.attachments || [
         {
@@ -217,7 +221,7 @@ async function sendFileMessage(req, res) {
           size: uploadedFile.size,
         },
       ],
-      createdAt: savedMessage.created_at || new Date().toISOString(),
+      createdAt: savedMessage.created_at || savedMessage.createdAt || new Date().toISOString(),
     };
 
     const io = req.app.get("socketio");

@@ -9,6 +9,7 @@ const { saveMessage, saveCallLogMessage, updateCallLogMessage } = require("../mo
 const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
 const { notifyMessageCreated } = require("../modules/notifications/notificationService");
 const { verifyToken } = require("../common/utils/jwt");
+const { generateToken04 } = require("../common/utils/zegoToken");
 
 const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
 const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
@@ -56,6 +57,23 @@ const roomToConversation = new Map();
 
 // Map ZegoCloud roomId -> startedAt (ms) — dùng để tính duration khi Zego webhook không gửi timestamp
 const roomStartedAt = new Map();
+
+// Map roomId -> { startTime: number, type: '1vs1' | 'group' } — dùng cho cả 1vs1 và group call
+const activeRooms = new Map();
+
+/**
+ * Tính duration (giây) từ lúc bắt đầu đến hiện tại và dọn room khỏi activeRooms.
+ * @param {string} roomId
+ * @returns {number} durationInSeconds
+ */
+function calculateDuration(roomId) {
+  const roomInfo = activeRooms.get(roomId);
+  if (!roomInfo) return 0;
+  const durationInSeconds = Math.floor((Date.now() - roomInfo.startTime) / 1000);
+  activeRooms.delete(roomId);
+  console.log(`[calculateDuration] roomId=${roomId}, duration=${durationInSeconds}s`);
+  return durationInSeconds;
+}
 
 // Set các roomId đã được lưu banner group_call_started — ngăn lưu trùng khi có nhiều event
 const groupCallBannerSaved = new Set();
@@ -849,8 +867,12 @@ function handleSocketConnection(io, socket) {
     const roomId = String(data.roomId || "").trim();
 
     if (!groupId) {
-      _respond(callback, false, "groupId is required");
-      return;
+      // Fallback: receiverId có thể đóng vai trò groupId (frontend gửi thiếu trường groupId)
+      groupId = String(data.receiverId || "").trim();
+      if (!groupId) {
+        _respond(callback, false, "groupId is required");
+        return;
+      }
     }
 
     if (!userId) {
@@ -991,6 +1013,36 @@ function handleSocketConnection(io, socket) {
       }
     }
 
+    // ── Emit call-accepted back to caller để họ có thể tham gia phòng ngay ──
+    let token = "";
+    let appId = 0;
+    try {
+      appId = Number(process.env.ZEGO_APP_ID);
+      const serverSecret = process.env.ZEGO_SERVER_SECRET;
+      if (appId && serverSecret) {
+        token = generateToken04(appId, String(payload.callerId), serverSecret, 3600, "");
+      }
+    } catch (err) {
+      console.error("[group-call-request] Lỗi sinh token cho caller:", err.message);
+    }
+
+    const callerPayload = {
+      roomId,
+      callerId: String(payload.callerId),
+      receiverId: String(groupId),
+      receiverName: payload.callerName || "",
+      token,
+      appId,
+      isGroupCall: true,
+      callType: data.callType || "video",
+    };
+
+    emitToUserSockets(String(payload.callerId), "call-accepted", callerPayload);
+    console.log(
+      `[group-call-request] Đã emit call-accepted cho caller ${payload.callerId} ` +
+      `(token=${token.substring(0, 20)}..., appId=${appId})`,
+    );
+
     _respond(callback, true);
   });
 
@@ -1002,14 +1054,20 @@ function handleSocketConnection(io, socket) {
     const room = activeGroupCallRooms.get(roomId);
     if (!room) {
       // Phòng chưa được track (có thể server restart) — tạo mới
-      const conversationId = roomToConversation.get(roomId) || "";
+      // Lấy conversationId từ payload hoặc từ roomToConversation map (do group-call-request đã lưu)
+      const conversationId = String(data.conversationId || roomToConversation.get(roomId) || "");
       activeGroupCallRooms.set(roomId, {
         conversationId,
         callerId: String(data.userId || ""),
         startTime: Date.now(),
         membersCount: 1,
       });
-      console.log(`[join_group_call] Tạo mới tracking cho roomId=${roomId}`);
+      // Đồng thời track vào activeRooms để calculateDuration dùng chung
+      activeRooms.set(roomId, { startTime: Date.now(), type: "group" });
+      if (conversationId) {
+        roomToConversation.set(roomId, conversationId);
+      }
+      console.log(`[join_group_call] Tạo mới tracking cho roomId=${roomId}, conversationId=${conversationId}`);
     } else {
       room.membersCount += 1;
       console.log(`[join_group_call] userId=${data.userId} vào phòng ${roomId}, members=${room.membersCount}`);
@@ -1039,8 +1097,9 @@ function handleSocketConnection(io, socket) {
       const status = durationSec >= 3 ? "completed" : "missed";
       console.log(`[leave_group_call] 🎯 Phòng ${roomId} trống! Cập nhật call_log: status=${status}, duration=${durationSec}s`);
 
-      const convId = room.conversationId;
+      const convId = room.conversationId || String(data.conversationId || "");
       activeGroupCallRooms.delete(roomId);
+      activeRooms.delete(roomId);
       groupCallBannerSaved.delete(roomId);
       roomToConversation.delete(roomId);
       roomStartedAt.delete(roomId);
@@ -1077,7 +1136,7 @@ function handleSocketConnection(io, socket) {
     _respond(callback, true);
   });
 
-  const handleCallAccept = (data = {}, callback) => {
+  const handleCallAccept = async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     const callerId = String(data.callerId || "").trim();
     const receiverId = String(data.receiverId || "").trim();
@@ -1098,17 +1157,44 @@ function handleSocketConnection(io, socket) {
     }
 
     record.status = "in_call";
-    record.startedAt = Date.now(); // ⏱️ Ghi nhận mốc bắt đầu để tính duration chính xác
+    record.startedAt = Date.now();
 
-    const payload = {
-      ...data,
+    // Track thời điểm bắt đầu cho việc tính duration
+    activeRooms.set(roomId, { startTime: Date.now(), type: "1vs1" });
+
+    // Lấy thông tin receiver để truyền receiverName cho caller
+    const receiverInfo = await getUserDisplayInfo(receiverId);
+
+    // Sinh RTC token phía server cho caller — caller không cần gọi API riêng
+    let token = "";
+    let appId = 0;
+    try {
+      appId = Number(process.env.ZEGO_APP_ID);
+      const serverSecret = process.env.ZEGO_SERVER_SECRET;
+      if (appId && serverSecret) {
+        token = generateToken04(appId, callerId, serverSecret, 3600, "");
+      }
+    } catch (err) {
+      console.error("[handleCallAccept] Lỗi sinh token cho caller:", err.message);
+    }
+
+    // Payload gửi cho người gọi (caller) — đầy đủ thông tin để khởi tạo ZegoUIKit
+    const callerPayload = {
       roomId,
-      callerId: record.callerId,
-      receiverId: receiverId || (record.receiverIds || [])[0] || "",
+      callerId,
+      receiverId,
+      receiverName: receiverInfo.displayName,
+      token,   // ← Zego RTC token cho caller
+      appId,   // ← Zego AppID cho caller
+      isGroupCall: data.isGroupCall,
+      callType: data.callType || "video",
     };
 
-    emitToUserSockets(record.callerId, "call-accepted", payload);
-    console.log(`[signal] Forwarded call-accepted to caller ${record.callerId}`);
+    emitToUserSockets(record.callerId, "call-accepted", callerPayload);
+    console.log(
+      `[signal] Forwarded call-accepted to caller ${record.callerId} ` +
+      `(token=${token.substring(0, 20)}..., appId=${appId}, receiverName=${receiverInfo.displayName})`,
+    );
 
     _respond(callback, true);
   };
@@ -1170,6 +1256,7 @@ function handleSocketConnection(io, socket) {
       ...data,
       roomId,
       reason: "rejected",
+      duration: 0,
     });
 
     // ── Lưu Call Log (missed) vào DynamoDB ────────────────────────────────
@@ -1204,10 +1291,12 @@ function handleSocketConnection(io, socket) {
     }
 
     clearActiveCall(roomId);
+    activeRooms.delete(roomId);
     emitToCallParticipants(record, "call-ended", {
       ...data,
       roomId,
       reason: "canceled",
+      duration: 0,
     });
 
     // ── Lưu Call Log (canceled/missed) vào DynamoDB ───────────────────────
@@ -1247,10 +1336,13 @@ function handleSocketConnection(io, socket) {
       : (Number(data.duration) || 0);
 
     clearActiveCall(roomId);
+    const calculatedDuration = calculateDuration(roomId); // dọn activeRooms.get(roomId)
+    const finalDuration = calculatedDuration > 0 ? calculatedDuration : durationSec;
     emitToCallParticipants(record, "call-ended", {
       ...data,
       roomId,
       reason: "ended",
+      duration: finalDuration,
     });
 
     // ── Lưu Call Log vào DynamoDB ──────────────────────────────────────────
@@ -1264,7 +1356,7 @@ function handleSocketConnection(io, socket) {
         callerId: record.callerId || userIdKey,
         callType: data.callType || "video",
         status: "completed",
-        durationSec,
+        durationSec: finalDuration,
       });
     }
 
@@ -1484,10 +1576,12 @@ function handleSocketConnection(io, socket) {
       const calls = getCallsForUser(userIdKey);
       calls.forEach(({ roomId, record }) => {
         clearActiveCall(roomId);
+        const duration = calculateDuration(roomId);
         emitToCallParticipants(record, "call-ended", {
           roomId,
           reason: "disconnect",
           disconnectedUserId: userIdKey,
+          duration,
         });
       });
     }

@@ -125,6 +125,7 @@ async function updateNickname(req, res) {
     if (!userId) return res.status(401).json({ message: 'Chưa xác thực' });
 
     const { friendshipId, nickname } = req.body;
+    
     if (!friendshipId) return res.status(400).json({ message: 'friendshipId là bắt buộc' });
 
     const result = await friendService.updateNickname(friendshipId, userId, nickname || null);

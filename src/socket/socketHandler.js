@@ -440,6 +440,29 @@ function handleSocketConnection(io, socket) {
   });
 
   // ============================================================
+  // CHAT SETTINGS SYNC
+  // ============================================================
+  socket.on("chat_background_updated", (data) => {
+    // data: { friendshipId, bgUrl, senderId, receiverId }
+    if (!data.receiverId) return;
+    
+    // Phát cho người nhận (để cập nhật UI ngay lập tức)
+    io.to(String(data.receiverId)).emit("chat_background_updated", {
+      friendshipId: data.friendshipId,
+      bgUrl: data.bgUrl,
+      updatedBy: userId
+    });
+    
+    // Nếu là DM room, phát vào room luôn
+    const roomId = `dm:${[Number(data.senderId), Number(data.receiverId)].sort((a, b) => a - b).join(":")}`;
+    io.to(roomId).emit("chat_background_updated", {
+      friendshipId: data.friendshipId,
+      bgUrl: data.bgUrl,
+      updatedBy: userId
+    });
+  });
+
+  // ============================================================
   // SEND MESSAGE — có kiểm tra membership
   // ============================================================
   socket.on("send_message", async (payload, callback) => {

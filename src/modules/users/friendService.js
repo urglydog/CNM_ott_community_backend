@@ -232,10 +232,10 @@ async function getFriends(userId) {
   const userService = require('./userService');
   const enriched = await Promise.all(
     items.map(async (item) => {
-      const friendId = item.sender_id === uid ? item.receiver_id : item.sender_id;
+      const friendId = String(item.sender_id) === uid ? item.receiver_id : item.sender_id;
       const friendInfo = await userService.getUserById(friendId);
       // Nickname & Background: mỗi hướng lưu riêng
-      const isSender = item.sender_id === uid;
+      const isSender = String(item.sender_id) === uid;
       const nickname = isSender ? (item.nickname_sender || null) : (item.nickname_receiver || null);
       const chatBgUrl = isSender ? (item.chatBgUrl_sender || null) : (item.chatBgUrl_receiver || null);
       const originalName = friendInfo?.display_name || friendInfo?.displayName || '';
@@ -270,7 +270,7 @@ async function updateNickname(friendshipId, userId, nickname) {
   }
 
   const uid = String(userId);
-  const isSender = rec.sender_id === uid;
+  const isSender = String(rec.sender_id) === uid;
   const field = isSender ? 'nickname_sender' : 'nickname_receiver';
 
   await ddbDocClient.send(new UpdateCommand({

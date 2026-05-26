@@ -13,5 +13,6 @@ router.get('/pending', authMiddleware, friendController.getPendingRequests);
 router.put('/nickname', authMiddleware, friendController.updateNickname);
 router.put('/chat-background', authMiddleware, friendController.updateChatBackground);
 router.get('/chat-background/:friendshipId', authMiddleware, friendController.getChatBackground);
+router.delete('/:friendshipId', authMiddleware, friendController.unfriend);
 
 module.exports = router;

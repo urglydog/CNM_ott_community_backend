@@ -376,6 +376,45 @@ async function unpinMessage(friendshipId, messageId, requestUserId) {
   return pinned;
 }
 
+/**
+ * Hủy kết bạn - xóa friendship khỏi database
+ */
+async function unfriend(friendshipId, userId) {
+  const rec = await getFriendshipByFriendshipId(friendshipId);
+
+  if (!rec) {
+    const err = new Error('Không tìm thấy quan hệ bạn bè');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const uid = String(userId);
+  const isParticipant = String(rec.sender_id) === uid || String(rec.receiver_id) === uid;
+
+  if (!isParticipant) {
+    const err = new Error('Bạn không có quyền hủy kết bạn này');
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (rec.status !== 'accepted') {
+    const err = new Error('Chỉ có thể hủy kết bạn khi đã là bạn bè');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  await ddbDocClient.send(new DeleteCommand({
+    TableName: FRIENDS_TABLE,
+    Key: { friendshipId: String(friendshipId) }
+  }));
+
+  return {
+    friendshipId,
+    status: 'unfriended',
+    unfriended_by: uid
+  };
+}
+
 module.exports = {
   sendFriendRequest,
   acceptFriendRequest,
@@ -387,5 +426,6 @@ module.exports = {
   getChatBackground,
   pinMessage,
   unpinMessage,
+  unfriend,
   findExistingRecord,
 };

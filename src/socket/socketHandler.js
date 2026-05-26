@@ -5,6 +5,7 @@ const {
   QueryCommand,
 } = require("@aws-sdk/lib-dynamodb");
 const { saveMessage } = require("../modules/messages/messageService");
+const { registerCallHandlers, handleDisconnect: handleCallDisconnect } = require("../modules/calls/callSocketHandler");
 
 const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
 const { notifyMessageCreated } = require("../modules/notifications/notificationService");
@@ -206,6 +207,9 @@ function handleSocketConnection(io, socket) {
         );
       });
   }
+
+  // ── Register call signaling handlers (Phase 2c) ──
+  registerCallHandlers(io, socket);
 
   const emitToUserSockets = (targetUserId, eventName, payload) => {
     const targetKey = String(targetUserId || "").trim();
@@ -947,6 +951,13 @@ function handleSocketConnection(io, socket) {
       console.log(
         `[socket] User ${userIdKey} disconnected socket ${socket.id}`,
       );
+
+      // ── Call disconnect handling (Phase 2c) ──
+      // Must be AFTER unregisterSocket so onlineUsers is updated
+      // when handleCallDisconnect checks for remaining sockets
+      handleCallDisconnect(io, userIdKey, socket.id).catch((err) => {
+        console.error(`[call-socket] Disconnect handler error:`, err.message);
+      });
     }
 
   });

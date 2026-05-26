@@ -60,6 +60,7 @@ const SOCKET_EVENTS = Object.freeze({
   CALL_END: "call:end",
   CALL_JOIN: "call:join",
   CALL_LEAVE: "call:leave",
+  CALL_HEARTBEAT: "call:heartbeat",
 
   // Server → Client
   CALL_INCOMING: "call:incoming",
@@ -75,6 +76,7 @@ const SOCKET_EVENTS = Object.freeze({
   CALL_PARTICIPANT_RECONNECTED: "call:participant-reconnected",
   CALL_STATE_UPDATED: "call:state-updated",
   CALL_BUSY: "call:busy",
+  CALL_ERROR: "call:error",
 });
 
 module.exports = {

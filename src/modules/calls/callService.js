@@ -303,6 +303,7 @@ async function startCall({ userId, conversationId, callType }) {
       "You are already in another call",
       "CALL_BUSY",
       409,
+      { busyUserId: callerId, busyCallId: callerBusy.callId || null },
     );
   }
 
@@ -315,6 +316,7 @@ async function startCall({ userId, conversationId, callType }) {
         "The person you are trying to call is busy",
         "CALL_BUSY",
         409,
+        { busyUserId: calleeId, busyCallId: calleeBusy.callId || null },
       );
     }
   }
@@ -735,6 +737,296 @@ async function getActiveCall(userId) {
   };
 }
 
+/**
+ * Handle ringing timeout — called by socket handler when 30s timer fires.
+ *
+ * Direct call:
+ *   - End the call with no_answer_timeout
+ *   - Mark all non-accepted participants as missed
+ *
+ * Group call:
+ *   - Mark all still-invited participants as missed
+ *   - If no one accepted → end the call
+ *   - If at least one accepted → keep call alive (invited participants just become missed)
+ *
+ * @param {string} callId
+ * @returns {Promise<{ ended: boolean, callSession: Object, missedUserIds: string[] }>}
+ */
+async function timeoutRingCall(callId) {
+  validateCallId(callId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+  // Only process if still ringing
+  if (call.status !== CALL_STATUS.RINGING) {
+    return { ended: false, callSession: call, missedUserIds: [] };
+  }
+
+  const missedUserIds = [];
+
+  // Mark all still-invited participants as missed
+  for (const p of call.participants) {
+    if (p.status === PARTICIPANT_STATUS.INVITED) {
+      await callRepository.updateParticipant(callId, p.userId, {
+        status: PARTICIPANT_STATUS.MISSED,
+      });
+      missedUserIds.push(p.userId);
+    }
+  }
+
+  if (call.callMode === CALL_MODE.DIRECT) {
+    // Direct: no one answered → end call
+    const ended = await callRepository.endCall(
+      callId,
+      call.initiatorId,
+      ENDED_REASON.NO_ANSWER_TIMEOUT,
+      null,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended, missedUserIds };
+  }
+
+  // Group: check if anyone accepted
+  const hasAccepted = call.participants.some(
+    (p) => p.status === PARTICIPANT_STATUS.ACCEPTED,
+  );
+
+  if (!hasAccepted) {
+    // No one accepted → end the call
+    const ended = await callRepository.endCall(
+      callId,
+      call.initiatorId,
+      ENDED_REASON.NO_ANSWER_TIMEOUT,
+      null,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended, missedUserIds };
+  }
+
+  // At least one accepted → call continues, just refresh
+  const refreshed = await callRepository.getById(callId);
+  return { ended: false, callSession: refreshed, missedUserIds };
+}
+
+/**
+ * Handle participant socket disconnect during an active call.
+ * Marks the participant as disconnected in DB.
+ *
+ * @param {string} callId
+ * @param {string} userId
+ * @returns {Promise<Object>} Updated call session
+ */
+async function handleParticipantDisconnect(callId, userId) {
+  validateCallId(callId);
+  validateUserId(userId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+
+  const uid = String(userId);
+  const participant = callModel.findParticipant(call, uid);
+  if (!participant || participant.status !== PARTICIPANT_STATUS.ACCEPTED) {
+    // Not an active participant — nothing to do
+    return call;
+  }
+
+  const updated = await callRepository.markParticipantDisconnected(callId, uid);
+  return updated;
+}
+
+/**
+ * Handle participant reconnect after a disconnect.
+ * Marks the participant as reconnected and returns a fresh token.
+ *
+ * @param {string} callId
+ * @param {string} userId
+ * @returns {Promise<{ callSession: Object, tokenPayload: Object }>}
+ */
+async function handleParticipantReconnect(callId, userId) {
+  validateCallId(callId);
+  validateUserId(userId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+
+  const uid = String(userId);
+  const updated = await callRepository.markParticipantReconnected(callId, uid);
+  const tokenPayload = generateTokenPayload(updated.channelName, uid);
+
+  return { callSession: updated, tokenPayload };
+}
+
+/**
+ * End a call because a participant's reconnect grace period expired.
+ *
+ * Direct call: end the entire call (atomic).
+ * Group call: mark participant as left, then check if call should end.
+ *
+ * @param {string} callId
+ * @param {string} userId - The user whose reconnect timed out
+ * @returns {Promise<{ ended: boolean, callSession: Object }>}
+ */
+async function endCallDueToDisconnect(callId, userId) {
+  validateCallId(callId);
+  validateUserId(userId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+
+  // Only process active calls
+  if (call.status !== CALL_STATUS.ACTIVE) {
+    return { ended: false, callSession: call };
+  }
+
+  const uid = String(userId);
+
+  if (call.callMode === CALL_MODE.DIRECT) {
+    // Direct: disconnect timeout ends the call for both
+    const ended = await callRepository.endCall(
+      callId,
+      uid,
+      ENDED_REASON.DISCONNECT_TIMEOUT,
+      call.startedAt,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended };
+  }
+
+  // Group: mark the disconnected user as left
+  const updated = await callRepository.markParticipantLeft(callId, uid);
+
+  // Check if any accepted participants remain
+  const hasAccepted = updated.participants.some(
+    (p) => p.userId !== uid && p.status === PARTICIPANT_STATUS.ACCEPTED,
+  );
+
+  if (!hasAccepted) {
+    const ended = await callRepository.endCall(
+      callId,
+      uid,
+      ENDED_REASON.GROUP_EMPTY,
+      call.startedAt,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended };
+  }
+
+  return { ended: false, callSession: updated };
+}
+
+/**
+ * Timeout a single participant in a group call (ring timer per-participant).
+ * Direct calls should use timeoutRingCall instead.
+ *
+ * @param {string} callId
+ * @param {string} userId - The participant whose ring timed out
+ * @returns {Promise<{ ended: boolean, callSession: Object, missedUserIds: string[] }>}
+ */
+async function timeoutParticipant(callId, userId) {
+  validateCallId(callId);
+  validateUserId(userId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+
+  const uid = String(userId);
+  const participant = callModel.findParticipant(call, uid);
+
+  // Only process if still invited
+  if (!participant || participant.status !== PARTICIPANT_STATUS.INVITED) {
+    return { ended: false, callSession: call, missedUserIds: [] };
+  }
+
+  // Mark as missed
+  await callRepository.updateParticipant(callId, uid, {
+    status: PARTICIPANT_STATUS.MISSED,
+  });
+
+  // Check if call should end
+  const hasAccepted = call.participants.some(
+    (p) => p.status === PARTICIPANT_STATUS.ACCEPTED,
+  );
+  const hasPending = call.participants.some(
+    (p) =>
+      p.userId !== call.initiatorId &&
+      p.userId !== uid &&
+      p.status === PARTICIPANT_STATUS.INVITED,
+  );
+
+  if (!hasAccepted && !hasPending) {
+    // No one accepted and no one pending → end call
+    const ended = await callRepository.endCall(
+      callId,
+      call.initiatorId,
+      ENDED_REASON.NO_ANSWER_TIMEOUT,
+      null,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended, missedUserIds: [uid] };
+  }
+
+  const refreshed = await callRepository.getById(callId);
+  return { ended: false, callSession: refreshed, missedUserIds: [uid] };
+}
+
+/**
+ * Late-join an existing group call (socket handler delegates here).
+ *
+ * @param {Object} params
+ * @param {string} params.userId - The joining user
+ * @param {string} params.callId - The call session ID
+ * @returns {Promise<{ callSession: Object, tokenPayload: Object }>}
+ */
+async function joinCall({ userId, callId }) {
+  validateUserId(userId);
+  validateCallId(callId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+  if (call.status !== CALL_STATUS.ACTIVE) {
+    throw new CallError("Call is not active", "CALL_NOT_ACTIVE", 400);
+  }
+  if (call.callMode !== CALL_MODE.GROUP) {
+    throw new CallError("Cannot join a direct call", "NOT_GROUP_CALL", 400);
+  }
+
+  const uid = String(userId);
+  const existing = callModel.findParticipant(call, uid);
+
+  let updatedCall;
+  if (existing) {
+    // Already a participant — rejoin (update status to accepted)
+    updatedCall = await callRepository.updateParticipant(callId, uid, {
+      status: PARTICIPANT_STATUS.ACCEPTED,
+      joinedAt: new Date().toISOString(),
+    });
+  } else {
+    // New participant — add to call
+    updatedCall = await callRepository.addParticipant(callId, {
+      userId: uid,
+      role: "member",
+      status: PARTICIPANT_STATUS.ACCEPTED,
+      joinedAt: new Date().toISOString(),
+    });
+  }
+
+  const tokenPayload = generateTokenPayload(updatedCall.channelName, uid);
+
+  return { callSession: updatedCall, tokenPayload };
+}
+
 module.exports = {
   startCall,
   acceptCall,
@@ -744,4 +1036,10 @@ module.exports = {
   getCallToken,
   getHistory,
   getActiveCall,
+  timeoutRingCall,
+  timeoutParticipant,
+  handleParticipantDisconnect,
+  handleParticipantReconnect,
+  endCallDueToDisconnect,
+  joinCall,
 };

@@ -30,11 +30,12 @@ src/modules/calls/
     agoraProvider.js         # Agora token generation implementation
   callModel.js               # DynamoDB table schema definition
   callRepository.js          # Data access layer with atomic operations
-  callValidation.js          # Input validation functions
+  callValidation.js          # Input validation + CallError class (with metadata)
   callService.js             # Core business logic
   callController.js          # REST API handlers
   callRoutes.js              # Express route definitions
-  callSocketHandler.js       # Socket event registration and handlers
+  callSocketHandler.js       # Socket event registration and handlers + timer management
+  callRecovery.js            # Boot-time recovery of orphaned calls and timers
 ```
 
 ## 3. Integration Points
@@ -43,8 +44,8 @@ src/modules/calls/
 
 | File | Change |
 |------|--------|
-| [`src/app.js`](src/app.js) | Import and register `callRoutes` at `/api/calls` |
-| [`src/socket/socketHandler.js`](src/socket/socketHandler.js) | Import and delegate to `callSocketHandler.registerCallHandlers(io, socket)` |
+| [`src/app.js`](src/app.js) | Import and register `callRoutes` at `/api/calls`, import and call `recoverCallsOnBoot(io)` on startup |
+| [`src/socket/socketHandler.js`](src/socket/socketHandler.js) | Import and delegate to `callSocketHandler.registerCallHandlers(io, socket)` + `handleCallDisconnect` on socket disconnect |
 | [`src/modules/messages/messageService.js`](src/modules/messages/messageService.js) | Re-add `"call_log"` to `VALID_CONTENT_TYPES` |
 | [`.env`](.env) | Add `AGORA_APP_ID`, `AGORA_APP_CERTIFICATE`, `AGORA_TOKEN_EXPIRE_SECONDS` |
 
@@ -687,3 +688,63 @@ App launches / resumes →
 - REST is guaranteed to return the current state at request time
 - Socket call events handle real-time updates AFTER recovery
 - This is a point-in-time snapshot, not a subscription
+
+## 21. Call Recovery on Server Boot (`callRecovery.js`)
+
+### Purpose
+When the server crashes or restarts, in-memory timers (ringing timeout, reconnect grace) are lost.
+Calls that were ringing or had disconnected participants become orphaned in DynamoDB with no
+active timer to clean them up. The recovery job restores correct state on boot.
+
+### File: `src/modules/calls/callRecovery.js`
+- Imported and called from `src/app.js` inside the `server.listen()` callback
+- Runs once on startup, fire-and-forget (non-blocking)
+- Zero Agora references — depends only on `callService`, `callRepository`, `callSocketHandler`, `call.constants`
+
+### Recovery Logic
+
+#### Ringing Calls (status = RINGING)
+| Condition | Action |
+|-----------|--------|
+| `createdAt` > 30s ago | Call `timeoutRingCall(callId)` immediately (DB update only, no socket events) |
+| `createdAt` < 30s ago | Rebuild ring timer with remaining time via `startRingTimer(io, callId, userId, callMode, remainingMs)` |
+| Direct call | One timer with `userId=null` |
+| Group call | Per-participant timer for each `INVITED` participant |
+
+#### Active Calls with Disconnected Participants (status = ACTIVE, connectionState = DISCONNECTED)
+| Condition | Action |
+|-----------|--------|
+| `disconnectedAt` > 15s ago | Call `endCallDueToDisconnect(callId, userId)` (DB update only, no socket events) |
+| `disconnectedAt` < 15s ago | Rebuild reconnect timer with remaining time via `startReconnectTimer(io, callId, userId, remainingMs)` |
+
+### Duplicate call_log Prevention
+All service functions (`timeoutRingCall`, `endCallDueToDisconnect`) internally call `createCallLogMessage()`
+which uses the `callLogCreated` atomic guard. Recovery will never create duplicate call_log messages
+because:
+1. If the previous server already created the log → `callLogCreated = true` → `markCallLogCreated()` returns `false` → skip
+2. If the previous server crashed before creating the log → `callLogCreated = false` → recovery creates it (correct behavior)
+
+### Timer Override
+`startRingTimer` and `startReconnectTimer` now accept an optional `timeoutMs` parameter.
+When provided (by recovery), the timer uses the remaining time instead of the full timeout.
+This ensures timers fire at the correct absolute time regardless of elapsed time before crash.
+
+### Repository Additions
+- `findAllRinging()` — ScanCommand for `status = RINGING`
+- `findAllActive()` — ScanCommand for `status = ACTIVE`
+
+### CallError Metadata
+`CallError` now accepts an optional 4th parameter `metadata = {}`.
+Used by `startCall` to attach `{ busyUserId, busyCallId }` to `CALL_BUSY` errors,
+which the socket handler extracts for the `call:busy` realtime payload.
+
+### `call:busy` Payload Fix
+The `call:busy` socket event now correctly sends:
+```json
+{
+  "targetUserId": "<busyUserId>",   // The user who is busy (NOT the caller)
+  "callId": "<busyCallId|null>",     // The busy user's active call ID
+  "reason": "user_busy"
+}
+```
+Previously `targetUserId` was incorrectly set to the caller's userId.

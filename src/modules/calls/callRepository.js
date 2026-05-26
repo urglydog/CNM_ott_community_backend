@@ -433,6 +433,40 @@ async function findActiveForUser(userId) {
   return items.length > 0 ? items[0] : null;
 }
 
+// ─── Recovery Queries ────────────────────────────────────────────────────────
+
+/**
+ * Find all calls with status = RINGING (for boot-time recovery).
+ * @returns {Promise<Object[]>} Array of ringing call sessions
+ */
+async function findAllRinging() {
+  const res = await ddbDocClient.send(
+    new ScanCommand({
+      TableName: CALLS_TABLE,
+      FilterExpression: "#s = :ringing",
+      ExpressionAttributeNames: { "#s": "status" },
+      ExpressionAttributeValues: { ":ringing": CALL_STATUS.RINGING },
+    }),
+  );
+  return res.Items || [];
+}
+
+/**
+ * Find all calls with status = ACTIVE (for boot-time recovery).
+ * @returns {Promise<Object[]>} Array of active call sessions
+ */
+async function findAllActive() {
+  const res = await ddbDocClient.send(
+    new ScanCommand({
+      TableName: CALLS_TABLE,
+      FilterExpression: "#s = :active",
+      ExpressionAttributeNames: { "#s": "status" },
+      ExpressionAttributeValues: { ":active": CALL_STATUS.ACTIVE },
+    }),
+  );
+  return res.Items || [];
+}
+
 module.exports = {
   create,
   getById,
@@ -449,4 +483,6 @@ module.exports = {
   markParticipantReconnected,
   markParticipantLeft,
   markCallLogCreated,
+  findAllRinging,
+  findAllActive,
 };

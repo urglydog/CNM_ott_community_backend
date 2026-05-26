@@ -16,12 +16,14 @@ class CallError extends Error {
    * @param {string} message - Human-readable error message
    * @param {string} code - Machine-readable error code (e.g. "CALL_BUSY", "CALL_ENDED")
    * @param {number} [statusCode=400] - HTTP status code
+   * @param {Object} [metadata={}] - Optional metadata for the error (e.g. busy user info)
    */
-  constructor(message, code = "CALL_ERROR", statusCode = 400) {
+  constructor(message, code = "CALL_ERROR", statusCode = 400, metadata = {}) {
     super(message);
     this.name = "CallError";
     this.code = code;
     this.statusCode = statusCode;
+    this.metadata = metadata;
   }
 }
 

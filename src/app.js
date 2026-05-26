@@ -24,6 +24,7 @@ const messageDeleteRoutes = require("./modules/messages/messageDeleteRoutes");
 const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
 const notificationRoutes = require("./modules/notifications/notificationRoutes");
 const callRoutes = require("./modules/calls/callRoutes");
+const { recoverCallsOnBoot } = require("./modules/calls/callRecovery");
 
 // Socket Handler
 const {
@@ -113,6 +114,11 @@ server.listen(PORT, () => {
   console.log(
     `OTT Community backend (Restructured) is running on port ${PORT}`,
   );
+
+  // Phase 2d: Recover orphaned call state from previous server instance
+  recoverCallsOnBoot(io).catch((err) => {
+    console.error("[BOOT] Call recovery failed:", err.message);
+  });
 });
 
 module.exports = { app, server, io };

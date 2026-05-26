@@ -580,3 +580,110 @@ The `isUserBusy` check uses a DynamoDB scan which is acceptable because:
 - Active/ringing calls are a tiny subset of all calls (most are status=ended)
 - DynamoDB scans only return matching items, not the full table
 - For optimization in Phase 2+, add a GSI on `status` + use `FilterExpression` on participants
+
+## 18. Conversation Resolution (DB-first)
+
+### Problem
+The previous implementation used `inferCallMode(conversationId)` and `extractDmMembers(conversationId)` which parsed the `dm:userA:userB` string format to determine call mode and members. This is fragile and tightly coupled to the conversationId format convention.
+
+### Solution: `resolveConversation(conversationId)`
+A single helper in `callService.js` that resolves conversation metadata from DynamoDB:
+
+```
+1. Query ott_groups with conversationId as groupId (GetCommand)
+2. If found → group conversation
+   - callMode = "group"
+   - members from ott_group_members table
+   - groupType from ott_groups.type
+3. If not found → DM conversation (fallback)
+   - callMode = "direct"
+   - members parsed from "dm:userA:userB" format (unavoidable — no DM table exists)
+   - groupType = null
+```
+
+### Key Properties
+- **DB-first**: Group type and members always come from the database
+- **Single parsing point**: DM string parsing is isolated in one function, not scattered across validation/service layers
+- **No exported parsing helpers**: `inferCallMode()` and `extractDmMembers()` are removed from the public API
+- **`validateStartCallInput`** only validates input format; callMode determination happens after DB resolution
+
+### Call Flow (updated)
+```
+startCall() →
+  1. validateStartCallInput(userId, conversationId, callType) → { callType }
+  2. resolveConversation(conversationId) → { callMode, members, groupType }
+  3. if group + audio → reject (GROUP_AUDIO_NOT_ALLOWED)
+  4. verify caller is member → proceed
+  ...rest of call creation
+```
+
+## 19. Idempotent call_log Creation
+
+### Problem
+Multiple code paths can trigger `createCallLogMessage()` for the same call:
+- Retry after timeout
+- Double end-call from two participants simultaneously
+- Timeout race vs. explicit end
+- Reconnect race
+
+### Solution: `callLogCreated` boolean flag
+
+**Field**: `callLogCreated: boolean` (default `false`) on every call session item.
+
+**Atomic Guard**: `markCallLogCreated(callId)` uses a DynamoDB conditional update:
+```
+UpdateExpression: "SET callLogCreated = :true"
+ConditionExpression: "callLogCreated = :false"
+```
+
+- Returns `true` → caller proceeds to create the call_log message
+- Returns `false` (ConditionalCheckFailedException) → another request already created it, skip
+
+**Flow in `createCallLogMessage()`**:
+```
+1. if callSession.callLogCreated → return early (fast path, no DB write)
+2. markCallLogCreated(callId) → if false → return early (race lost)
+3. saveMessage({ contentType: "call_log", ... })
+```
+
+The flag is set BEFORE the message write to prevent any possibility of double-creation.
+
+## 20. Active Call Recovery (`GET /api/calls/active`)
+
+### Purpose
+When a client recovers from crash, background, or network loss, it needs to know if the user is currently in a call and get a fresh token to rejoin.
+
+### Endpoint
+```
+GET /api/calls/active
+Authorization: Bearer <jwt>
+
+Response (in call):
+{
+  "call": { callId, conversationId, status, participants, ... },
+  "token": { appId, token, uid, channelName, expireAt }
+}
+
+Response (no active call):
+{
+  "call": null,
+  "token": null
+}
+```
+
+### Client Startup Flow
+```
+App launches / resumes →
+  1. Reconnect socket (socket.connect())
+  2. GET /api/calls/active
+     - If call exists + token → show in-call UI, use token to join Agora channel
+     - If call exists + no token → call ended between request and response, ignore
+     - If null → no active call, proceed normally
+  3. Socket events will take over for real-time updates from here
+```
+
+### Why REST + Socket (not socket-only)?
+- Socket may not be connected yet when the app resumes
+- REST is guaranteed to return the current state at request time
+- Socket call events handle real-time updates AFTER recovery
+- This is a point-in-time snapshot, not a subscription

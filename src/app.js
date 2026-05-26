@@ -23,6 +23,7 @@ const messageRevokeRoutes = require("./modules/messages/messageRevokeRoutes");
 const messageDeleteRoutes = require("./modules/messages/messageDeleteRoutes");
 const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
 const notificationRoutes = require("./modules/notifications/notificationRoutes");
+const callRoutes = require("./modules/calls/callRoutes");
 
 // Socket Handler
 const {
@@ -95,6 +96,7 @@ app.use("/api/channels", channelRoutes);
 app.use("/api/v1/bot", botRoutes);
 app.use("/api/uploads", uploadRoutes);
 app.use("/api/stats", statsRoutes);
+app.use("/api/calls", callRoutes);
 
 // Socket.io Middleware and Initialization
 io.use(socketAuthMiddleware);

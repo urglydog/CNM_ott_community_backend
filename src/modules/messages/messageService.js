@@ -257,6 +257,10 @@ async function saveMessage(payload) {
           },
         }
       : {}),
+    // callData chỉ tồn tại khi contentType === "call_log" — lưu metadata cuộc gọi
+    ...(contentType === "call_log" && payload.callData
+      ? { callData: { ...payload.callData } }
+      : {}),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
     // replyTo: lưu ID của tin nhắn gốc đang được trả lời

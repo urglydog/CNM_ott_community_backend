@@ -1,0 +1,747 @@
+/**
+ * Core business logic for video/voice calls.
+ *
+ * Depends on: callModel, callRepository, callValidation, AgoraProvider,
+ *             groupService (for membership), messageService (for call_log).
+ *
+ * No socket logic — socket events are handled separately in callSocketHandler (Phase 2c).
+ * No REST logic — request/response handling is in callController.
+ */
+
+const { ddbDocClient } = require("../../config/awsConfig");
+const { GetCommand, QueryCommand } = require("@aws-sdk/lib-dynamodb");
+
+const callModel = require("./callModel");
+const callRepository = require("./callRepository");
+const { CallError, validateStartCallInput, validateCallId, validateUserId } = require("./callValidation");
+const AgoraProvider = require("./providers/agoraProvider");
+const {
+  CALL_STATUS,
+  CALL_MODE,
+  CALL_TYPE,
+  PARTICIPANT_STATUS,
+  ENDED_REASON,
+  TIMEOUTS,
+} = require("./call.constants");
+
+const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || "ott_groups";
+const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
+
+// ─── Provider Singleton ─────────────────────────────────────────────────────
+
+const agoraProvider = new AgoraProvider();
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve a conversation from the database to determine callMode and members.
+ *
+ * Strategy:
+ * 1. Query ott_groups with conversationId as groupId (GetCommand).
+ * 2. If found → group conversation. Members come from ott_group_members.
+ * 3. If not found → direct (DM) conversation. Members are derived from
+ *    the "dm:userA:userB" convention (no DM table exists in DynamoDB).
+ *
+ * @param {string} conversationId
+ * @returns {Promise<{ callMode: "direct"|"group", members: string[], groupType?: string }>}
+ */
+async function resolveConversation(conversationId) {
+  if (!conversationId || typeof conversationId !== "string" || !conversationId.trim()) {
+    throw new CallError("conversationId is required", "INVALID_INPUT", 400);
+  }
+
+  const cid = conversationId.trim();
+
+  // 1. Try looking up as a group in ott_groups
+  const groupRes = await ddbDocClient.send(
+    new GetCommand({
+      TableName: GROUPS_TABLE,
+      Key: { groupId: cid },
+    }),
+  );
+
+  if (groupRes.Item) {
+    // Group conversation — get members from ott_group_members
+    const membersRes = await ddbDocClient.send(
+      new QueryCommand({
+        TableName: MEMBERS_TABLE,
+        KeyConditionExpression: "groupId = :gid",
+        ExpressionAttributeValues: { ":gid": cid },
+      }),
+    );
+    const members = (membersRes.Items || []).map((item) => String(item.userId));
+    if (members.length === 0) {
+      throw new CallError(
+        "Conversation has no members",
+        "CONVERSATION_NOT_FOUND",
+        404,
+      );
+    }
+    return {
+      callMode: CALL_MODE.GROUP,
+      members,
+      groupType: groupRes.Item.type || null,
+    };
+  }
+
+  // 2. Not a group — treat as DM conversation
+  // DMs use the convention "dm:userA:userB" with no dedicated DB table.
+  if (!cid.startsWith("dm:")) {
+    throw new CallError(
+      "Conversation not found (not a group and not a valid DM format)",
+      "CONVERSATION_NOT_FOUND",
+      404,
+    );
+  }
+
+  const parts = cid.slice(3).split(":");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new CallError(
+      "Invalid DM conversationId format. Expected 'dm:userA:userB'",
+      "INVALID_INPUT",
+      400,
+    );
+  }
+
+  const members = [String(parts[0]).trim(), String(parts[1]).trim()];
+  return {
+    callMode: CALL_MODE.DIRECT,
+    members,
+    groupType: null,
+  };
+}
+
+/**
+ * Create a call_log message in ott_messages when a call reaches a terminal state.
+ * This is the ONLY place call_log messages are generated.
+ *
+ * IDEMPOTENT: checks callLogCreated flag before writing. Only one call_log
+ * may ever exist per call session. Protected against retry, double end,
+ * timeout race, and reconnect race.
+ *
+ * @param {Object} callSession - The ended call session (with final status)
+ */
+async function createCallLogMessage(callSession) {
+  if (!callSession || !callSession.conversationId) return;
+
+  // Idempotency guard: if already created, skip
+  if (callSession.callLogCreated) return;
+
+  const participants = callSession.participants || [];
+  const acceptedCount = participants.filter(
+    (p) => p.status === PARTICIPANT_STATUS.ACCEPTED,
+  ).length;
+  const rejectedCount = participants.filter(
+    (p) => p.status === PARTICIPANT_STATUS.REJECTED,
+  ).length;
+  const missedCount = participants.filter(
+    (p) => p.status === PARTICIPANT_STATUS.MISSED || p.status === PARTICIPANT_STATUS.INVITED,
+  ).length;
+
+  // Determine human-readable content
+  const typeLabel =
+    callSession.callType === CALL_TYPE.VIDEO ? "Cuộc gọi video" : "Cuộc gọi thoại";
+  let statusSuffix = "";
+  switch (callSession.endedReason) {
+    case ENDED_REASON.USER_ENDED:
+      statusSuffix = ` · ${formatDuration(callSession.durationSeconds)}`;
+      break;
+    case ENDED_REASON.CALLER_CANCELLED:
+      statusSuffix = " · đã hủy";
+      break;
+    case ENDED_REASON.CALLEE_REJECTED:
+      statusSuffix = " · đã từ chối";
+      break;
+    case ENDED_REASON.NO_ANSWER_TIMEOUT:
+      statusSuffix = " · không trả lời";
+      break;
+    case ENDED_REASON.DISCONNECT_TIMEOUT:
+      statusSuffix = " · mất kết nối";
+      break;
+    case ENDED_REASON.GROUP_EMPTY:
+      statusSuffix = " · kết thúc";
+      break;
+    default:
+      break;
+  }
+
+  const content = `${typeLabel}${statusSuffix}`;
+
+  const callData = {
+    callId: callSession.callId,
+    callMode: callSession.callMode,
+    callType: callSession.callType,
+    callStatus: callSession.status,
+    endedReason: callSession.endedReason || null,
+    durationSeconds: callSession.durationSeconds || 0,
+    initiatorId: callSession.initiatorId,
+    acceptedCount,
+    rejectedCount,
+    missedCount,
+  };
+
+  // Mark callLogCreated = true BEFORE writing the message to prevent races.
+  // If this fails (e.g. concurrent end-call), the flag prevents double-write.
+  const marked = await callRepository.markCallLogCreated(callSession.callId);
+  if (!marked) {
+    // Another request already created the call_log — skip
+    return;
+  }
+
+  // Use saveMessage from messageService to persist in ott_messages
+  const { saveMessage } = require("../messages/messageService");
+  await saveMessage({
+    conversationId: callSession.conversationId,
+    senderId: callSession.initiatorId,
+    content,
+    contentType: "call_log",
+    callData,
+  });
+}
+
+/**
+ * Format seconds into a human-readable duration string.
+ *
+ * @param {number} seconds
+ * @returns {string} e.g. "2:30" or "0:05"
+ */
+function formatDuration(seconds) {
+  if (!seconds || seconds <= 0) return "0:00";
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/**
+ * Generate an Agora token payload for a user joining a call.
+ *
+ * @param {string} channelName
+ * @param {string} userId
+ * @returns {{ appId: string, token: string, uid: number, channelName: string, expireAt: string }}
+ */
+function generateTokenPayload(channelName, userId) {
+  const uid = agoraProvider.generateUid(userId);
+  const token = agoraProvider.generateToken(channelName, uid);
+  const expireAt = new Date(
+    Date.now() + TIMEOUTS.TOKEN_EXPIRE_SECONDS * 1000,
+  ).toISOString();
+
+  return {
+    appId: agoraProvider.getAppId(),
+    token,
+    uid,
+    channelName,
+    expireAt,
+  };
+}
+
+// ─── Core Service Methods ───────────────────────────────────────────────────
+
+/**
+ * Start a new call in a conversation.
+ *
+ * @param {Object} params
+ * @param {string} params.userId - The caller's userId
+ * @param {string} params.conversationId - The conversation to call in
+ * @param {string} params.callType - "audio" or "video"
+ * @returns {Promise<{ callSession: Object, tokenPayload: Object, recipientIds: string[] }>}
+ */
+async function startCall({ userId, conversationId, callType }) {
+  // 1. Validate input (no callMode determination here — comes from DB)
+  const { callType: normalizedType } = validateStartCallInput({
+    userId,
+    conversationId,
+    callType,
+  });
+
+  // 2. Resolve conversation from DB → determines callMode + members
+  const conversation = await resolveConversation(conversationId);
+  const { callMode, members } = conversation;
+
+  // 3. Group audio is not supported (Zalo-like rule: group calls are video-only)
+  if (callMode === CALL_MODE.GROUP && normalizedType === CALL_TYPE.AUDIO) {
+    throw new CallError(
+      "Group calls support video only. Audio group calls are not allowed.",
+      "GROUP_AUDIO_NOT_ALLOWED",
+      400,
+    );
+  }
+
+  // 4. Verify caller is a member
+  const callerId = String(userId);
+  if (!members.includes(callerId)) {
+    throw new CallError(
+      "You are not a member of this conversation",
+      "NOT_MEMBER",
+      403,
+    );
+  }
+
+  // 5. Direct call: exactly 2 members
+  if (callMode === CALL_MODE.DIRECT && members.length !== 2) {
+    throw new CallError(
+      "Direct call requires exactly 2 members",
+      "INVALID_CONVERSATION",
+      400,
+    );
+  }
+
+  // 6. Check no active call in this conversation
+  const existingCall = await callRepository.findActiveByConversation(conversationId);
+  if (existingCall) {
+    throw new CallError(
+      "An active call already exists in this conversation",
+      "CALL_EXISTS",
+      409,
+    );
+  }
+
+  // 7. Check initiator not busy
+  const callerBusy = await callRepository.isUserBusy(callerId);
+  if (callerBusy.busy) {
+    throw new CallError(
+      "You are already in another call",
+      "CALL_BUSY",
+      409,
+    );
+  }
+
+  // 8. Direct: check callee not busy
+  if (callMode === CALL_MODE.DIRECT) {
+    const calleeId = members.find((m) => m !== callerId);
+    const calleeBusy = await callRepository.isUserBusy(calleeId);
+    if (calleeBusy.busy) {
+      throw new CallError(
+        "The person you are trying to call is busy",
+        "CALL_BUSY",
+        409,
+      );
+    }
+  }
+
+  // 9. Build initial participants
+  let initialParticipants = [];
+  if (callMode === CALL_MODE.DIRECT) {
+    const calleeId = members.find((m) => m !== callerId);
+    initialParticipants = [
+      { userId: calleeId, role: "callee", status: PARTICIPANT_STATUS.INVITED },
+    ];
+  } else {
+    // Group: invite all other members
+    initialParticipants = members
+      .filter((m) => m !== callerId)
+      .map((m) => ({
+        userId: m,
+        role: "member",
+        status: PARTICIPANT_STATUS.INVITED,
+      }));
+  }
+
+  // 10. Create call session (channelName defaults to callId in createCallSession)
+  const callSession = callModel.createCallSession({
+    conversationId,
+    initiatorId: callerId,
+    callMode,
+    callType: normalizedType,
+    channelName: null, // will default to callId
+    initialParticipants,
+  });
+
+  // 11. Store in DynamoDB
+  await callRepository.create(callSession);
+
+  // 12. Generate token for initiator
+  const tokenPayload = generateTokenPayload(callSession.channelName, callerId);
+
+  // 13. Recipient IDs (who should receive call:incoming)
+  const recipientIds = initialParticipants.map((p) => p.userId);
+
+  return { callSession, tokenPayload, recipientIds };
+}
+
+/**
+ * Accept an incoming call.
+ *
+ * @param {Object} params
+ * @param {string} params.userId - The accepting user's userId
+ * @param {string} params.callId - The call session ID
+ * @returns {Promise<{ callSession: Object, tokenPayload: Object }>}
+ */
+async function acceptCall({ userId, callId }) {
+  validateUserId(userId);
+  validateCallId(callId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+  if (call.status !== CALL_STATUS.RINGING) {
+    throw new CallError(
+      `Call is not in ringing state (current: ${call.status})`,
+      "CALL_NOT_RINGING",
+      400,
+    );
+  }
+
+  const uid = String(userId);
+  const participant = callModel.findParticipant(call, uid);
+  if (!participant) {
+    throw new CallError("You are not a participant in this call", "NOT_PARTICIPANT", 403);
+  }
+  if (participant.status !== PARTICIPANT_STATUS.INVITED) {
+    throw new CallError(
+      `Already responded (status: ${participant.status})`,
+      "ALREADY_RESPONDED",
+      400,
+    );
+  }
+
+  const now = new Date().toISOString();
+
+  // Mark participant as accepted
+  const updated = await callRepository.updateParticipant(callId, uid, {
+    status: PARTICIPANT_STATUS.ACCEPTED,
+    joinedAt: now,
+  });
+
+  // Activate call if this is the first accept
+  const alreadyActive = updated.status === CALL_STATUS.ACTIVE;
+  let finalCall = updated;
+  if (!alreadyActive) {
+    finalCall = await callRepository.activateCall(callId);
+  }
+
+  // Generate token for this participant
+  const tokenPayload = generateTokenPayload(finalCall.channelName, uid);
+
+  return { callSession: finalCall, tokenPayload };
+}
+
+/**
+ * Reject an incoming call.
+ *
+ * @param {Object} params
+ * @param {string} params.userId - The rejecting user's userId
+ * @param {string} params.callId - The call session ID
+ * @returns {Promise<{ ended: boolean, callSession?: Object }>}
+ */
+async function rejectCall({ userId, callId }) {
+  validateUserId(userId);
+  validateCallId(callId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+  if (call.status !== CALL_STATUS.RINGING) {
+    throw new CallError(
+      `Call is not in ringing state (current: ${call.status})`,
+      "CALL_NOT_RINGING",
+      400,
+    );
+  }
+
+  const uid = String(userId);
+  const participant = callModel.findParticipant(call, uid);
+  if (!participant) {
+    throw new CallError("You are not a participant in this call", "NOT_PARTICIPANT", 403);
+  }
+  if (participant.status !== PARTICIPANT_STATUS.INVITED) {
+    throw new CallError(
+      `Already responded (status: ${participant.status})`,
+      "ALREADY_RESPONDED",
+      400,
+    );
+  }
+
+  if (call.callMode === CALL_MODE.DIRECT) {
+    // Direct: callee reject ends call for both
+    const ended = await callRepository.endCall(
+      callId,
+      uid,
+      ENDED_REASON.CALLEE_REJECTED,
+      null, // no startedAt (never became active)
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended };
+  }
+
+  // Group: mark only this participant as rejected
+  const updated = await callRepository.updateParticipant(callId, uid, {
+    status: PARTICIPANT_STATUS.REJECTED,
+  });
+
+  // Check if call should end: all non-initiator invitees rejected/missed and no accepted
+  const hasAccepted = updated.participants.some(
+    (p) => p.status === PARTICIPANT_STATUS.ACCEPTED,
+  );
+  const hasPending = updated.participants.some(
+    (p) =>
+      p.userId !== call.initiatorId && p.status === PARTICIPANT_STATUS.INVITED,
+  );
+
+  if (!hasAccepted && !hasPending) {
+    // Everyone rejected/missed, no one accepted → end call
+    const ended = await callRepository.endCall(
+      callId,
+      uid,
+      ENDED_REASON.NO_ANSWER_TIMEOUT,
+      null,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended };
+  }
+
+  return { ended: false, callSession: updated };
+}
+
+/**
+ * Cancel a ringing call (initiator only).
+ *
+ * @param {Object} params
+ * @param {string} params.userId - Must be the initiator
+ * @param {string} params.callId - The call session ID
+ * @returns {Promise<{ ended: boolean, callSession: Object }>}
+ */
+async function cancelCall({ userId, callId }) {
+  validateUserId(userId);
+  validateCallId(callId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+  if (String(call.initiatorId) !== String(userId)) {
+    throw new CallError(
+      "Only the call initiator can cancel the call",
+      "NOT_INITIATOR",
+      403,
+    );
+  }
+  if (call.status !== CALL_STATUS.RINGING) {
+    throw new CallError(
+      `Can only cancel ringing calls (current: ${call.status})`,
+      "CALL_NOT_RINGING",
+      400,
+    );
+  }
+
+  const ended = await callRepository.endCall(
+    callId,
+    userId,
+    ENDED_REASON.CALLER_CANCELLED,
+    null,
+  );
+  await createCallLogMessage(ended);
+  return { ended: true, callSession: ended };
+}
+
+/**
+ * End an active call.
+ *
+ * Rules:
+ * - Direct: any participant ends for both (atomic)
+ * - Group initiator: ends for everyone
+ * - Group normal participant: leaves only themselves
+ * - If no accepted participants remain in group: ends as group_empty
+ *
+ * @param {Object} params
+ * @param {string} params.userId - The user ending/leaving
+ * @param {string} params.callId - The call session ID
+ * @returns {Promise<{ ended: boolean, selfOnly?: boolean, callSession: Object }>}
+ */
+async function endCall({ userId, callId }) {
+  validateUserId(userId);
+  validateCallId(callId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+
+  // Can only end active or ringing calls
+  const endableStatuses = [CALL_STATUS.ACTIVE, CALL_STATUS.RINGING];
+  if (!endableStatuses.includes(call.status)) {
+    throw new CallError(
+      `Call cannot be ended (current status: ${call.status})`,
+      "CALL_ALREADY_ENDED",
+      400,
+    );
+  }
+
+  const uid = String(userId);
+  const participant = callModel.findParticipant(call, uid);
+  if (!participant) {
+    throw new CallError("You are not a participant in this call", "NOT_PARTICIPANT", 403);
+  }
+
+  if (call.callMode === CALL_MODE.DIRECT) {
+    // Direct: any participant ends for both (atomic)
+    const ended = await callRepository.endCall(
+      callId,
+      uid,
+      ENDED_REASON.USER_ENDED,
+      call.startedAt,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended };
+  }
+
+  // Group call
+  const isInitiator = String(call.initiatorId) === uid;
+
+  if (isInitiator) {
+    // Initiator ends the entire call for everyone
+    const ended = await callRepository.endCall(
+      callId,
+      uid,
+      ENDED_REASON.USER_ENDED,
+      call.startedAt,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended };
+  }
+
+  // Normal participant: leave only themselves
+  const updated = await callRepository.markParticipantLeft(callId, uid);
+
+  // Check if any accepted participants remain
+  const hasAccepted = updated.participants.some(
+    (p) =>
+      p.userId !== uid && p.status === PARTICIPANT_STATUS.ACCEPTED,
+  );
+
+  if (!hasAccepted) {
+    // No one left in the call → end it
+    const ended = await callRepository.endCall(
+      callId,
+      uid,
+      ENDED_REASON.GROUP_EMPTY,
+      call.startedAt,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, selfOnly: true, callSession: ended };
+  }
+
+  return { ended: false, selfOnly: true, callSession: updated };
+}
+
+/**
+ * Get a fresh Agora token for an active call participant.
+ *
+ * @param {Object} params
+ * @param {string} params.userId - The requesting user
+ * @param {string} params.callId - The call session ID
+ * @returns {Promise<Object>} Token payload
+ */
+async function getCallToken({ userId, callId }) {
+  validateUserId(userId);
+  validateCallId(callId);
+
+  const call = await callRepository.getById(callId);
+  if (!call) {
+    throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+
+  // Can only get tokens for active/ringing calls
+  const validStatuses = [CALL_STATUS.ACTIVE, CALL_STATUS.RINGING];
+  if (!validStatuses.includes(call.status)) {
+    throw new CallError(
+      `Cannot get token for call with status: ${call.status}`,
+      "CALL_ENDED",
+      400,
+    );
+  }
+
+  const uid = String(userId);
+  const participant = callModel.findParticipant(call, uid);
+  if (!participant) {
+    throw new CallError("You are not a participant in this call", "NOT_PARTICIPANT", 403);
+  }
+
+  return generateTokenPayload(call.channelName, uid);
+}
+
+/**
+ * Get call history for a conversation.
+ *
+ * @param {Object} params
+ * @param {string} params.userId - The requesting user
+ * @param {string} params.conversationId - The conversation
+ * @param {Object} [params.pagination] - { limit, exclusiveStartKey }
+ * @returns {Promise<{ items: Object[], nextCursor?: string }>}
+ */
+async function getHistory({ userId, conversationId, pagination = {} }) {
+  validateUserId(userId);
+  if (!conversationId) {
+    throw new CallError("conversationId is required", "INVALID_INPUT", 400);
+  }
+
+  // Verify user is a member of this conversation (DB lookup, no string parsing)
+  const { members } = await resolveConversation(conversationId);
+  if (!members.includes(String(userId))) {
+    throw new CallError(
+      "You are not a member of this conversation",
+      "NOT_MEMBER",
+      403,
+    );
+  }
+
+  const result = await callRepository.getHistoryByConversation(
+    conversationId,
+    pagination,
+  );
+
+  return {
+    items: result.items,
+    nextCursor: result.lastEvaluatedKey
+      ? Buffer.from(JSON.stringify(result.lastEvaluatedKey)).toString("base64")
+      : null,
+  };
+}
+
+/**
+ * Get the user's current active or ringing call (for crash/background recovery).
+ *
+ * Returns the call session if the user has an active/ringing call, plus a fresh
+ * Agora token payload if the call is still joinable (ringing or active).
+ *
+ * @param {string} userId
+ * @returns {Promise<{ callSession: Object|null, tokenPayload?: Object }>}
+ */
+async function getActiveCall(userId) {
+  validateUserId(userId);
+
+  const activeCall = await callRepository.findActiveForUser(userId);
+  if (!activeCall) {
+    return { callSession: null };
+  }
+
+  const uid = String(userId);
+  const participant = callModel.findParticipant(activeCall, uid);
+
+  // Generate token only if the call is joinable (ringing or active)
+  let tokenPayload = null;
+  if (
+    participant &&
+    (activeCall.status === CALL_STATUS.ACTIVE || activeCall.status === CALL_STATUS.RINGING)
+  ) {
+    tokenPayload = generateTokenPayload(activeCall.channelName, uid);
+  }
+
+  return {
+    callSession: activeCall,
+    tokenPayload,
+  };
+}
+
+module.exports = {
+  startCall,
+  acceptCall,
+  rejectCall,
+  cancelCall,
+  endCall,
+  getCallToken,
+  getHistory,
+  getActiveCall,
+};

@@ -10,5 +10,8 @@ router.post('/request', authMiddleware, friendController.sendFriendRequest);
 router.put('/accept', authMiddleware, friendController.acceptFriendRequest);
 router.put('/reject', authMiddleware, friendController.rejectFriendRequest);
 router.get('/pending', authMiddleware, friendController.getPendingRequests);
+router.put('/nickname', authMiddleware, friendController.updateNickname);
+router.put('/chat-background', authMiddleware, friendController.updateChatBackground);
+router.get('/chat-background/:friendshipId', authMiddleware, friendController.getChatBackground);
 
 module.exports = router;

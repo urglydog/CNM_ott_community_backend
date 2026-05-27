@@ -12,16 +12,23 @@ const ALLOWED_MIME_TYPES = new Set([
   "audio/mpeg",
   "audio/wav",
   "audio/ogg",
+  "audio/m4a",
+  "audio/aac",
+  "audio/x-m4a",
+  "video/mp4",
+  "video/quicktime",
+  "video/x-msvideo",
+  "video/webm"
 ]);
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
 const storage = multer.memoryStorage();
 
 function fileFilter(req, file, cb) {
   if (!file || !ALLOWED_MIME_TYPES.has(file.mimetype)) {
     return cb(
-      new Error("Only images, pdf, docx, txt, and audio files are allowed"),
+      new Error("Only images, videos, audio, pdf, docx, and txt files are allowed"),
     );
   }
   return cb(null, true);

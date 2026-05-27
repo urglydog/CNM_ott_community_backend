@@ -4,18 +4,84 @@ const {
   GetCommand,
   QueryCommand,
 } = require("@aws-sdk/lib-dynamodb");
-const { saveMessage } = require("../modules/messages/messageService");
+const { saveMessage, saveCallLogMessage, updateCallLogMessage } = require("../modules/messages/messageService");
+
+const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
 const { notifyMessageCreated } = require("../modules/notifications/notificationService");
 const { verifyToken } = require("../common/utils/jwt");
+const { generateToken04 } = require("../common/utils/zegoToken");
 
 const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || "ott_group_members";
 const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
+const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
+
+// ============================================================
+// READ RECEIPT DEDUPLICATION CACHE
+// Prevents duplicate mark_read events from the same user for the same message
+// ============================================================
+const readReceiptDedupeCache = new Map(); // key: `${conversationId}:${messageId}:${userId}`, value: timestamp
+const DEDUPE_WINDOW_MS = 2000; // 2 second window
+
+function isDuplicateReadReceipt(conversationId, messageId, userId) {
+  const key = `${conversationId}:${messageId}:${userId}`;
+  const now = Date.now();
+  const lastTime = readReceiptDedupeCache.get(key);
+
+  if (lastTime && now - lastTime < DEDUPE_WINDOW_MS) {
+    console.log(`[mark_read] DEDUP: Ignoring duplicate mark_read from ${userId} for ${messageId} (${now - lastTime}ms since last)`);
+    return true;
+  }
+
+  readReceiptDedupeCache.set(key, now);
+
+  // Cleanup old entries periodically
+  if (readReceiptDedupeCache.size > 10000) {
+    const cutoff = now - DEDUPE_WINDOW_MS * 2;
+    for (const [k, v] of readReceiptDedupeCache) {
+      if (v < cutoff) readReceiptDedupeCache.delete(k);
+    }
+  }
+
+  return false;
+}
 
 // ============================================================
 // CALL MANAGER (Server-authoritative)
 // ============================================================
 // roomId -> { callerId, receiverIds: string[], status, timeoutRef }
 const activeCalls = new Map();
+
+// Map ZegoCloud roomId (call_1vs1_...) -> conversationId (dm:...)
+// Được ghi khi call-request, dùng bởi Webhook để trầ cứu conversationId đúng
+const roomToConversation = new Map();
+
+// Map ZegoCloud roomId -> startedAt (ms) — dùng để tính duration khi Zego webhook không gửi timestamp
+const roomStartedAt = new Map();
+
+// Map roomId -> { startTime: number, type: '1vs1' | 'group' } — dùng cho cả 1vs1 và group call
+const activeRooms = new Map();
+
+/**
+ * Tính duration (giây) từ lúc bắt đầu đến hiện tại và dọn room khỏi activeRooms.
+ * @param {string} roomId
+ * @returns {number} durationInSeconds
+ */
+function calculateDuration(roomId) {
+  const roomInfo = activeRooms.get(roomId);
+  if (!roomInfo) return 0;
+  const durationInSeconds = Math.floor((Date.now() - roomInfo.startTime) / 1000);
+  activeRooms.delete(roomId);
+  console.log(`[calculateDuration] roomId=${roomId}, duration=${durationInSeconds}s`);
+  return durationInSeconds;
+}
+
+// Set các roomId đã được lưu banner group_call_started — ngăn lưu trùng khi có nhiều event
+const groupCallBannerSaved = new Set();
+
+// Map theo dõi phòng gọi nhóm đang hoạt động:
+// roomId → { conversationId, callerId, startTime, membersCount }
+// Khi membersCount về 0 → lưu call_log "completed" ngay lập tức
+const activeGroupCallRooms = new Map();
 
 /**
  * Lấy displayName và avatarUrl của user từ bảng ott_users.
@@ -281,6 +347,53 @@ function handleSocketConnection(io, socket) {
     _respond(callback, true, null, { roomId });
   });
 
+  // --- Ghim tin nhắn ---
+  socket.on("pin_message", async (data, callback) => {
+    try {
+      const { roomId, message } = data;
+      const groupService = require("../modules/groups/groupService");
+      const friendService = require("../modules/users/friendService");
+
+      let pinnedList = [];
+      if (roomId.startsWith("group_")) {
+        pinnedList = await groupService.pinMessage(roomId, message, userIdKey);
+      } else if (roomId.startsWith("dm:")) {
+        const parts = roomId.split(":");
+        const rec = await friendService.findExistingRecord(parts[1], parts[2]);
+        if (!rec) throw new Error("Không tìm thấy thông tin bạn bè");
+        pinnedList = await friendService.pinMessage(rec.friendshipId, message, userIdKey);
+      }
+
+      io.to(roomId).emit("message_pinned_updated", { roomId, pinnedMessages: pinnedList });
+      _respond(callback, true, null, { pinnedMessages: pinnedList });
+    } catch (error) {
+      _respond(callback, false, error.message);
+    }
+  });
+
+  socket.on("unpin_message", async (data, callback) => {
+    try {
+      const { roomId, messageId } = data;
+      const groupService = require("../modules/groups/groupService");
+      const friendService = require("../modules/users/friendService");
+
+      let pinnedList = [];
+      if (roomId.startsWith("group_")) {
+        pinnedList = await groupService.unpinMessage(roomId, messageId, userIdKey);
+      } else if (roomId.startsWith("dm:")) {
+        const parts = roomId.split(":");
+        const rec = await friendService.findExistingRecord(parts[1], parts[2]);
+        if (!rec) throw new Error("Không tìm thấy thông tin bạn bè");
+        pinnedList = await friendService.unpinMessage(rec.friendshipId, messageId, userIdKey);
+      }
+
+      io.to(roomId).emit("message_pinned_updated", { roomId, pinnedMessages: pinnedList });
+      _respond(callback, true, null, { pinnedMessages: pinnedList });
+    } catch (error) {
+      _respond(callback, false, error.message);
+    }
+  });
+
   // --- Tham gia phòng chat (legacy alias) ---
   // KHÔNG dùng socket.emit vì emit không truyền callback qua chain,
   // dẫn đến lỗi rơi vào "No callback provided" thay vì phản hồi client.
@@ -327,22 +440,46 @@ function handleSocketConnection(io, socket) {
   });
 
   // ============================================================
+  // CHAT SETTINGS SYNC
+  // ============================================================
+  socket.on("chat_background_updated", (data) => {
+    // data: { friendshipId, bgUrl, senderId, receiverId }
+    if (!data.receiverId) return;
+    
+    // Phát cho người nhận (để cập nhật UI ngay lập tức)
+    io.to(String(data.receiverId)).emit("chat_background_updated", {
+      friendshipId: data.friendshipId,
+      bgUrl: data.bgUrl,
+      updatedBy: userId
+    });
+    
+    // Nếu là DM room, phát vào room luôn
+    const roomId = `dm:${[Number(data.senderId), Number(data.receiverId)].sort((a, b) => a - b).join(":")}`;
+    io.to(roomId).emit("chat_background_updated", {
+      friendshipId: data.friendshipId,
+      bgUrl: data.bgUrl,
+      updatedBy: userId
+    });
+  });
+
+  // ============================================================
   // SEND MESSAGE — có kiểm tra membership
   // ============================================================
   socket.on("send_message", async (payload, callback) => {
-    // Payload: { roomId, content, contentType, attachments, stickerData }
+    // Payload: { roomId, content, contentType, attachments, stickerData, replyTo, pollData }
     const contentType = payload.contentType || "text";
 
     // sticker: không bắt buộc content; emoji/sticker: dùng stickerData thay thế
     const hasContent = payload.content && String(payload.content).trim();
     const hasStickerData = contentType === "sticker" && payload.stickerData;
     const isEmoji = contentType === "emoji";
+    const isPoll = contentType === "poll";
 
     if (!payload.roomId) {
       return _respond(callback, false, "roomId is required");
     }
-    if (!hasContent && !hasStickerData && !isEmoji) {
-      return _respond(callback, false, "content or stickerData is required");
+    if (!hasContent && !hasStickerData && !isEmoji && !isPoll) {
+      return _respond(callback, false, "content or stickerData or pollData is required");
     }
 
     if (!userId) {
@@ -362,13 +499,19 @@ function handleSocketConnection(io, socket) {
     try {
       // sticker: content có thể là undefined → service sẽ tự tạo từ stickerData
       // emoji: content luôn là emoji string
+      // poll: content là câu hỏi, pollData chứa options
       const entityPayload = {
         conversationId: payload.roomId,
         senderId: userId,
         content: hasContent ? payload.content.trim() : payload.content,
         contentType,
         attachments: payload.attachments || null,
+        mentions: Array.isArray(payload.mentions) ? payload.mentions.map(String) : [],
         ...(hasStickerData ? { stickerData: payload.stickerData } : {}),
+        // Thêm pollData nếu là tin nhắn bình chọn
+        ...(isPoll && payload.pollData ? { pollData: payload.pollData } : {}),
+        // Thêm replyTo nếu có - ID của tin nhắn đang được trả lời
+        ...(payload.replyTo ? { replyTo: payload.replyTo } : {}),
       };
 
       const savedMessage = await saveMessage(entityPayload);
@@ -383,6 +526,52 @@ function handleSocketConnection(io, socket) {
 
       // Broadcast tới tất cả thành viên trong phòng (bao gồm cả người gửi)
       io.to(payload.roomId).emit("receive_message", enrichedMessage);
+
+      // Bổ sung logic: Kiểm tra mentions và bắn mention_notification tới những người bị tag
+      if (Array.isArray(savedMessage.mentions) && savedMessage.mentions.length > 0) {
+        if (savedMessage.mentions.includes("all")) {
+          try {
+            const membersResult = await ddbDocClient.send(
+              new QueryCommand({
+                TableName: MEMBERS_TABLE,
+                KeyConditionExpression: "groupId = :gid",
+                ExpressionAttributeValues: {
+                  ":gid": String(payload.roomId),
+                },
+              })
+            );
+            const memberIds = (membersResult.Items || [])
+              .map((item) => String(item.userId))
+              .filter((uid) => uid !== String(userId));
+
+            memberIds.forEach((mentionedUserId) => {
+              const userSockets = onlineUsers.get(String(mentionedUserId));
+              if (userSockets) {
+                for (const sockId of userSockets) {
+                  io.to(sockId).emit("mention_notification", {
+                    message: enrichedMessage,
+                    conversationId: payload.roomId,
+                  });
+                }
+              }
+            });
+          } catch (err) {
+            console.error(`[socket] Lỗi query group members for @all:`, err.message);
+          }
+        } else {
+          savedMessage.mentions.forEach((mentionedUserId) => {
+            const userSockets = onlineUsers.get(String(mentionedUserId));
+            if (userSockets) {
+              for (const sockId of userSockets) {
+                io.to(sockId).emit("mention_notification", {
+                  message: enrichedMessage,
+                  conversationId: payload.roomId,
+                });
+              }
+            }
+          });
+        }
+      }
 
       // DM compatibility: một số client cũ có thể join room DM theo thứ tự id ngược lại.
       // Emit thêm sang room đảo chiều để tránh mất tin nhắn realtime (đặc biệt với luồng gửi video qua socket).
@@ -429,6 +618,107 @@ function handleSocketConnection(io, socket) {
   // --- Gửi tin nhắn (legacy alias cho backward compatibility) ---
   socket.on("send-message", async (payload, callback) => {
     socket.emit("send_message", payload, callback);
+  });
+
+  // ============================================================
+  // POLL VOTING — Bình chọn trong chat
+  // ============================================================
+
+  /**
+   * vote_poll: Xử lý vote cho một lựa chọn trong poll
+   * Payload: { roomId, messageId, optionId }
+   */
+  socket.on("vote_poll", async (data, callback) => {
+    const { roomId, messageId, optionId } = data;
+
+    console.log(`[vote_poll] Received vote request: roomId=${roomId}, messageId=${messageId}, optionId=${optionId}, userId=${userId}`);
+
+    if (!roomId) return _respond(callback, false, "roomId is required");
+    if (!messageId) return _respond(callback, false, "messageId is required");
+    if (!optionId) return _respond(callback, false, "optionId is required");
+    if (!userId) return _respond(callback, false, "User not authenticated");
+
+    const isMember = await checkUserInGroup(roomId, userId);
+    if (!isMember) return _respond(callback, false, "Not a member of this group");
+
+    try {
+      // Lấy tin nhắn poll từ DynamoDB
+      console.log(`[vote_poll] Fetching conversation ${roomId} from ${MESSAGES_TABLE}`);
+      const convRes = await ddbDocClient.send(
+        new GetCommand({ TableName: MESSAGES_TABLE, Key: { conversationId: roomId } })
+      );
+
+      if (!convRes.Item || !Array.isArray(convRes.Item.messages)) {
+        return _respond(callback, false, "Không tìm thấy cuộc trò chuyện");
+      }
+
+      const messages = convRes.Item.messages.slice();
+      const msgIndex = messages.findIndex((m) => String(m.id) === String(messageId));
+
+      if (msgIndex === -1) {
+        return _respond(callback, false, "Không tìm thấy tin nhắn bình chọn");
+      }
+
+      const msg = messages[msgIndex];
+
+      if (msg.contentType !== "poll" || !msg.pollData) {
+        return _respond(callback, false, "Tin nhắn không phải là bình chọn");
+      }
+
+      const pollData = { ...msg.pollData };
+      const optionIndex = pollData.pollOptions.findIndex((o) => String(o.id) === String(optionId));
+
+      if (optionIndex === -1) {
+        return _respond(callback, false, "Không tìm thấy lựa chọn");
+      }
+
+      const userIdStr = String(userId);
+      const option = pollData.pollOptions[optionIndex];
+      const voterIds = option.voterIds || [];
+
+      // Kiểm tra xem user đã vote cho option này chưa
+      if (voterIds.includes(userIdStr)) {
+        // User đã vote → bỏ vote (toggle behavior)
+        option.voterIds = voterIds.filter((id) => id !== userIdStr);
+      } else {
+        // User chưa vote → thêm vote
+        // Nếu không phải multiple choice, bỏ vote các option khác trước
+        if (!pollData.pollSettings?.multipleChoice) {
+          pollData.pollOptions.forEach((opt) => {
+            if (Array.isArray(opt.voterIds)) {
+              opt.voterIds = opt.voterIds.filter((id) => id !== userIdStr);
+            }
+          });
+        }
+        option.voterIds = [...voterIds, userIdStr];
+      }
+
+      // Cập nhật message trong mảng
+      messages[msgIndex] = { ...msg, pollData };
+
+      // Lưu lại vào DynamoDB
+      console.log(`[vote_poll] Saving vote to ${MESSAGES_TABLE}, conversationId=${roomId}, messageId=${messageId}`);
+      await ddbDocClient.send(
+        new PutCommand({
+          TableName: MESSAGES_TABLE,
+          Item: { conversationId: roomId, messages },
+        })
+      );
+      console.log(`[vote_poll] Vote saved successfully for message ${messageId}`);
+
+      // Broadcast cập nhật poll tới tất cả thành viên trong phòng
+      io.to(roomId).emit("poll_updated", {
+        roomId,
+        messageId: String(messageId),
+        pollData,
+      });
+
+      console.log(`[vote_poll] User ${userId} voted for option ${optionId} in poll ${messageId}`);
+      _respond(callback, true, null, { pollData });
+    } catch (error) {
+      console.error("[vote_poll] Error:", error.message, error.stack);
+      _respond(callback, false, error.message);
+    }
   });
 
   // ============================================================
@@ -481,9 +771,58 @@ function handleSocketConnection(io, socket) {
     socket.to(roomId).emit("user_stopped_typing", {
       roomId,
       userId,
+      userName: socket.user?.username || "",
     });
 
     _respond(callback, true);
+  });
+
+  // ============================================================
+  // CHAT BACKGROUND UPDATE — Real-time sync
+  // ============================================================
+  socket.on("chat_background_updated", async (data, callback) => {
+    try {
+      const { friendshipId, bgUrl, receiverId } = data;
+      if (!friendshipId) return _respond(callback, false, "friendshipId is required");
+
+      // Gửi cho receiver qua các socket của họ
+      if (receiverId) {
+        emitToUserSockets(receiverId, "chat_background_updated", { 
+          friendshipId, 
+          bgUrl,
+          updatedBy: userIdKey 
+        });
+      }
+
+      _respond(callback, true);
+    } catch (error) {
+      console.error("[chat_background_updated] error:", error.message);
+      _respond(callback, false, error.message);
+    }
+  });
+
+  // TYPING STOP ALL — gửi stop typing cho tất cả conversations khi logout
+  // ============================================================
+  socket.on("typing_stop_all", async ({ conversations = [] }, callback) => {
+    if (!userId) {
+      _respond(callback, false, "User not authenticated");
+      return;
+    }
+
+    const userName = socket.user?.username || "";
+    // Gửi user_stopped_typing cho tất cả conversations được cung cấp
+    const rooms = Array.isArray(conversations) ? conversations : [];
+    rooms.forEach((roomId) => {
+      if (!roomId || typeof roomId !== "string") return;
+      socket.to(roomId).emit("user_stopped_typing", {
+        roomId,
+        userId,
+        userName,
+      });
+    });
+
+    console.log(`[typing] User ${userId} sent stopped_typing to ${rooms.length} rooms`);
+    _respond(callback, true, null, { count: rooms.length });
   });
 
   // ============================================================
@@ -502,13 +841,22 @@ function handleSocketConnection(io, socket) {
     const record = {
       callerId,
       receiverIds: [receiverId],
+      conversationId: String(data.conversationId || ""), // lưu conversationId thật (dm:...) để dùng khi lưu call log
       status: "ringing",
+      startedAt: null, // sẽ được set khi call-accepted
       timeoutRef: null,
     };
 
     // Override any existing call for this room
     clearActiveCall(roomId);
     activeCalls.set(roomId, record);
+
+    // Lưu mapping roomId (Zego) → conversationId (dm:...) để Webhook tra cứu
+    if (data.conversationId) {
+      roomToConversation.set(roomId, String(data.conversationId));
+      roomStartedAt.set(roomId, Date.now()); // ← lưu thời điểm bắt đầu
+      console.log(`[call-request] Mapped roomId=${roomId} → conversationId=${data.conversationId}`);
+    }
 
     record.timeoutRef = setTimeout(() => {
       const payload = {
@@ -542,8 +890,12 @@ function handleSocketConnection(io, socket) {
     const roomId = String(data.roomId || "").trim();
 
     if (!groupId) {
-      _respond(callback, false, "groupId is required");
-      return;
+      // Fallback: receiverId có thể đóng vai trò groupId (frontend gửi thiếu trường groupId)
+      groupId = String(data.receiverId || "").trim();
+      if (!groupId) {
+        _respond(callback, false, "groupId is required");
+        return;
+      }
     }
 
     if (!userId) {
@@ -585,13 +937,23 @@ function handleSocketConnection(io, socket) {
     const record = {
       callerId: payload.callerId,
       receiverIds: [String(groupId)], // For group, receiver is the group itself
+      conversationId: String(data.conversationId || groupId), // lưu conversationId thật (group_...) để dùng khi lưu call log
       status: "ringing",
+      startedAt: Date.now(),  // ← set ngay khi tạo phòng để tính duration đúng
       timeoutRef: null,
       isGroupCall: true
     };
     clearActiveCall(roomId);
     activeCalls.set(roomId, record);
-    
+
+    // Lưu mapping roomId (Zego: group_call_...) → conversationId thật (group_...)
+    const resolvedConvId = String(data.conversationId || groupId);
+    if (resolvedConvId) {
+      roomToConversation.set(roomId, resolvedConvId);
+      roomStartedAt.set(roomId, Date.now()); // ← lưu thời điểm bắt đầu
+      console.log(`[group-call-request] Mapped roomId=${roomId} → conversationId=${resolvedConvId}`);
+    }
+
     record.timeoutRef = setTimeout(() => {
       emitToCallParticipants(record, "call-timeout", {
         roomId,
@@ -611,10 +973,252 @@ function handleSocketConnection(io, socket) {
     // Emit sang cả room channel:... để đảm bảo clients cũ đang ở đó cũng nhận được
     socket.to(`channel:${groupId}`).emit("group-call-request", payload);
 
+    let createdMessageId = null;
+
+    // ── Lưu tin nhắn hệ thống "group_call_started" (CHỈ 1 LẦN per roomId) ──
+    if (!groupCallBannerSaved.has(roomId)) {
+      groupCallBannerSaved.add(roomId);
+      try {
+        const callerInfo = await (async () => {
+          try {
+            const res = await ddbDocClient.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: String(payload.callerId) } }));
+            return { displayName: res.Item?.displayName || res.Item?.username || "Ai đó", avatarUrl: res.Item?.avatarUrl || null };
+          } catch { return { displayName: "Ai đó", avatarUrl: null }; }
+        })();
+
+        const startMsg = await saveCallLogMessage({
+          conversationId: resolvedConvId,
+          senderId: String(payload.callerId),
+          callData: {
+            callType: "video",
+            status: "started",
+            duration: 0,
+            roomId,
+            messageType: "group_call_started",
+          },
+        });
+
+        createdMessageId = startMsg?.messageId;
+
+        const enrichedStartMsg = {
+          ...startMsg,
+          messageType: "group_call_started",
+          contentType: "group_call_started",
+          content: `📞 ${callerInfo.displayName} đang gọi nhóm`,
+          senderDisplayName: callerInfo.displayName,
+          senderAvatarUrl: callerInfo.avatarUrl,
+        };
+
+        io.to(resolvedConvId).emit("receive_message", enrichedStartMsg);
+        console.log(`[group-call-request] Đã gửi banner group_call_started → room ${resolvedConvId}, messageId=${createdMessageId}`);
+      } catch (err) {
+        console.error("[group-call-request] Không thể lưu group_call_started:", err.message);
+        groupCallBannerSaved.delete(roomId); // rollback để có thể thử lại lần sau
+      }
+    } else {
+      console.log(`[group-call-request] Banner đã được lưu cho roomId=${roomId}, bỏ qua.`);
+    }
+
+    // Khởi tạo tracking phòng gọi nhóm (caller là member đầu tiên)
+    if (!activeGroupCallRooms.has(roomId)) {
+      activeGroupCallRooms.set(roomId, {
+        conversationId: resolvedConvId,
+        callerId: String(payload.callerId),
+        startTime: Date.now(),
+        membersCount: 1,  // caller đã vào phòng
+        messageId: createdMessageId,
+      });
+      console.log(`[group-call-request] Khởi tạo tracking phòng ${roomId}, members=1, messageId=${createdMessageId}`);
+    } else {
+      const r = activeGroupCallRooms.get(roomId);
+      if (r && !r.messageId && createdMessageId) {
+        r.messageId = createdMessageId;
+      }
+    }
+
+    // ── Emit call-accepted back to caller để họ có thể tham gia phòng ngay ──
+    let token = "";
+    let appId = 0;
+    try {
+      appId = Number(process.env.ZEGO_APP_ID);
+      const serverSecret = process.env.ZEGO_SERVER_SECRET;
+      if (appId && serverSecret) {
+        token = generateToken04(appId, String(payload.callerId), serverSecret, 3600, "");
+      }
+    } catch (err) {
+      console.error("[group-call-request] Lỗi sinh token cho caller:", err.message);
+    }
+
+    const callerPayload = {
+      roomId,
+      callerId: String(payload.callerId),
+      receiverId: String(groupId),
+      receiverName: payload.callerName || "",
+      token,
+      appId,
+      isGroupCall: true,
+      callType: data.callType || "video",
+    };
+
+    emitToUserSockets(String(payload.callerId), "call-accepted", callerPayload);
+    console.log(
+      `[group-call-request] Đã emit call-accepted cho caller ${payload.callerId} ` +
+      `(token=${token.substring(0, 20)}..., appId=${appId})`,
+    );
+
     _respond(callback, true);
   });
 
-  const handleCallAccept = (data = {}, callback) => {
+  // ── join_group_call: thành viên bấm [Tham gia] và vào phòng Zego ──────────
+  socket.on("join_group_call", (data = {}, callback) => {
+    const roomId = String(data.roomId || "").trim();
+    if (!roomId) { _respond(callback, false, "roomId required"); return; }
+
+    const room = activeGroupCallRooms.get(roomId);
+    if (!room) {
+      // Phòng chưa được track (có thể server restart) — tạo mới
+      // Lấy conversationId từ payload hoặc từ roomToConversation map (do group-call-request đã lưu)
+      const conversationId = String(data.conversationId || roomToConversation.get(roomId) || "");
+      activeGroupCallRooms.set(roomId, {
+        conversationId,
+        callerId: String(data.userId || ""),
+        startTime: Date.now(),
+        membersCount: 1,
+      });
+      // Đồng thời track vào activeRooms để calculateDuration dùng chung
+      activeRooms.set(roomId, { startTime: Date.now(), type: "group" });
+      if (conversationId) {
+        roomToConversation.set(roomId, conversationId);
+      }
+      console.log(`[join_group_call] Tạo mới tracking cho roomId=${roomId}, conversationId=${conversationId}`);
+    } else {
+      room.membersCount += 1;
+      console.log(`[join_group_call] userId=${data.userId} vào phòng ${roomId}, members=${room.membersCount}`);
+    }
+
+    _respond(callback, true);
+  });
+
+  // ── leave_group_call: thành viên rời phòng gọi nhóm ─────────────────────
+  // ============================================================
+  // ✅ SERVER-AUTHORITATIVE: Backend quản lý trạng thái cuộc gọi nhóm
+  // ============================================================
+  socket.on("leave_group_call", async (data = {}, callback) => {
+    const roomId = String(data.roomId || "").trim();
+    if (!roomId) { _respond(callback, false, "roomId required"); return; }
+
+    const room = activeGroupCallRooms.get(roomId);
+    if (!room) {
+      console.warn(`[leave_group_call] Không tìm thấy room ${roomId} trong tracking.`);
+      _respond(callback, true);
+      return;
+    }
+
+    // ============================================================
+    // ✅ Guard: Chỉ xử lý 1 lần - nếu room đã pending cleanup → bỏ qua
+    // ============================================================
+    if (room.cleaned) {
+      console.log(`[leave_group_call] Room đã được cleanup trước đó, bỏ qua. roomId=${roomId}`);
+      _respond(callback, true);
+      return;
+    }
+
+    // ============================================================
+    // ✅ Cập nhật membersCount CHÍNH XÁC trước khi kiểm tra
+    // ============================================================
+    room.membersCount = Math.max(0, room.membersCount - 1);
+    const isLastMember = room.membersCount === 0;
+
+    console.log(`[leave_group_call] userId=${data.userId} rời phòng ${roomId}, members còn lại=${room.membersCount}`);
+
+    // ============================================================
+    // ✅ Emit 'call-ended' CHO NGƯỜI RỜI ĐI để họ cleanup UI
+    // ============================================================
+    // Người rời đi cần nhận 'call-ended' → SocketContext.handleCallEnded
+    // → gracefulLeave() → setActiveCall(null) → unmount VideoCallRoom
+    emitToUserSockets(data.userId, "call-ended", {
+      roomId,
+      callerId: room.callerId,
+      reason: isLastMember ? "ended" : "left",
+      duration: Math.round((Date.now() - room.startTime) / 1000),
+    });
+
+    console.log(`[leave_group_call] ✅ Emitted call-ended to user ${data.userId}`);
+
+    // ============================================================
+    // ✅ CHỈ người cuối cùng rời → cập nhật call_log (started → completed/missed)
+    // ============================================================
+    if (isLastMember) {
+      const durationSec = Math.round((Date.now() - room.startTime) / 1000);
+      const status = durationSec >= 3 ? "completed" : "missed";
+      console.log(`[leave_group_call] 🎯 Người cuối cùng rời! Cập nhật call_log: status=${status}, duration=${durationSec}s`);
+
+      const convId = room.conversationId || String(data.conversationId || "");
+
+      // Mark room as cleaned TRƯỚC KHI emit để ngăn double-processing
+      room.cleaned = true;
+
+      // Dọn memory TRƯỚC KHI emit để tránh race condition
+      activeGroupCallRooms.delete(roomId);
+      activeRooms.delete(roomId);
+      groupCallBannerSaved.delete(roomId);
+      roomToConversation.delete(roomId);
+      roomStartedAt.delete(roomId);
+
+      try {
+        // Cập nhật message cũ (status=started) → completed/missed
+        const updatedMsg = await updateCallLogMessage({
+          conversationId: convId,
+          roomId,
+          status,
+          durationSec,
+          messageId: room.messageId,
+        });
+
+        // ============================================================
+        // ✅ Emit update_message ĐẾN TẤT CẢ thành viên trong nhóm
+        // Bao gồm cả những người không tham gia nhưng đang thấy banner
+        // ============================================================
+        if (updatedMsg) {
+          // Phát đến conversation room — TẤT CẢ thành viên nhóm
+          io.to(convId).emit("update_message", updatedMsg);
+          console.log(`✅ [leave_group_call] Emit update_message đến room ${convId}`);
+
+          // DM fallback: emit số đảo room id
+          if (convId.startsWith("dm:")) {
+            const parts = convId.split(":");
+            if (parts.length >= 3) {
+              const reversed = `dm:${parts[2]}:${parts[1]}`;
+              if (reversed !== convId) {
+                io.to(reversed).emit("update_message", updatedMsg);
+              }
+            }
+          }
+        } else {
+          // Fallback: tạo call_log mới nếu không tìm thấy banner cũ
+          console.warn(`[leave_group_call] Không tìm thấy banner cũ, tạo call_log mới.`);
+          try {
+            const callLogItem = await saveCallLogMessage({
+              conversationId: convId,
+              senderId: room.callerId,
+              callData: { callType: "video", status, duration: durationSec },
+            });
+            io.to(convId).emit("receive_message", callLogItem);
+            console.log(`[leave_group_call] ✅ Created new call_log message`);
+          } catch (saveErr) {
+            console.error(`[leave_group_call] Lỗi tạo call_log mới:`, saveErr.message);
+          }
+        }
+      } catch (err) {
+        console.error(`❌ [leave_group_call] Lỗi cập nhật call_log:`, err.message);
+        // ⚠️ Vẫn tiếp tục - không block client
+      }
+    }
+
+    _respond(callback, true);
+  });
+
+  const handleCallAccept = async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     const callerId = String(data.callerId || "").trim();
     const receiverId = String(data.receiverId || "").trim();
@@ -635,16 +1239,44 @@ function handleSocketConnection(io, socket) {
     }
 
     record.status = "in_call";
+    record.startedAt = Date.now();
 
-    const payload = {
-      ...data,
+    // Track thời điểm bắt đầu cho việc tính duration
+    activeRooms.set(roomId, { startTime: Date.now(), type: "1vs1" });
+
+    // Lấy thông tin receiver để truyền receiverName cho caller
+    const receiverInfo = await getUserDisplayInfo(receiverId);
+
+    // Sinh RTC token phía server cho caller — caller không cần gọi API riêng
+    let token = "";
+    let appId = 0;
+    try {
+      appId = Number(process.env.ZEGO_APP_ID);
+      const serverSecret = process.env.ZEGO_SERVER_SECRET;
+      if (appId && serverSecret) {
+        token = generateToken04(appId, callerId, serverSecret, 3600, "");
+      }
+    } catch (err) {
+      console.error("[handleCallAccept] Lỗi sinh token cho caller:", err.message);
+    }
+
+    // Payload gửi cho người gọi (caller) — đầy đủ thông tin để khởi tạo ZegoUIKit
+    const callerPayload = {
       roomId,
-      callerId: record.callerId,
-      receiverId: receiverId || (record.receiverIds || [])[0] || "",
+      callerId,
+      receiverId,
+      receiverName: receiverInfo.displayName,
+      token,   // ← Zego RTC token cho caller
+      appId,   // ← Zego AppID cho caller
+      isGroupCall: data.isGroupCall,
+      callType: data.callType || "video",
     };
 
-    emitToUserSockets(record.callerId, "call-accepted", payload);
-    console.log(`[signal] Forwarded call-accepted to caller ${record.callerId}`);
+    emitToUserSockets(record.callerId, "call-accepted", callerPayload);
+    console.log(
+      `[signal] Forwarded call-accepted to caller ${record.callerId} ` +
+      `(token=${token.substring(0, 20)}..., appId=${appId}, receiverName=${receiverInfo.displayName})`,
+    );
 
     _respond(callback, true);
   };
@@ -652,7 +1284,43 @@ function handleSocketConnection(io, socket) {
   socket.on("call-accepted", handleCallAccept);
   socket.on("call-accept", handleCallAccept);
 
-  socket.on("call-reject", (data = {}, callback) => {
+  // ============================================================
+  // HELPER: Lưu call log vào DynamoDB và phát realtime
+  // Được gọi sau khi một cuộc gọi kết thúc (end, reject, cancel, timeout)
+  // ============================================================
+  const saveCallLog = async ({ conversationId, callerId, callType, status, durationSec = 0 }) => {
+    try {
+      console.log(`📞 [saveCallLog] Bắt đầu lưu: conversationId=${conversationId}, callerId=${callerId}, status=${status}, duration=${durationSec}s`);
+      const callLogItem = await saveCallLogMessage({
+        conversationId: String(conversationId),
+        senderId: String(callerId || "system"),
+        callData: {
+          callType: callType || "video",
+          status,
+          duration: Number(durationSec) || 0,
+        },
+      });
+      console.log(`✅ [saveCallLog] Đã lưu call log: messageId=${callLogItem?.messageId}`);
+
+      // Phát realtime tới tất cả người trong phòng
+      io.to(conversationId).emit("receive_message", callLogItem);
+
+      // DM fallback: emit số đảo room id
+      if (conversationId.startsWith("dm:")) {
+        const parts = conversationId.split(":");
+        if (parts.length >= 3) {
+          const reversedRoomId = `dm:${parts[2]}:${parts[1]}`;
+          if (reversedRoomId !== conversationId) {
+            io.to(reversedRoomId).emit("receive_message", callLogItem);
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`❌ [saveCallLog] Thất bại lưu call log:`, err.message, err.stack);
+    }
+  };
+
+  socket.on("call-reject", async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     if (!roomId) {
       _respond(callback, false, "roomId is required");
@@ -670,12 +1338,28 @@ function handleSocketConnection(io, socket) {
       ...data,
       roomId,
       reason: "rejected",
+      duration: 0,
     });
+
+    // ── Lưu Call Log (missed) vào DynamoDB ────────────────────────────────
+    // dùng data.conversationId (dm:...) — KHÔNG dùng roomId (call_1vs1_...)
+    const rejectConversationId = String(data.conversationId || record.conversationId || "");
+    if (!rejectConversationId) {
+      console.error(`❌ [call-reject] Thiếu conversationId, không thể lưu call log. data.conversationId=${data.conversationId}`);
+    } else {
+      await saveCallLog({
+        conversationId: rejectConversationId,
+        callerId: record.callerId,
+        callType: data.callType || "video",
+        status: "missed",
+        durationSec: 0,
+      });
+    }
 
     _respond(callback, true);
   });
 
-  socket.on("call-cancel", (data = {}, callback) => {
+  socket.on("call-cancel", async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     if (!roomId) {
       _respond(callback, false, "roomId is required");
@@ -689,16 +1373,33 @@ function handleSocketConnection(io, socket) {
     }
 
     clearActiveCall(roomId);
+    activeRooms.delete(roomId);
     emitToCallParticipants(record, "call-ended", {
       ...data,
       roomId,
       reason: "canceled",
+      duration: 0,
     });
+
+    // ── Lưu Call Log (canceled/missed) vào DynamoDB ───────────────────────
+    // dùng data.conversationId (dm:...) — KHÔNG dùng roomId (call_1vs1_...)
+    const cancelConversationId = String(data.conversationId || record.conversationId || "");
+    if (!cancelConversationId) {
+      console.error(`❌ [call-cancel] Thiếu conversationId, không thể lưu call log. data.conversationId=${data.conversationId}`);
+    } else {
+      await saveCallLog({
+        conversationId: cancelConversationId,
+        callerId: record.callerId,
+        callType: data.callType || "video",
+        status: "missed",
+        durationSec: 0,
+      });
+    }
 
     _respond(callback, true);
   });
 
-  socket.on("end-call", (data = {}, callback) => {
+  socket.on("end-call", async (data = {}, callback) => {
     const roomId = String(data.roomId || "").trim();
     if (!roomId) {
       _respond(callback, false, "roomId is required");
@@ -711,12 +1412,58 @@ function handleSocketConnection(io, socket) {
       return;
     }
 
+    // ============================================================
+    // ✅ Guard: Chỉ xử lý 1 lần - nếu call đã pending end → bỏ qua
+    // ============================================================
+    if (record.status === "ended") {
+      console.log(`[end-call] Call đã được end trước đó, bỏ qua double-emit. roomId=${roomId}`);
+      _respond(callback, true); // trả về success để client không retry
+      return;
+    }
+
+    // Mark as ended NGAY LẬP TỨC để tránh double-processing
+    record.status = "ended";
+
+    // Tính duration từ thời điểm bắt đầu (nếu record có startedAt)
+    const durationSec = record.startedAt
+      ? Math.floor((Date.now() - record.startedAt) / 1000)
+      : (Number(data.duration) || 0);
+
     clearActiveCall(roomId);
+    const calculatedDuration = calculateDuration(roomId); // dọn activeRooms.get(roomId)
+    const finalDuration = calculatedDuration > 0 ? calculatedDuration : durationSec;
+
+    // ============================================================
+    // ✅ Emit 'call-ended' CHO TẤT CẢ participants để cleanup Zego
+    // ============================================================
     emitToCallParticipants(record, "call-ended", {
       ...data,
       roomId,
       reason: "ended",
+      duration: finalDuration,
     });
+
+    console.log(`[end-call] ✅ Emitted call-ended to participants. roomId=${roomId}, duration=${finalDuration}s`);
+
+    // ── Lưu Call Log vào DynamoDB ──────────────────────────────────────────
+    // dùng data.conversationId (dm:...) — KHÔNG dùng roomId (call_1vs1_...)
+    const endConversationId = String(data.conversationId || record.conversationId || "");
+    if (!endConversationId) {
+      console.error(`❌ [end-call] Thiếu conversationId, không thể lưu call log. data.conversationId=${data.conversationId}`);
+    } else {
+      try {
+        await saveCallLog({
+          conversationId: endConversationId,
+          callerId: record.callerId || userIdKey,
+          callType: data.callType || "video",
+          status: "completed",
+          durationSec: finalDuration,
+        });
+        console.log(`[end-call] ✅ Call log saved. conversationId=${endConversationId}, duration=${finalDuration}s`);
+      } catch (err) {
+        console.error(`[end-call] Lỗi lưu call log:`, err.message);
+      }
+    }
 
     _respond(callback, true);
   });
@@ -731,10 +1478,199 @@ function handleSocketConnection(io, socket) {
   });
 
   // ============================================================
+  // LIVE LOCATION — Chia sẻ vị trí trực tiếp (realtime)
+  // KHÔNG lưu vào DB để tránh quá tải; chỉ broadcast trong room.
+  //
+  // Events:
+  //   start_live_location  { roomId }          → báo bắt đầu chia sẻ
+  //   update_live_location { roomId, lat, lng } → cập nhật tọa độ liên tục
+  //   stop_live_location   { roomId }          → dừng chia sẻ
+  // ============================================================
+
+  socket.on("start_live_location", async ({ roomId }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
+      return;
+    }
+    if (!userId) {
+      _respond(callback, false, "User not authenticated");
+      return;
+    }
+
+    // Kiểm tra membership trước khi cho phép chia sẻ
+    const isMember = await checkUserInGroup(roomId, userId);
+    if (!isMember) {
+      _respond(callback, false, "Not a member of this room");
+      return;
+    }
+
+    const senderInfo = await getUserDisplayInfo(userId);
+
+    // Thông báo cho các thành viên khác biết có người bắt đầu chia sẻ live location
+    socket.to(roomId).emit("live_location_started", {
+      roomId,
+      senderId: userId,
+      senderDisplayName: senderInfo.displayName,
+      senderAvatarUrl: senderInfo.avatarUrl,
+      startedAt: new Date().toISOString(),
+    });
+
+    console.log(`[live_location] User ${userId} started sharing in room ${roomId}`);
+    _respond(callback, true);
+  });
+
+  socket.on("update_live_location", async ({ roomId, lat, lng }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
+      return;
+    }
+    if (typeof lat !== "number" || typeof lng !== "number") {
+      _respond(callback, false, "lat và lng (number) là bắt buộc");
+      return;
+    }
+    if (!userId) {
+      _respond(callback, false, "User not authenticated");
+      return;
+    }
+
+    // Broadcast tọa độ mới đến tất cả thành viên khác trong phòng
+    // Không gửi lại cho người gửi (socket.to thay vì io.to)
+    socket.to(roomId).emit("live_location_updated", {
+      roomId,
+      senderId: userId,
+      lat,
+      lng,
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Không cần callback trong trường hợp này vì event xảy ra rất thường xuyên
+    _respond(callback, true);
+  });
+
+  socket.on("stop_live_location", async ({ roomId }, callback) => {
+    if (!roomId) {
+      _respond(callback, false, "roomId is required");
+      return;
+    }
+    if (!userId) {
+      _respond(callback, false, "User not authenticated");
+      return;
+    }
+
+    // Thông báo cho các thành viên khác biết người dùng đã dừng chia sẻ
+    socket.to(roomId).emit("live_location_stopped", {
+      roomId,
+      senderId: userId,
+      stoppedAt: new Date().toISOString(),
+    });
+
+    console.log(`[live_location] User ${userId} stopped sharing in room ${roomId}`);
+    _respond(callback, true);
+  });
+
+  // ============================================================
+  // MARK READ — đánh dấu tin nhắn đã đọc (Read Receipts)
+  // ============================================================
+  socket.on("mark_read", async ({ conversationId, messageId }, callback) => {
+    if (!conversationId) {
+      return _respond(callback, false, "conversationId is required");
+    }
+    if (!messageId) {
+      return _respond(callback, false, "messageId is required");
+    }
+    if (!userId) {
+      return _respond(callback, false, "User not authenticated");
+    }
+
+    // Server-side deduplication check
+    if (isDuplicateReadReceipt(conversationId, messageId, userId)) {
+      return _respond(callback, true); // Still respond OK but don't process
+    }
+
+    try {
+      // Verify membership
+      const isMember = await checkUserInGroup(conversationId, userId);
+      if (!isMember) {
+        return _respond(callback, false, "Not a member of this conversation");
+      }
+
+      // Get user display info for the reader
+      const readerInfo = await getUserDisplayInfo(userId);
+
+      // Save the read receipt
+      await saveReadReceipt({
+        conversationId,
+        messageId: String(messageId),
+        userId: String(userId),
+        readerName: readerInfo.displayName,
+        readerAvatar: readerInfo.avatarUrl,
+      });
+
+      console.log(`[mark_read] User ${userId} marked message ${messageId} as read in conversation ${conversationId}`);
+
+      // Determine the sender of the message to notify them
+      // For DM conversations, notify the other participant
+      if (conversationId.startsWith("dm:")) {
+        const parts = conversationId.split(":");
+        if (parts.length >= 3) {
+          const senderId = parts[1] === String(userId) ? parts[2] : parts[1];
+          // Emit to the sender's sockets
+          const readReceiptPayload = {
+            conversationId,
+            messageId: String(messageId),
+            readerId: String(userId),
+            readerName: readerInfo.displayName,
+            readerAvatar: readerInfo.avatarUrl,
+            readAt: new Date().toISOString(),
+          };
+
+          // Emit directly to the sender's sockets
+          emitToUserSockets(senderId, "message_read", readReceiptPayload);
+          console.log(`[mark_read] Notified sender ${senderId} that message ${messageId} was read`);
+        }
+      } else {
+        // For group chats, emit to the room so the sender can see who read their message
+        // The sender will receive this if they're in the room
+        socket.to(conversationId).emit("message_read", {
+          conversationId,
+          messageId: String(messageId),
+          readerId: String(userId),
+          readerName: readerInfo.displayName,
+          readerAvatar: readerInfo.avatarUrl,
+          readAt: new Date().toISOString(),
+        });
+      }
+
+      _respond(callback, true);
+    } catch (error) {
+      console.error("[mark_read] Error:", error.message);
+      _respond(callback, false, error.message);
+    }
+  });
+
+  // ============================================================
   // NGẮT KẾT NỐI
   // ============================================================
   socket.on("disconnect", () => {
     if (userIdKey) {
+      // Gửi user_stopped_typing cho tất cả các room mà user đang tham gia
+      // để người nhận không còn thấy "đang soạn tin" khi user offline
+      const rooms = Array.from(socket.rooms || []);
+      const userName = socket.user?.username || "";
+      rooms.forEach((roomId) => {
+        // Bỏ qua socket ID của chính socket này (không phải conversation room)
+        if (roomId === socket.id) return;
+        // Bỏ qua các room hệ thống (nếu có prefix đặc biệt)
+        if (roomId.startsWith("_")) return;
+
+        io.to(roomId).emit("user_stopped_typing", {
+          roomId,
+          userId,
+          userName,
+        });
+        console.log(`[typing] User ${userIdKey} disconnected - sent stopped_typing to room ${roomId}`);
+      });
+
       unregisterSocket(userIdKey, socket.id);
       console.log(
         `[socket] User ${userIdKey} disconnected socket ${socket.id}`,
@@ -745,10 +1681,12 @@ function handleSocketConnection(io, socket) {
       const calls = getCallsForUser(userIdKey);
       calls.forEach(({ roomId, record }) => {
         clearActiveCall(roomId);
+        const duration = calculateDuration(roomId);
         emitToCallParticipants(record, "call-ended", {
           roomId,
           reason: "disconnect",
           disconnectedUserId: userIdKey,
+          duration,
         });
       });
     }
@@ -846,6 +1784,53 @@ function notifyFriendAccepted(senderId, receiverInfo) {
   }
 }
 
+/**
+ * Join một user vào socket room
+ */
+function joinUserToRoom(userId, roomId) {
+  const io = getIO();
+  if (!io) return;
+  const sockets = onlineUsers.get(String(userId));
+  if (sockets && sockets.size > 0) {
+    for (const socketId of sockets) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) socket.join(roomId);
+    }
+  }
+}
+
+/**
+ * Kick một user ra khỏi socket room
+ */
+function leaveUserFromRoom(userId, roomId) {
+  const io = getIO();
+  if (!io) return;
+  const sockets = onlineUsers.get(String(userId));
+  if (sockets && sockets.size > 0) {
+    for (const socketId of sockets) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) socket.leave(roomId);
+    }
+  }
+}
+
+/**
+ * Emit sự kiện tới một room cụ thể
+ */
+function emitToRoom(roomId, event, payload) {
+  const io = getIO();
+  if (!io) return;
+  io.to(roomId).emit(event, payload);
+}
+
+/**
+ * Emit event call_log tới room cụ thể
+ */
+function emitCallLogToRoom(io, conversationId, callLogData) {
+  if (!io) return;
+  io.to(String(conversationId)).emit("receive_message", callLogData);
+}
+
 module.exports = {
   handleSocketConnection,
   socketAuthMiddleware,
@@ -855,4 +1840,10 @@ module.exports = {
   isUserOnline,
   notifyNewFriendRequest,
   notifyFriendAccepted,
+  joinUserToRoom,
+  leaveUserFromRoom,
+  emitToRoom,
+  roomToConversation,
+  roomStartedAt,
+  groupCallBannerSaved,
 };

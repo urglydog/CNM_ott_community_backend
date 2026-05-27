@@ -131,7 +131,7 @@
           "name": "DELETE unfriend",
           "request": {
             "method": "DELETE",
-            "url": "{{baseUrl}}/api/relationships/1"
+            "url": "{{baseUrl}}/api/friends/:friendshipId"
           }
         }
       ]

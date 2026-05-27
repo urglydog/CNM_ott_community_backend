@@ -31,7 +31,12 @@ async function getMessagesForChannel(req, res) {
 
 async function sendMessage(req, res) {
   try {
-    const message = await messageService.saveMessage(req.body);
+    // Chấp nhận replyTo từ body nếu có
+    const messageData = {
+      ...req.body,
+      // replyTo sẽ được xử lý trong messageService.saveMessage
+    };
+    const message = await messageService.saveMessage(messageData);
     const io = req.app.get("socketio");
     if (io) {
       io.to(message.conversationId).emit("receive_message", message);
@@ -81,7 +86,7 @@ async function searchMessagesGlobal(req, res) {
 
 /**
  * Gửi tin nhắn sticker.
- * Body: { senderId, conversationId, stickerData: { stickerId, stickerUrl, stickerPack, stickerName } }
+ * Body: { senderId, conversationId, stickerData: { stickerId, stickerUrl, stickerPack, stickerName }, replyTo? }
  */
 async function sendStickerMessage(req, res) {
   try {
@@ -113,6 +118,7 @@ async function sendStickerMessage(req, res) {
       contentType: "sticker",
       content: stickerData.stickerName || stickerData.stickerId || "[sticker]",
       stickerData,
+      replyTo: req.body.replyTo || null,
     });
 
     // Broadcast real-time
@@ -130,7 +136,7 @@ async function sendStickerMessage(req, res) {
 
 /**
  * Gửi tin nhắn emoji.
- * Body: { senderId, conversationId, content (emoji string) }
+ * Body: { senderId, conversationId, content (emoji string), replyTo? }
  */
 async function sendEmojiMessage(req, res) {
   try {
@@ -152,6 +158,7 @@ async function sendEmojiMessage(req, res) {
       conversationId,
       contentType: "emoji",
       content: req.body.content.trim(),
+      replyTo: req.body.replyTo || null,
     });
 
     // Broadcast real-time
@@ -197,11 +204,15 @@ async function sendFileMessage(req, res) {
         ? `channel:${channelId}`
         : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`);
 
+    const senderInfo = await messageService.enrichSenderInfo(senderId);
+
     const messagePayload = {
       id: savedMessage.id || savedMessage.message_id || Date.now(),
       conversationId,
       senderId: savedMessage.sender_id || senderId,
-      contentType: savedMessage.type || "file",
+      senderDisplayName: senderInfo.senderDisplayName,
+      senderAvatarUrl: senderInfo.senderAvatarUrl,
+      contentType: savedMessage.contentType || savedMessage.type || "file",
       content: req.file.originalname,
       attachments: savedMessage.attachments || [
         {
@@ -210,7 +221,7 @@ async function sendFileMessage(req, res) {
           size: uploadedFile.size,
         },
       ],
-      createdAt: savedMessage.created_at || new Date().toISOString(),
+      createdAt: savedMessage.created_at || savedMessage.createdAt || new Date().toISOString(),
     };
 
     const io = req.app.get("socketio");
@@ -228,6 +239,172 @@ async function sendFileMessage(req, res) {
   }
 }
 
+/**
+ * Gửi tin nhắn vị trí tĩnh (Current Location).
+ * Body: { conversationId, locationData: { lat: number, lng: number, label?: string }, replyTo? }
+ *
+ * Luồng:
+ *  1. Validate lat/lng từ client (navigator.geolocation.getCurrentPosition)
+ *  2. Lưu tin nhắn với contentType="location" vào DynamoDB
+ *  3. Broadcast qua Socket.io để người nhận thấy ngay
+ */
+async function sendLocationMessage(req, res) {
+  try {
+    const senderId = req.body.senderId || req.user?.userId || req.user?.id;
+    const conversationId = req.body.conversationId || req.body.groupId;
+    const locationData = req.body.locationData || req.body.location; // { lat, lng, label? }
+
+    if (!senderId) {
+      return res.status(400).json({ message: "senderId is required" });
+    }
+    if (!conversationId) {
+      return res.status(400).json({ message: "conversationId is required" });
+    }
+    // Kiểm tra locationData có hợp lệ không
+    if (
+      !locationData ||
+      typeof locationData.lat !== "number" ||
+      typeof locationData.lng !== "number"
+    ) {
+      return res.status(400).json({
+        message: "locationData với lat và lng (number) là bắt buộc",
+      });
+    }
+
+    // Lưu tin nhắn vị trí vào DB
+    const message = await messageService.saveMessage({
+      senderId,
+      conversationId,
+      contentType: "location",
+      content: locationData.label || `📍 ${locationData.lat.toFixed(6)}, ${locationData.lng.toFixed(6)}`,
+      locationData: {
+        lat: locationData.lat,
+        lng: locationData.lng,
+        label: locationData.label || null,
+      },
+      replyTo: req.body.replyTo || null,
+    });
+
+    // Broadcast realtime cho tất cả thành viên trong phòng
+    const io = req.app.get("socketio");
+    if (io) {
+      io.to(conversationId).emit("receive_message", message);
+    }
+    await notifyMessageCreated(message, io);
+
+    res.status(201).json(message);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
+/**
+ * Bắt đầu phên live location — tạo tin nhắn với isLive: true.
+ * Body: { conversationId, locationData: { lat, lng, label? } }
+ * Trả về tin nhắn + messageId để frontend lưu lại và dùng khi dừng.
+ */
+async function startLiveLocationMessage(req, res) {
+  try {
+    const senderId = req.body.senderId || req.user?.userId || req.user?.id;
+    const conversationId = req.body.conversationId || req.body.groupId;
+    const locationData = req.body.locationData || req.body.location; // { lat, lng, label? }
+
+    if (!senderId) {
+      return res.status(400).json({ message: "senderId is required" });
+    }
+    if (!conversationId) {
+      return res.status(400).json({ message: "conversationId is required" });
+    }
+    if (
+      !locationData ||
+      typeof locationData.lat !== "number" ||
+      typeof locationData.lng !== "number"
+    ) {
+      return res.status(400).json({
+        message: "locationData với lat và lng (number) là bắt buộc",
+      });
+    }
+
+    // Lưu tin nhắn live location vào DB
+    const message = await messageService.saveMessage({
+      senderId,
+      conversationId,
+      contentType: "location",
+      content: `📍 ${locationData.label || "Vị trí trực tiếp"}`,
+      locationData: {
+        lat: locationData.lat,
+        lng: locationData.lng,
+        label: locationData.label || null,
+        isLive: true,
+        liveUntil: null, // sẽ cập nhật khi dừng
+      },
+      replyTo: req.body.replyTo || null,
+    });
+
+    // Broadcast realtime cho tất cả thành viên trong phòng
+    const io = req.app.get("socketio");
+    if (io) {
+      io.to(conversationId).emit("receive_message", message);
+    }
+    await notifyMessageCreated(message, io);
+
+    res.status(201).json(message);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
+/**
+ * Dừng phên live location — cập nhật isLive: false, liveUntil: now.
+ * PATCH /api/messages/location/live/:messageId/stop
+ * Body: { conversationId }
+ */
+async function stopLiveLocationMessage(req, res) {
+  try {
+    const { messageId } = req.params;
+    const conversationId = req.body.conversationId;
+
+    if (!messageId) {
+      return res.status(400).json({ message: "messageId is required" });
+    }
+    if (!conversationId) {
+      return res.status(400).json({ message: "conversationId is required" });
+    }
+
+    const stoppedAt = new Date().toISOString();
+    const updatedMsg = await messageService.stopLiveLocationMessage(
+      conversationId,
+      messageId,
+      stoppedAt
+    );
+
+    if (!updatedMsg) {
+      return res.status(404).json({ message: "Không tìm thấy tin nhắn live location" });
+    }
+
+    // Broadcast cập nhật tới cả 2 phía qua socket
+    const io = req.app.get("socketio");
+    if (io) {
+      io.to(conversationId).emit("live_location_message_stopped", {
+        conversationId,
+        messageId: String(messageId),
+        locationData: updatedMsg.locationData,
+      });
+    }
+
+    res.json({
+      message: "Live location đã được dừng",
+      data: {
+        id: updatedMsg.id,
+        conversationId,
+        locationData: updatedMsg.locationData,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+}
+
 module.exports = {
   getMessagesForConversation,
   getMessagesForChannel,
@@ -237,4 +414,7 @@ module.exports = {
   sendFileMessage,
   sendStickerMessage,
   sendEmojiMessage,
+  sendLocationMessage,
+  startLiveLocationMessage,
+  stopLiveLocationMessage,
 };

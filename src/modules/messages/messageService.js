@@ -1,5 +1,5 @@
 const { ddbDocClient } = require("../../config/awsConfig");
-const { PutCommand, GetCommand, ScanCommand } = require("@aws-sdk/lib-dynamodb");
+const { PutCommand, GetCommand, ScanCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
 const { PutObjectCommand } = require("@aws-sdk/client-s3");
 const { randomUUID } = require("crypto");
 const { s3Client } = require("../../config/awsConfig");
@@ -22,6 +22,13 @@ const VALID_CONTENT_TYPES = new Set([
   "video",
   "emoji",
   "sticker",
+  "system",
+  // Loại tin nhắn vị trí — lưu tọa độ {lat, lng} dưới dạng locationData
+  "location",
+  // Loại tin nhắn log cuộc gọi từ ZegoCloud webhook
+  "call_log",
+  // Loại tin nhắn bình chọn (poll)
+  "poll",
 ]);
 
 /**
@@ -34,6 +41,50 @@ function normalizeContentType(raw) {
     .toLowerCase()
     .trim();
   return VALID_CONTENT_TYPES.has(ct) ? ct : "text";
+}
+
+/**
+ * Lấy thông tin cơ bản của tin nhắn gốc để hiển thị trong reply preview.
+ * @param {string} conversationId - ID của cuộc trò chuyện
+ * @param {string|number} replyToId - ID của tin nhắn cần trả lời
+ * @returns {Promise<object|null>} - Thông tin cơ bản của tin nhắn gốc
+ */
+async function getRepliedMessageInfo(conversationId, replyToId) {
+  if (!replyToId) return null;
+
+  try {
+    const res = await ddbDocClient.send(
+      new GetCommand({
+        TableName: MESSAGES_TABLE,
+        Key: { conversationId },
+      }),
+    );
+
+    if (!res.Item || !Array.isArray(res.Item.messages)) {
+      return null;
+    }
+
+    const originalMessage = res.Item.messages.find(
+      (msg) => String(msg.id) === String(replyToId),
+    );
+
+    if (!originalMessage) return null;
+
+    const senderInfo = await enrichSenderInfo(originalMessage.senderId);
+
+    return {
+      id: originalMessage.id,
+      content: originalMessage.content,
+      contentType: originalMessage.contentType,
+      senderId: originalMessage.senderId,
+      senderDisplayName: senderInfo.senderDisplayName,
+      senderAvatarUrl: senderInfo.senderAvatarUrl,
+      attachments: originalMessage.attachments || null,
+    };
+  } catch (error) {
+    console.error("[getRepliedMessageInfo] Error fetching replied message:", error.message);
+    return null;
+  }
 }
 
 /**
@@ -125,8 +176,47 @@ async function saveMessage(payload) {
     validateEmojiData(payload.content);
   }
 
+  // Validate poll: phải có pollData với pollOptions (tối thiểu 2 options)
+  if (contentType === "poll") {
+    const pollData = payload.pollData;
+    if (!pollData || typeof pollData !== "object") {
+      throw new Error("pollData là bắt buộc cho tin nhắn bình chọn");
+    }
+    if (!Array.isArray(pollData.pollOptions) || pollData.pollOptions.length < 2) {
+      throw new Error("pollOptions phải có ít nhất 2 lựa chọn");
+    }
+    // Mỗi option phải có text
+    for (const option of pollData.pollOptions) {
+      if (!option.text || typeof option.text !== "string" || !option.text.trim()) {
+        throw new Error("Mỗi lựa chọn bình chọn phải có nội dung text");
+      }
+    }
+    // Content (question) là bắt buộc cho poll
+    if (!payload.content || !String(payload.content).trim()) {
+      throw new Error("content (câu hỏi bình chọn) là bắt buộc");
+    }
+  }
+
+  // Validate location: phải có locationData với lat và lng hợp lệ
+  if (contentType === "location") {
+    const loc = payload.locationData;
+    if (!loc || typeof loc.lat !== "number" || typeof loc.lng !== "number") {
+      throw new Error("locationData với lat và lng (number) là bắt buộc cho tin nhắn vị trí");
+    }
+    // Content mặc định hiển thị tọa độ nếu không được truyền vào
+    if (!payload.content) {
+      payload.content = `📍 ${loc.lat.toFixed(6)}, ${loc.lng.toFixed(6)}`;
+    }
+  }
+
   const createdAt = new Date().toISOString();
   const id = Date.now();
+
+  // Lấy thông tin tin nhắn gốc nếu có replyTo
+  let replyTo = null;
+  if (payload.replyTo) {
+    replyTo = await getRepliedMessageInfo(payload.conversationId, payload.replyTo);
+  }
 
   const newMessage = {
     id,
@@ -137,8 +227,40 @@ async function saveMessage(payload) {
     ...(contentType === "sticker" && payload.stickerData
       ? { stickerData: { ...payload.stickerData } }
       : {}),
+    // locationData chỉ tồn tại khi contentType === "location" — lưu {lat, lng, label?, isLive?, liveUntil?}
+    ...(contentType === "location" && payload.locationData
+      ? {
+          locationData: {
+            lat: payload.locationData.lat,
+            lng: payload.locationData.lng,
+            label: payload.locationData.label || null,
+            // Fields live location
+            isLive: payload.locationData.isLive === true,
+            liveUntil: payload.locationData.liveUntil || null,
+          },
+        }
+      : {}),
+    // pollData chỉ tồn tại khi contentType === "poll" — lưu pollOptions và pollSettings
+    ...(contentType === "poll" && payload.pollData
+      ? {
+          pollData: {
+            pollOptions: payload.pollData.pollOptions.map((opt) => ({
+              id: opt.id || String(Date.now() + Math.random()),
+              text: String(opt.text).trim(),
+              voterIds: Array.isArray(opt.voterIds) ? opt.voterIds : [],
+            })),
+            pollSettings: {
+              multipleChoice: payload.pollData.pollSettings?.multipleChoice === true,
+              allowAddOption: payload.pollData.pollSettings?.allowAddOption === true,
+            },
+          },
+        }
+      : {}),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
+    // replyTo: lưu ID của tin nhắn gốc đang được trả lời
+    replyTo: payload.replyTo || null,
+    mentions: Array.isArray(payload.mentions) ? payload.mentions.map(String) : [],
     createdAt,
   };
 
@@ -176,8 +298,16 @@ async function saveMessage(payload) {
     contentType: newMessage.contentType,
     content: newMessage.content,
     ...(newMessage.stickerData ? { stickerData: newMessage.stickerData } : {}),
+    // Trả về locationData để frontend render bản đồ
+    ...(newMessage.locationData ? { locationData: newMessage.locationData } : {}),
+    // Trả về pollData để frontend hiển thị bình chọn
+    ...(newMessage.pollData ? { pollData: newMessage.pollData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
+    replyTo: newMessage.replyTo,
+    mentions: newMessage.mentions,
+    // Trả về đầy đủ thông tin replyTo đã populate để frontend hiển thị
+    ...(replyTo ? { replyToMessage: replyTo } : {}),
     createdAt: newMessage.createdAt,
   };
 }
@@ -211,22 +341,57 @@ async function getMessagesForConversation(conversationId, currentUserId) {
     return aTime.localeCompare(bTime);
   });
 
-  // Enrich mỗi tin nhắn với displayName/avatarUrl của người gửi
+  // Build a map of messageId -> message for quick lookup of replied messages
+  const messageMap = new Map();
+  messages.forEach((msg) => {
+    messageMap.set(String(msg.id), msg);
+  });
+
+  // Enrich mỗi tin nhắn với displayName/avatarUrl của người gửi và thông tin replyTo
   const enriched = await Promise.all(
     messages.map(async (msg) => {
       const info = await enrichSenderInfo(msg.senderId);
+
+      // Lấy thông tin tin nhắn gốc nếu có replyTo
+      let replyToMessage = null;
+      if (msg.replyTo) {
+        const repliedMsg = messageMap.get(String(msg.replyTo));
+        if (repliedMsg) {
+          const repliedSenderInfo = await enrichSenderInfo(repliedMsg.senderId);
+          replyToMessage = {
+            id: repliedMsg.id,
+            content: repliedMsg.content,
+            contentType: repliedMsg.contentType,
+            senderId: repliedMsg.senderId,
+            senderDisplayName: repliedSenderInfo.senderDisplayName,
+            senderAvatarUrl: repliedSenderInfo.senderAvatarUrl,
+            attachments: repliedMsg.attachments || null,
+          };
+        }
+      }
+
       return {
         id: msg.id,
         conversationId,
         senderId: msg.senderId,
         contentType: msg.contentType,
+        messageType: msg.messageType,           // ← cần cho call_log UI
         content: msg.content,
+        callData: msg.callData || null,          // ← cần cho call_log UI
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
+        // locationData được giữ nguyên khi đọc lại từ DB
+        ...(msg.locationData ? { locationData: msg.locationData } : {}),
+        // pollData được giữ nguyên khi đọc lại từ DB
+        ...(msg.pollData ? { pollData: msg.pollData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
+        replyTo: msg.replyTo || null,
+        mentions: msg.mentions || [],
         createdAt: msg.createdAt,
         senderDisplayName: info.senderDisplayName,
         senderAvatarUrl: info.senderAvatarUrl,
+        // Trả về đầy đủ thông tin replyTo đã populate
+        ...(replyToMessage ? { replyToMessage } : {}),
       };
     }),
   );
@@ -234,11 +399,20 @@ async function getMessagesForConversation(conversationId, currentUserId) {
   return enriched;
 }
 
-function resolveAttachmentType(mimetype) {
-  if (!mimetype) return "file";
-  if (mimetype.startsWith("image/")) return "image";
-  if (mimetype.startsWith("video/")) return "video";
-  if (mimetype.startsWith("audio/")) return "voice";
+function resolveAttachmentType(mimetype, originalname) {
+  if (mimetype) {
+    if (mimetype.startsWith("image/")) return "image";
+    if (mimetype.startsWith("video/")) return "video";
+    if (mimetype.startsWith("audio/")) return "voice";
+  }
+  
+  if (originalname) {
+    const ext = String(originalname).split('.').pop().toLowerCase();
+    if (['wav', 'mp3', 'm4a', 'aac', 'webm', 'ogg'].includes(ext)) return "voice";
+    if (['mp4', 'mov', 'avi'].includes(ext)) return "video";
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return "image";
+  }
+  
   return "file";
 }
 
@@ -295,8 +469,8 @@ async function saveFileMessage(data) {
     ? `channel:${channelId}`
     : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`;
 
-  const attachmentType = resolveAttachmentType(data.attachment.mimetype);
-  const messageType = attachmentType === "voice" ? "voice" : attachmentType === "video" ? "video" : "file";
+  const attachmentType = resolveAttachmentType(data.attachment.mimetype, data.attachment.originalname);
+  const messageType = attachmentType;
   const persistedMessageId = randomUUID();
   const createdAt = new Date().toISOString();
 
@@ -529,6 +703,7 @@ async function searchMessagesInConversation({
         contentType: msg.contentType,
         content: msg.content,
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
+        ...(msg.pollData ? { pollData: msg.pollData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         createdAt: msg.createdAt,
@@ -637,6 +812,7 @@ async function searchMessagesForUserGlobal({
         contentType: msg.contentType,
         content: msg.content,
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
+        ...(msg.pollData ? { pollData: msg.pollData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         createdAt: msg.createdAt,
@@ -657,12 +833,223 @@ async function searchMessagesForUserGlobal({
     data: enriched,
   };
 }
+/**
+ * Dừng phên chia sẻ vị trí trực tiếp.
+ * Cập nhật field locationData.isLive = false và locationData.liveUntil = now
+ * cho tin nhắn tương ứng trong DynamoDB.
+ *
+ * @param {string} conversationId - ID phòng
+ * @param {string|number} messageId - ID tin nhắn live location
+ * @param {string} stoppedAt - ISO string thời điểm dừng
+ * @returns {Promise<object|null>} tin nhắn đã cập nhật, hoặc null nếu không tìm thấy
+ */
+async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
+  if (!conversationId || !messageId) {
+    throw new Error("conversationId và messageId là bắt buộc");
+  }
+
+  const res = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MESSAGES_TABLE,
+      Key: { conversationId },
+    })
+  );
+
+  if (!res.Item || !Array.isArray(res.Item.messages)) {
+    return null;
+  }
+
+  const messages = res.Item.messages.slice();
+  const idx = messages.findIndex((m) => String(m.id) === String(messageId));
+  if (idx === -1) return null;
+
+  const msg = messages[idx];
+  if (!msg.locationData) return null;
+
+  // Cập nhật in-place
+  messages[idx] = {
+    ...msg,
+    locationData: {
+      ...msg.locationData,
+      isLive: false,
+      liveUntil: stoppedAt || new Date().toISOString(),
+    },
+  };
+
+  // Ghi lại toàn bộ mảng messages (DynamoDB document store)
+  await ddbDocClient.send(
+    new PutCommand({
+      TableName: MESSAGES_TABLE,
+      Item: {
+        conversationId,
+        messages,
+      },
+    })
+  );
+
+  return messages[idx];
+}
+
+/**
+ * Lưu log cuộc gọi (Call Log) từ ZegoCloud Webhook vào DynamoDB.
+ * @param {object} payload - { conversationId, senderId, callData: { callType, status, duration } }
+ */
+async function saveCallLogMessage({ conversationId, senderId, callData }) {
+  // ── Validate & Sanitize đầu vào ──────────────────────────────────────────
+  if (!conversationId) throw new Error("[saveCallLogMessage] conversationId is required");
+  if (!callData) throw new Error("[saveCallLogMessage] callData is required");
+
+  // senderId có thể thiếu từ ZegoCloud webhook → fallback về 'zego_webhook'
+  const resolvedSenderId = senderId && String(senderId).trim()
+    ? String(senderId).trim()
+    : "zego_webhook";
+
+  const id = Date.now();
+  const messageId = randomUUID();
+  const createdAt = new Date().toISOString();
+
+  const newMessage = {
+    id,
+    messageId,
+    senderId: resolvedSenderId,
+    contentType: "call_log", // backward compatible
+    messageType: "call_log", // user specific request
+    content: "Cuộc gọi " + (callData.callType === "video" ? "video" : "thoại"),
+    callData: {
+      callType: callData.callType || "voice",
+      status: callData.status || "missed",
+      duration: Number(callData.duration) || 0,
+      // Giữ roomId nếu có (dùng cho banner group_call_started → nút [Tham gia])
+      ...(callData.roomId ? { roomId: String(callData.roomId) } : {}),
+      // Giữ messageType nếu có (phân biệt group_call_started vs call_log thông thường)
+      ...(callData.messageType ? { messageType: String(callData.messageType) } : {}),
+    },
+    createdAt,
+  };
+
+  // ── Bước 1: Lấy document hiện tại từ DynamoDB ───────────────────────────
+  let messages = [];
+  try {
+    const getRes = await ddbDocClient.send(
+      new GetCommand({
+        TableName: MESSAGES_TABLE,
+        Key: { conversationId: String(conversationId) },
+      })
+    );
+    const existing = getRes.Item || { conversationId: String(conversationId), messages: [] };
+    messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
+  } catch (getError) {
+    console.error("❌ [DYNAMODB GET ERROR] Không đọc được messages cũ:", getError.message, getError.stack);
+    // Tiếp tục với mảng rỗng — sẽ tạo document mới
+    messages = [];
+  }
+
+  messages.push(newMessage);
+
+  // ── Bước 2: Ghi document cập nhật vào DynamoDB ──────────────────────────
+  const itemToSave = {
+    conversationId: String(conversationId),
+    messages,
+  };
+
+  console.log("📦 [DYNAMODB PAYLOAD]:", JSON.stringify(itemToSave, null, 2));
+
+  try {
+    await ddbDocClient.send(
+      new PutCommand({
+        TableName: MESSAGES_TABLE,
+        Item: itemToSave,
+      })
+    );
+    console.log(`✅ [DYNAMODB PUT OK] conversationId=${conversationId}, messageId=${messageId}`);
+  } catch (error) {
+    console.error("❌ [DYNAMODB ERROR]:", error.message, error.stack);
+    throw error; // re-throw để controller biết lưu thất bại
+  }
+
+  // ── Bước 3: Enrich thông tin người gọi để trả về Frontend ───────────────
+  const info = await enrichSenderInfo(resolvedSenderId);
+  return {
+    ...newMessage,
+    conversationId: String(conversationId),
+    senderDisplayName: info.senderDisplayName,
+    senderAvatarUrl: info.senderAvatarUrl,
+  };
+}
+
+/**
+ * Tìm tin nhắn group_call_started (callData.roomId === roomId && status === "started")
+ * trong conversation và UPDATE tại chỗ thành status completed/missed với duration.
+ * KHÔNG tạo tin nhắn mới — chỉ cập nhật existing message.
+ *
+ * @returns {object|null} - Message đã được update, hoặc null nếu không tìm thấy
+ */
+async function updateCallLogMessage({ conversationId, roomId, status, durationSec, messageId }) {
+  if (!conversationId || !messageId) throw new Error("[updateCallLogMessage] conversationId và messageId là bắt buộc");
+
+  // Bước 1: Đọc document hiện tại
+  const getRes = await ddbDocClient.send(
+    new GetCommand({ TableName: MESSAGES_TABLE, Key: { conversationId: String(conversationId) } })
+  );
+  const existing = getRes.Item || { conversationId: String(conversationId), messages: [] };
+  const messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
+
+  // Bước 2: Tìm message cần update - BẮT BUỘC theo messageId
+  const targetIdx = messages.findIndex(
+    (m) => String(m.messageId) === String(messageId)
+  );
+
+  if (targetIdx === -1) {
+    console.warn(`[updateCallLogMessage] Không tìm thấy message cho messageId=${messageId} trong ${conversationId}`);
+    return null;
+  }
+
+  // Bước 3: Update tại chỗ
+  const updatedMsg = {
+    ...messages[targetIdx],
+    callData: {
+      ...messages[targetIdx].callData,
+      status,
+      duration: Number(durationSec) || 0,
+      // Xóa messageType "group_call_started" — giờ là call_log hoàn thành
+      messageType: undefined,
+    },
+    contentType: "call_log",
+    messageType: "call_log",
+    content: "Cuộc gọi " + (messages[targetIdx].callData?.callType === "video" ? "video" : "thoại"),
+  };
+  // Dọn undefined keys
+  if (updatedMsg.callData.messageType === undefined) delete updatedMsg.callData.messageType;
+
+  messages[targetIdx] = updatedMsg;
+
+  // Bước 4: Ghi lại DynamoDB
+  await ddbDocClient.send(
+    new PutCommand({ TableName: MESSAGES_TABLE, Item: { conversationId: String(conversationId), messages } })
+  );
+  console.log(`✅ [updateCallLogMessage] Updated messageId=${updatedMsg.messageId} → status=${status}, duration=${durationSec}s`);
+
+  // Bước 5: Enrich sender info để trả về
+  const info = await enrichSenderInfo(updatedMsg.senderId);
+  return {
+    ...updatedMsg,
+    conversationId: String(conversationId),
+    senderDisplayName: info.senderDisplayName,
+    senderAvatarUrl: info.senderAvatarUrl,
+  };
+}
+
 module.exports = {
   saveMessage,
+  saveCallLogMessage,
+  updateCallLogMessage,
   saveStickerMessage,
   getMessagesForConversation,
+  getRepliedMessageInfo,
   uploadFileToS3,
   saveFileMessage,
   searchMessagesInConversation,
   searchMessagesForUserGlobal,
+  stopLiveLocationMessage,
+  enrichSenderInfo,
 };

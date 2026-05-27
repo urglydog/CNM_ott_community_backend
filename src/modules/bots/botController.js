@@ -13,6 +13,7 @@ async function chatWithBot(req, res) {
     return res.status(200).json({
       sender: "AI Bot",
       content: result,
+      reply: result, // For frontend compatibility
     });
   } catch (error) {
     // eslint-disable-next-line no-console

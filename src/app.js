@@ -13,6 +13,7 @@ const { Server } = require("socket.io");
 const authRoutes = require("./modules/auth/authRoutes");
 const userRoutes = require("./modules/users/userRoutes");
 const friendRoutes = require("./modules/users/friendRoutes");
+const qrFriendRoutes = require("./modules/users/qrFriendRoutes");
 const messageRoutes = require("./modules/messages/messageRoutes");
 const groupRoutes = require("./modules/groups/groupRoutes");
 const channelRoutes = require("./modules/channels/channelRoutes");
@@ -86,6 +87,7 @@ app.get("/health", (req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/friends", friendRoutes);
+app.use("/api/friends", qrFriendRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/messages-extension", messageRevokeRoutes);
 app.use("/api/messages-extension", messageDeleteRoutes);

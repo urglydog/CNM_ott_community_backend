@@ -232,16 +232,25 @@ async function getFriends(userId) {
   const userService = require('./userService');
   const enriched = await Promise.all(
     items.map(async (item) => {
-      const friendId = item.sender_id === uid ? item.receiver_id : item.sender_id;
+      const friendId = String(item.sender_id) === uid ? item.receiver_id : item.sender_id;
       const friendInfo = await userService.getUserById(friendId);
+      // Nickname & Background: mỗi hướng lưu riêng
+      const isSender = String(item.sender_id) === uid;
+      const nickname = isSender ? (item.nickname_sender || null) : (item.nickname_receiver || null);
+      const chatBgUrl = isSender ? (item.chatBgUrl_sender || null) : (item.chatBgUrl_receiver || null);
+      const originalName = friendInfo?.display_name || friendInfo?.displayName || '';
       return {
         friendshipId: item.friendshipId,
         friend_id: friendId,
         status: item.status,
         updated_at: item.updated_at,
-        friend_display_name: friendInfo?.display_name || friendInfo?.displayName || '',
+        friend_display_name: nickname || originalName,
+        friend_original_name: originalName,
         friend_username: friendInfo?.username || '',
-        friend_avatar_url: friendInfo?.avatar_url || friendInfo?.avatarUrl || null
+        friend_avatar_url: friendInfo?.avatar_url || friendInfo?.avatarUrl || null,
+        nickname: nickname,
+        chatBgUrl: chatBgUrl,
+        pinnedMessages: item.pinnedMessages || []
       };
     })
   );
@@ -249,10 +258,174 @@ async function getFriends(userId) {
   return enriched;
 }
 
+/**
+ * Cập nhật nickname cho bạn bè (lưu theo hướng: ai đặt thì lưu cho người đó)
+ */
+async function updateNickname(friendshipId, userId, nickname) {
+  const rec = await getFriendshipByFriendshipId(friendshipId);
+  if (!rec) {
+    const err = new Error('Không tìm thấy quan hệ bạn bè');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const uid = String(userId);
+  const isSender = String(rec.sender_id) === uid;
+  const field = isSender ? 'nickname_sender' : 'nickname_receiver';
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: FRIENDS_TABLE,
+    Key: { friendshipId: String(friendshipId) },
+    UpdateExpression: `SET ${field} = :n, updated_at = :u`,
+    ExpressionAttributeValues: {
+      ':n': nickname || null,
+      ':u': new Date().toISOString()
+    }
+  }));
+
+  return { friendshipId, nickname: nickname || null };
+}
+
+/**
+ * Lấy / cập nhật cài đặt chat (background) cho một conversation
+ */
+async function updateChatBackground(userId, friendshipId, bgUrl, bothSides = false) {
+  const rec = await getFriendshipByFriendshipId(friendshipId);
+  if (!rec) throw new Error('Không tìm thấy quan hệ bạn bè');
+
+  const uid = String(userId);
+  const isSender = String(rec.sender_id) === uid;
+  
+  let updateExpr = '';
+  let attrValues = { ':bg': bgUrl || null, ':u': new Date().toISOString() };
+
+  if (bothSides) {
+    updateExpr = 'SET chatBgUrl_sender = :bg, chatBgUrl_receiver = :bg, updated_at = :u';
+  } else {
+    const field = isSender ? 'chatBgUrl_sender' : 'chatBgUrl_receiver';
+    updateExpr = `SET ${field} = :bg, updated_at = :u`;
+  }
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: FRIENDS_TABLE,
+    Key: { friendshipId: String(friendshipId) },
+    UpdateExpression: updateExpr,
+    ExpressionAttributeValues: attrValues
+  }));
+
+  return { friendshipId, chatBgUrl: bgUrl || null };
+}
+
+async function getChatBackground(userId, friendshipId) {
+  const rec = await getFriendshipByFriendshipId(friendshipId);
+  if (!rec) return null;
+  const isSender = String(rec.sender_id) === String(userId);
+  return isSender ? (rec.chatBgUrl_sender || null) : (rec.chatBgUrl_receiver || null);
+}
+
+async function pinMessage(friendshipId, message, pinnedBy) {
+  const rec = await getFriendshipByFriendshipId(friendshipId);
+  if (!rec) throw new Error('Không tìm thấy quan hệ bạn bè');
+
+  let pinned = Array.isArray(rec.pinnedMessages) ? rec.pinnedMessages : [];
+  // Tránh trùng lặp
+  pinned = pinned.filter(m => String(m.id) !== String(message.id));
+  
+  const pinObj = {
+    ...message,
+    pinnedBy: String(pinnedBy),
+    pinnedAt: new Date().toISOString()
+  };
+  pinned.unshift(pinObj); // Thêm vào đầu danh sách
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: FRIENDS_TABLE,
+    Key: { friendshipId: String(friendshipId) },
+    UpdateExpression: 'SET pinnedMessages = :p, updated_at = :u',
+    ExpressionAttributeValues: {
+      ':p': pinned,
+      ':u': new Date().toISOString()
+    }
+  }));
+  return pinned;
+}
+
+async function unpinMessage(friendshipId, messageId, requestUserId) {
+  const rec = await getFriendshipByFriendshipId(friendshipId);
+  if (!rec) throw new Error('Không tìm thấy quan hệ bạn bè');
+
+  let pinned = Array.isArray(rec.pinnedMessages) ? rec.pinnedMessages : [];
+  
+  // Kiểm tra quyền: Chỉ người ghim mới được gỡ (hoặc tin nhắn cũ chưa có pinnedBy)
+  const pinToUnpin = pinned.find(m => String(m.id) === String(messageId));
+  if (pinToUnpin && pinToUnpin.pinnedBy && String(pinToUnpin.pinnedBy) !== String(requestUserId)) {
+    throw new Error('Bạn chỉ có thể gỡ tin nhắn do chính mình ghim');
+  }
+
+  pinned = pinned.filter(m => String(m.id) !== String(messageId));
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: FRIENDS_TABLE,
+    Key: { friendshipId: String(friendshipId) },
+    UpdateExpression: 'SET pinnedMessages = :p, updated_at = :u',
+    ExpressionAttributeValues: {
+      ':p': pinned,
+      ':u': new Date().toISOString()
+    }
+  }));
+  return pinned;
+}
+
+/**
+ * Hủy kết bạn - xóa friendship khỏi database
+ */
+async function unfriend(friendshipId, userId) {
+  const rec = await getFriendshipByFriendshipId(friendshipId);
+
+  if (!rec) {
+    const err = new Error('Không tìm thấy quan hệ bạn bè');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const uid = String(userId);
+  const isParticipant = String(rec.sender_id) === uid || String(rec.receiver_id) === uid;
+
+  if (!isParticipant) {
+    const err = new Error('Bạn không có quyền hủy kết bạn này');
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (rec.status !== 'accepted') {
+    const err = new Error('Chỉ có thể hủy kết bạn khi đã là bạn bè');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  await ddbDocClient.send(new DeleteCommand({
+    TableName: FRIENDS_TABLE,
+    Key: { friendshipId: String(friendshipId) }
+  }));
+
+  return {
+    friendshipId,
+    status: 'unfriended',
+    unfriended_by: uid
+  };
+}
+
 module.exports = {
   sendFriendRequest,
   acceptFriendRequest,
   rejectFriendRequest,
   getPendingRequests,
-  getFriends
+  getFriends,
+  updateNickname,
+  updateChatBackground,
+  getChatBackground,
+  pinMessage,
+  unpinMessage,
+  unfriend,
+  findExistingRecord,
 };

@@ -119,10 +119,83 @@ async function getFriends(req, res) {
   }
 }
 
+async function updateNickname(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Chưa xác thực' });
+
+    const { friendshipId, nickname } = req.body;
+    
+    if (!friendshipId) return res.status(400).json({ message: 'friendshipId là bắt buộc' });
+
+    const result = await friendService.updateNickname(friendshipId, userId, nickname || null);
+    return res.status(200).json({ message: 'Đã cập nhật tên gợi nhớ', data: result });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ message: error.message });
+  }
+}
+
+async function updateChatBackground(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Chưa xác thực' });
+
+    const { friendshipId, bgUrl, bothSides } = req.body;
+    if (!friendshipId) return res.status(400).json({ message: 'friendshipId là bắt buộc' });
+
+    const result = await friendService.updateChatBackground(userId, friendshipId, bgUrl || null, !!bothSides);
+    return res.status(200).json({ message: 'Đã cập nhật hình nền chat', data: result });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ message: error.message });
+  }
+}
+
+async function getChatBackground(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Chưa xác thực' });
+
+    const { friendshipId } = req.params;
+    if (!friendshipId) return res.status(400).json({ message: 'friendshipId là bắt buộc' });
+
+    const bgUrl = await friendService.getChatBackground(userId, friendshipId);
+    return res.status(200).json({ chatBgUrl: bgUrl });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ message: error.message });
+  }
+}
+
+async function unfriend(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Chưa xác thực' });
+    }
+
+    const { friendshipId } = req.params;
+    if (!friendshipId) {
+      return res.status(400).json({ message: 'friendshipId là bắt buộc' });
+    }
+
+    const result = await friendService.unfriend(friendshipId, userId);
+    return res.status(200).json({
+      message: 'Đã hủy kết bạn thành công',
+      data: result
+    });
+  } catch (error) {
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({ message: error.message });
+  }
+}
+
 module.exports = {
   sendFriendRequest,
   acceptFriendRequest,
   rejectFriendRequest,
   getPendingRequests,
-  getFriends
+  getFriends,
+  updateNickname,
+  updateChatBackground,
+  getChatBackground,
+  unfriend,
 };

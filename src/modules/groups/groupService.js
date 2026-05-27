@@ -1,8 +1,7 @@
 const { ddbDocClient } = require('../../config/awsConfig');
 const { PutCommand, GetCommand, ScanCommand, UpdateCommand, QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 const crypto = require('crypto');
-const socketService = require('../../services/socketService');
-const socketHandler = require('../../socket/socketHandler');
+
 const { onlineUsers } = require('../../socket/socketUserRegistry');
 
 const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || 'ott_groups';
@@ -10,8 +9,7 @@ const MEMBERS_TABLE = process.env.DDB_MEMBERS_TABLE || 'ott_group_members';
 const REQUESTS_TABLE = process.env.DDB_GROUP_REQUESTS_TABLE || 'ott_group_requests';
 
 function getActiveIO() {
-  // Dự án có hai file lưu ioInstance (tùy file đang config ở app.js), ưu tiên thử lấy io từ 2 source
-  return socketHandler.getIO() || socketService.getIO();
+  return require('../../socket/socketHandler').getIO();
 }
 
 function forceJoinGroup(userId, groupId) {
@@ -64,7 +62,9 @@ async function createGroup(payload) {
     created_by: ownerId,
     created_at: now,
     inviteCode: generateInviteCode(),
-    isApprovalRequired: false
+    isApprovalRequired: false,
+    allowSendLinks: payload.allowSendLinks || 'ALL', // 'ALL' hoặc 'ADMINS_ONLY'
+    spamFilterLevel: payload.spamFilterLevel !== undefined ? payload.spamFilterLevel : 1 // 0: Tắt, 1: Vừa, 2: Gắt gao
   };
 
   await ddbDocClient.send(new PutCommand({
@@ -122,7 +122,10 @@ async function listGroups() {
     avatarUrl: g.avatar_url,
     memberCount: g.member_count,
     createdBy: g.created_by,
-    createdAt: g.created_at
+    createdAt: g.created_at,
+    isApprovalRequired: !!g.isApprovalRequired,
+    allowSendLinks: g.allowSendLinks || 'ALL',
+    spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
   }));
 }
 
@@ -144,7 +147,10 @@ async function getGroupById(groupId) {
     memberCount: g.member_count,
     createdBy: g.created_by,
     createdAt: g.created_at,
-    isApprovalRequired: !!g.isApprovalRequired
+    isApprovalRequired: !!g.isApprovalRequired,
+    pinnedMessages: g.pinnedMessages || [],
+    allowSendLinks: g.allowSendLinks || 'ALL',
+    spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
   };
 }
 
@@ -230,15 +236,8 @@ async function addMembersToGroup(groupId, requestUserId, userIds) {
       ExpressionAttributeValues: { ':inc': newMembers.length, ':zero': 0 }
     }));
 
-    // Real-time
-    newMembers.forEach(uid => forceJoinGroup(uid, groupKey));
-    const io = getActiveIO();
-    if (io) {
-      io.to(groupKey).emit('SERVER:MEMBER_ADDED', {
-        groupId: groupKey,
-        addedMembers: newMemberObjects
-      });
-    }
+    // NOTE: socket emit 'group:members_added' is handled by groupController.addMembers
+    // to ensure only 1 emit with full payload (including groupData). No emit here to avoid duplication.
   }
 
   return { addedCount: newMembers.length, addedMembers: newMemberObjects };
@@ -306,14 +305,6 @@ async function kickMember(groupId, requestUserId, targetUserId) {
   }));
 
   forceLeaveGroup(targetKey, groupKey);
-  const io = getActiveIO();
-  if (io) {
-    io.to(groupKey).emit('SERVER:MEMBER_KICKED', {
-      groupId: groupKey,
-      targetUserId: targetKey,
-      actionBy: reqUserKey
-    });
-  }
 
   return { message: 'Member kicked successfully' };
 }
@@ -380,7 +371,7 @@ async function updateRole(groupId, requestUserId, targetUserId, newRole) {
   return { message: 'Role updated successfully', newRole: roleUpper };
 }
 
-async function leaveGroup(groupId, requestUserId) {
+async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
   const groupKey = String(groupId);
   const reqUserKey = String(requestUserId);
 
@@ -396,10 +387,58 @@ async function leaveGroup(groupId, requestUserId) {
     throw err;
   }
 
+  // Get all members to check count
+  const allMembersRes = await ddbDocClient.send(new QueryCommand({
+    TableName: MEMBERS_TABLE,
+    KeyConditionExpression: 'groupId = :gid',
+    ExpressionAttributeValues: { ':gid': groupKey }
+  }));
+  const allMembers = allMembersRes.Items || [];
+
   if ((reqMember.role || '').toUpperCase() === 'OWNER') {
-    const err = new Error('Bạn phải nhường quyền Trưởng nhóm (OWNER) cho người khác trước khi rời');
-    err.status = 400;
-    throw err;
+    if (allMembers.length > 1) {
+      if (!newOwnerId) {
+        const err = new Error('Bạn phải nhường quyền Trưởng nhóm (OWNER) cho người khác trước khi rời');
+        err.status = 400;
+        throw err;
+      }
+      
+      const newOwnerKey = String(newOwnerId);
+      const newOwner = allMembers.find(m => m.userId === newOwnerKey);
+      if (!newOwner) {
+        const err = new Error('Người được chọn làm Trưởng nhóm mới không có trong nhóm');
+        err.status = 400;
+        throw err;
+      }
+
+      // Promote new owner
+      await ddbDocClient.send(new UpdateCommand({
+        TableName: MEMBERS_TABLE,
+        Key: { groupId: groupKey, userId: newOwnerKey },
+        UpdateExpression: 'SET #role = :roleVal',
+        ExpressionAttributeNames: { '#role': 'role' },
+        ExpressionAttributeValues: { ':roleVal': 'OWNER' }
+      }));
+      
+      // Update creator in GROUPS_TABLE
+      await ddbDocClient.send(new UpdateCommand({
+        TableName: GROUPS_TABLE,
+        Key: { groupId: groupKey },
+        UpdateExpression: 'SET created_by = :newOwner',
+        ExpressionAttributeValues: { ':newOwner': newOwnerKey }
+      }));
+      
+      // Emit event owner_transferred
+      const io = getActiveIO();
+      if (io) {
+        io.to(groupKey).emit('group:owner_transferred', { newOwnerId: newOwnerKey, oldOwnerId: reqUserKey });
+        // And also update role socket for frontend compatibility
+        io.to(groupKey).emit('SERVER:ROLE_UPDATED', { targetUserId: newOwnerKey, newRole: 'OWNER', groupId: groupKey });
+      }
+    } else {
+      // It's the last member (owner), disband the group entirely
+      return await disbandGroup(groupKey, reqUserKey);
+    }
   }
 
   await ddbDocClient.send(new DeleteCommand({
@@ -415,13 +454,6 @@ async function leaveGroup(groupId, requestUserId) {
   }));
 
   forceLeaveGroup(reqUserKey, groupKey);
-  const io = getActiveIO();
-  if (io) {
-    io.to(groupKey).emit('SERVER:MEMBER_LEFT', {
-      groupId: groupKey,
-      userId: reqUserKey
-    });
-  }
 
   return { message: 'Successfully left the group' };
 }
@@ -461,7 +493,10 @@ async function getGroupsForUser(userId) {
       memberCount: g.member_count,
       createdBy: g.created_by,
       createdAt: g.created_at,
-      isApprovalRequired: !!g.isApprovalRequired
+      isApprovalRequired: !!g.isApprovalRequired,
+      pinnedMessages: g.pinnedMessages || [],
+      allowSendLinks: g.allowSendLinks || 'ALL',
+      spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
     }));
 }
 
@@ -603,9 +638,11 @@ async function joinGroupByInviteCode(userId, inviteCode) {
   forceJoinGroup(userKey, groupId);
   const io = getActiveIO();
   if (io) {
-    io.to(groupId).emit('SERVER:MEMBER_ADDED', {
+    console.log(`[joinGroupByInviteCode] 📡 EMIT group:members_added → room=${groupId}, user=${userKey}`);
+    io.to(groupId).emit('group:members_added', {
       groupId,
-      addedMembers: [newMemberObj]
+      newMembers: [newMemberObj],
+      addedBy: userKey
     });
   }
 
@@ -640,6 +677,20 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
     changed = true;
   }
 
+  if (settings.allowSendLinks !== undefined) {
+    updateExpr += '#allowSend = :allowSend, ';
+    exprNames['#allowSend'] = 'allowSendLinks';
+    exprValues[':allowSend'] = String(settings.allowSendLinks);
+    changed = true;
+  }
+
+  if (settings.spamFilterLevel !== undefined) {
+    updateExpr += '#spamLvl = :spamLvl, ';
+    exprNames['#spamLvl'] = 'spamFilterLevel';
+    exprValues[':spamLvl'] = Number(settings.spamFilterLevel);
+    changed = true;
+  }
+
   // Bỏ dấu phẩy thừa ở cuối
   updateExpr = updateExpr.replace(/, $/, '');
 
@@ -651,6 +702,18 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
       ExpressionAttributeNames: exprNames,
       ExpressionAttributeValues: exprValues
     }));
+
+    const io = getActiveIO();
+    if (io) {
+      io.to(groupKey).emit('SERVER:GROUP_SETTINGS_UPDATED', {
+        groupId: groupKey,
+        settings: {
+          isApprovalRequired: settings.isApprovalRequired,
+          allowSendLinks: settings.allowSendLinks,
+          spamFilterLevel: settings.spamFilterLevel
+        }
+      });
+    }
   }
 
   return { message: 'Settings updated successfully' };
@@ -844,9 +907,10 @@ async function handleJoinRequest(groupId, requestUserId, targetUserId, action) {
     forceJoinGroup(targetKey, groupKey);
     const io = getActiveIO();
     if (io) {
-      io.to(groupKey).emit('SERVER:MEMBER_ADDED', {
+      io.to(groupKey).emit('group:members_added', {
         groupId: groupKey,
-        addedMembers: [newMemberObj]
+        newMembers: [newMemberObj],
+        addedBy: reqUserKey
       });
       // also emit to targetUser privately so their UI updates
       io.to(targetKey).emit('SERVER:JOIN_REQUEST_APPROVED', { groupId: groupKey });
@@ -884,5 +948,91 @@ module.exports = {
   requestToJoin,
   getPendingRequests,
   handleJoinRequest,
-  updateGroupSettings
+  updateGroupSettings,
+  pinMessage,
+  unpinMessage,
 };
+
+async function pinMessage(groupId, message, requestUserId) {
+  const groupKey = String(groupId);
+  const result = await ddbDocClient.send(new GetCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey }
+  }));
+  const g = result.Item;
+  if (!g) throw new Error('Group not found');
+
+  // Kiểm tra quyền (OWNER/DEPUTY)
+  const memberRes = await ddbDocClient.send(new GetCommand({
+    TableName: MEMBERS_TABLE,
+    Key: { groupId: groupKey, userId: String(requestUserId) }
+  }));
+  const member = memberRes.Item;
+  if (!member || (member.role !== 'OWNER' && member.role !== 'owner' && member.role !== 'DEPUTY' && member.role !== 'deputy')) {
+    throw new Error('Only OWNER or DEPUTY can pin messages');
+  }
+
+  let pinned = Array.isArray(g.pinnedMessages) ? g.pinnedMessages : [];
+  pinned = pinned.filter(m => String(m.id) !== String(message.id));
+
+  const pinObj = {
+    ...message,
+    pinnedBy: String(requestUserId),
+    pinnedAt: new Date().toISOString()
+  };
+  pinned.unshift(pinObj);
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey },
+    UpdateExpression: 'SET pinnedMessages = :p',
+    ExpressionAttributeValues: { ':p': pinned }
+  }));
+
+  return pinned;
+}
+
+async function unpinMessage(groupId, messageId, requestUserId) {
+  const groupKey = String(groupId);
+  const result = await ddbDocClient.send(new GetCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey }
+  }));
+  const g = result.Item;
+  if (!g) throw new Error('Group not found');
+
+  // Kiểm tra quyền
+  const memberRes = await ddbDocClient.send(new GetCommand({
+    TableName: MEMBERS_TABLE,
+    Key: { groupId: groupKey, userId: String(requestUserId) }
+  }));
+  const member = memberRes.Item;
+  if (!member || (member.role !== 'OWNER' && member.role !== 'owner' && member.role !== 'DEPUTY' && member.role !== 'deputy')) {
+    throw new Error('Only OWNER or DEPUTY can unpin messages');
+  }
+
+  let pinned = Array.isArray(g.pinnedMessages) ? g.pinnedMessages : [];
+
+  // Kiểm tra quyền: 
+  // 1. Nếu là OWNER/DEPUTY thì được gỡ mọi ghim
+  // 2. Nếu là MEMBER thì chỉ được gỡ ghim do chính mình tạo
+  const pinToUnpin = pinned.find(m => String(m.id) === String(messageId));
+  
+  const isPinner = pinToUnpin && String(pinToUnpin.pinnedBy) === String(requestUserId);
+  const isHighRole = member && (member.role === 'OWNER' || member.role === 'owner' || member.role === 'DEPUTY' || member.role === 'deputy');
+
+  if (pinToUnpin && pinToUnpin.pinnedBy && !isPinner && !isHighRole) {
+    throw new Error('Bạn không có quyền gỡ tin nhắn này');
+  }
+
+  pinned = pinned.filter(m => String(m.id) !== String(messageId));
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey },
+    UpdateExpression: 'SET pinnedMessages = :p',
+    ExpressionAttributeValues: { ':p': pinned }
+  }));
+
+  return pinned;
+}

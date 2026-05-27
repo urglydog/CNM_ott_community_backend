@@ -97,6 +97,14 @@ async function revokeMessageHandler(req, res) {
       for (const participantId of participants) {
         emitToUserSockets(io, participantId, "message:revoked", revokedPayload);
       }
+
+      // Path C: Auto-unpin synchronization
+      if (result.updatedPinnedList) {
+        io.to(conversationId).emit("message_pinned_updated", {
+          roomId: conversationId,
+          pinnedMessages: result.updatedPinnedList,
+        });
+      }
     }
 
     // ── 5. Respond ─────────────────────────────────────────────────────────

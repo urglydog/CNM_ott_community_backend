@@ -90,7 +90,11 @@ function buildParticipantPayload(participant) {
  * @param {Object} payload
  */
 function emitToUser(io, userId, eventName, payload) {
-  emitToUserSocketsRegistry(io, userId, eventName, payload);
+  return emitToUserSocketsRegistry(io, userId, eventName, payload);
+}
+
+function namespacedCallEvent(callSession, directEvent, groupEvent) {
+  return callSession.callMode === CALL_MODE.GROUP ? groupEvent : directEvent;
 }
 
 /**
@@ -152,17 +156,23 @@ function startRingTimer(io, callId, userId, callMode, timeoutMs) {
 
       const { ended, callSession, missedUserIds } = result;
 
-      // Notify missed users individually
+      // Notify missed users individually (include callSession so frontend can update state)
       for (const missedId of missedUserIds) {
         emitToUser(io, missedId, SOCKET_EVENTS.CALL_MISSED, {
           callId,
+          userId: missedId,
           reason: "no_answer",
+          callSession: buildPublicCallPayload(callSession),
         });
       }
 
       if (ended) {
         // Broadcast call ended to all participants
-        emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_ENDED, {
+        emitToAllParticipants(io, callSession, namespacedCallEvent(
+          callSession,
+          SOCKET_EVENTS.DIRECT_CALL_ENDED,
+          SOCKET_EVENTS.GROUP_CALL_ENDED,
+        ), {
           callId,
           endedBy: null,
           reason: ENDED_REASON.NO_ANSWER_TIMEOUT,
@@ -242,7 +252,11 @@ function startReconnectTimer(io, callId, userId, timeoutMs) {
         // Call ended due to disconnect timeout
         cancelAllRingTimers(callId);
 
-        emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_ENDED, {
+        emitToAllParticipants(io, callSession, namespacedCallEvent(
+          callSession,
+          SOCKET_EVENTS.DIRECT_CALL_ENDED,
+          SOCKET_EVENTS.GROUP_CALL_ENDED,
+        ), {
           callId,
           endedBy: userId,
           reason: ENDED_REASON.DISCONNECT_TIMEOUT,
@@ -250,7 +264,7 @@ function startReconnectTimer(io, callId, userId, timeoutMs) {
         });
       } else {
         // Group call: participant left but call continues
-        emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_PARTICIPANT_LEFT, {
+        emitToAllParticipants(io, callSession, SOCKET_EVENTS.GROUP_CALL_PARTICIPANT_LEFT, {
           callId,
           userId,
           reason: "disconnect_timeout",
@@ -342,8 +356,27 @@ async function handleCallStart(io, socket, userId, data, callback) {
       callType,
     });
 
-    const { callSession, tokenPayload, recipientIds } = result;
+    const { callSession, tokenPayload } = result;
     const callId = callSession.callId;
+    const recipientIds = [
+      ...new Set(
+        callSession.participants
+          .map((p) => String(p.userId))
+          .filter((pid) => pid !== String(userId)),
+      ),
+    ];
+
+    console.log(`[call:create] { callerId: ${userId}, receiverId: ${recipientIds.join(",")}, conversationId: ${callSession.conversationId}, callId: ${callId} }`);
+    if (callSession.callMode === CALL_MODE.GROUP) {
+      const memberIds = [
+        ...new Set(callSession.participants.map((p) => String(p.userId))),
+      ];
+      console.log(`[GROUP_CALL_INVITE] sessionId=${callId}`);
+      console.log(`[GROUP_CALL_INVITE] callerId=${userId}`);
+      console.log(`[GROUP_CALL_INVITE] groupId/conversationId=${callSession.conversationId}`);
+      console.log(`[GROUP_CALL_INVITE] members=${JSON.stringify(memberIds)}`);
+      console.log(`[GROUP_CALL_INVITE] invitees=${JSON.stringify(recipientIds)}`);
+    }
 
     // Join initiator to a call-specific room for easy broadcasting
     socket.join(`call:${callId}`);
@@ -357,8 +390,10 @@ async function handleCallStart(io, socket, userId, data, callback) {
     });
 
     // Notify all recipients about incoming call (NO token in payload)
+    // Include callSession so the frontend can use payload.callSession directly
     const incomingPayload = {
       callId,
+      callSession: buildPublicCallPayload(callSession),
       conversationId: callSession.conversationId,
       callMode: callSession.callMode,
       callType: callSession.callType,
@@ -368,15 +403,29 @@ async function handleCallStart(io, socket, userId, data, callback) {
       createdAt: callSession.createdAt,
     };
 
+    const incomingEvent = namespacedCallEvent(
+      callSession,
+      SOCKET_EVENTS.DIRECT_CALL_INCOMING,
+      SOCKET_EVENTS.GROUP_CALL_INCOMING,
+    );
+    let emittedCount = 0;
     for (const recipientId of recipientIds) {
       // Check if recipient is online
       const recipientKey = String(recipientId);
       const recipientSockets = onlineUsers.get(recipientKey);
+      const sockets = recipientSockets ? recipientSockets.size : 0;
+      if (callSession.callMode === CALL_MODE.GROUP) {
+        console.log(`[GROUP_CALL_INVITE] emitting userId=${recipientKey} socketCount=${sockets}`);
+      }
+      console.log(`[call:incoming emit] { receiverId: ${recipientKey}, sockets: ${sockets}, eventName: ${incomingEvent} }`);
       if (recipientSockets && recipientSockets.size > 0) {
-        emitToUser(io, recipientId, SOCKET_EVENTS.CALL_INCOMING, incomingPayload);
+        if (emitToUser(io, recipientId, incomingEvent, incomingPayload)) {
+          emittedCount += 1;
+        }
       } else {
         // Recipient offline → mark as missed immediately
         // (Don't await, fire-and-forget for now)
+        console.warn(`[call:incoming emit] Receiver ${recipientKey} is OFFLINE — marking as missed`);
         const callRepository = require("./callRepository");
         callRepository.updateParticipant(callId, recipientId, {
           status: PARTICIPANT_STATUS.MISSED,
@@ -384,6 +433,9 @@ async function handleCallStart(io, socket, userId, data, callback) {
           console.error(`[call-socket] Failed to mark offline recipient ${recipientId} as missed:`, err.message);
         });
       }
+    }
+    if (callSession.callMode === CALL_MODE.GROUP) {
+      console.log(`[GROUP_CALL_INVITE] emittedCount=${emittedCount}`);
     }
 
     // Start ringing timeout
@@ -396,8 +448,11 @@ async function handleCallStart(io, socket, userId, data, callback) {
       }
     }
 
-    // Notify initiator that call is ringing
-    emitToUser(io, userId, SOCKET_EVENTS.CALL_RINGING, { callId });
+    // Notify initiator that call is ringing (include callSession for frontend)
+    emitToUser(io, userId, SOCKET_EVENTS.CALL_RINGING, {
+      callId,
+      callSession: buildPublicCallPayload(callSession),
+    });
   } catch (err) {
     const code = err.code || "INTERNAL_ERROR";
 
@@ -445,7 +500,11 @@ async function handleCallAccept(io, socket, userId, data, callback) {
     });
 
     // Notify all other participants that this user accepted (NO token)
-    emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_ACCEPTED, {
+    emitToAllParticipants(io, callSession, namespacedCallEvent(
+      callSession,
+      SOCKET_EVENTS.DIRECT_CALL_ACCEPTED,
+      SOCKET_EVENTS.GROUP_CALL_ACCEPTED,
+    ), {
       callId,
       userId,
       participant: buildParticipantPayload(
@@ -485,7 +544,11 @@ async function handleCallReject(io, socket, userId, data, callback) {
 
     if (ended) {
       // Notify all participants the call ended
-      emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_ENDED, {
+      emitToAllParticipants(io, callSession, namespacedCallEvent(
+        callSession,
+        SOCKET_EVENTS.DIRECT_CALL_ENDED,
+        SOCKET_EVENTS.GROUP_CALL_ENDED,
+      ), {
         callId,
         endedBy: userId,
         reason: ENDED_REASON.CALLEE_REJECTED,
@@ -493,7 +556,11 @@ async function handleCallReject(io, socket, userId, data, callback) {
       });
     } else {
       // Group: just notify this user rejected
-      emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_REJECTED, {
+      emitToAllParticipants(io, callSession, namespacedCallEvent(
+        callSession,
+        SOCKET_EVENTS.DIRECT_CALL_REJECTED,
+        SOCKET_EVENTS.GROUP_CALL_REJECTED,
+      ), {
         callId,
         userId,
         callSession: buildPublicCallPayload(callSession),
@@ -524,9 +591,14 @@ async function handleCallCancel(io, socket, userId, data, callback) {
     sendOk(callback, { callId });
 
     // Notify all participants
-    emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_CANCELLED, {
+    emitToAllParticipants(io, callSession, namespacedCallEvent(
+      callSession,
+      SOCKET_EVENTS.DIRECT_CALL_ENDED,
+      SOCKET_EVENTS.GROUP_CALL_ENDED,
+    ), {
       callId,
-      cancelledBy: userId,
+      endedBy: userId,
+      reason: ENDED_REASON.CALLER_CANCELLED,
       callSession: buildPublicCallPayload(callSession),
     });
   } catch (err) {
@@ -540,22 +612,27 @@ async function handleCallCancel(io, socket, userId, data, callback) {
  */
 async function handleCallEnd(io, socket, userId, data, callback) {
   try {
-    const { callId } = data || {};
+    const { callId, scope, leaveOnly: requestedLeaveOnly } = data || {};
     if (!callId) {
       return sendError(socket, callback, "INVALID_INPUT", "callId is required");
     }
 
-    const result = await callService.endCall({ userId, callId });
+    const leaveOnly = scope === "leave" || requestedLeaveOnly === true;
+    const result = await callService.endCall({ userId, callId, leaveOnly });
     const { ended, selfOnly, callSession } = result;
 
-    // Cancel any lingering timers
-    cancelAllRingTimers(callId);
-
     sendOk(callback, { callId, ended, selfOnly });
+    if (result.noop) return;
 
     if (ended) {
+      // Cancel any lingering timers
+      cancelAllRingTimers(callId);
       // Call fully ended — notify all participants
-      emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_ENDED, {
+      emitToAllParticipants(io, callSession, namespacedCallEvent(
+        callSession,
+        SOCKET_EVENTS.DIRECT_CALL_ENDED,
+        SOCKET_EVENTS.GROUP_CALL_ENDED,
+      ), {
         callId,
         endedBy: userId,
         reason: callSession.endedReason || ENDED_REASON.USER_ENDED,
@@ -565,8 +642,9 @@ async function handleCallEnd(io, socket, userId, data, callback) {
       // Cleanup reconnect timers for this call
       cancelAllReconnectTimers(callId);
     } else if (selfOnly) {
+      cancelRingTimer(callId, userId);
       // Group: only this user left, call continues
-      emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_PARTICIPANT_LEFT, {
+      emitToAllParticipants(io, callSession, SOCKET_EVENTS.GROUP_CALL_PARTICIPANT_LEFT, {
         callId,
         userId,
         reason: "left",
@@ -615,7 +693,7 @@ async function handleCallJoin(io, socket, userId, data, callback) {
     });
 
     // Notify other participants (NO token)
-    emitToAllParticipants(io, updatedCall, SOCKET_EVENTS.CALL_PARTICIPANT_JOINED, {
+    emitToAllParticipants(io, updatedCall, SOCKET_EVENTS.GROUP_CALL_PARTICIPANT_JOINED, {
       callId,
       userId,
       participant: buildParticipantPayload(
@@ -639,8 +717,9 @@ async function handleCallLeave(io, socket, userId, data, callback) {
       return sendError(socket, callback, "INVALID_INPUT", "callId is required");
     }
 
-    // Reuse endCall logic (it handles group leave correctly)
-    const result = await callService.endCall({ userId, callId });
+    // Force leave-only semantics so a group host closing/leaving does not end
+    // the entire session.
+    const result = await callService.endCall({ userId, callId, leaveOnly: true });
     const { ended, selfOnly, callSession } = result;
 
     // Leave call room
@@ -651,7 +730,11 @@ async function handleCallLeave(io, socket, userId, data, callback) {
     if (ended) {
       cancelAllRingTimers(callId);
 
-      emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_ENDED, {
+      emitToAllParticipants(io, callSession, namespacedCallEvent(
+        callSession,
+        SOCKET_EVENTS.DIRECT_CALL_ENDED,
+        SOCKET_EVENTS.GROUP_CALL_ENDED,
+      ), {
         callId,
         endedBy: userId,
         reason: callSession.endedReason || ENDED_REASON.USER_ENDED,
@@ -661,7 +744,8 @@ async function handleCallLeave(io, socket, userId, data, callback) {
       // Cleanup reconnect timers
       cancelAllReconnectTimers(callId);
     } else if (selfOnly) {
-      emitToAllParticipants(io, callSession, SOCKET_EVENTS.CALL_PARTICIPANT_LEFT, {
+      cancelRingTimer(callId, userId);
+      emitToAllParticipants(io, callSession, SOCKET_EVENTS.GROUP_CALL_PARTICIPANT_LEFT, {
         callId,
         userId,
         reason: "left",
@@ -783,8 +867,20 @@ function registerCallHandlers(io, socket) {
   socket.on(SOCKET_EVENTS.CALL_ACCEPT, (data, callback) => {
     handleCallAccept(io, socket, uid, data, callback);
   });
+  socket.on(SOCKET_EVENTS.DIRECT_CALL_ACCEPT, (data, callback) => {
+    handleCallAccept(io, socket, uid, data, callback);
+  });
+  socket.on(SOCKET_EVENTS.GROUP_CALL_ACCEPT, (data, callback) => {
+    handleCallAccept(io, socket, uid, data, callback);
+  });
 
   socket.on(SOCKET_EVENTS.CALL_REJECT, (data, callback) => {
+    handleCallReject(io, socket, uid, data, callback);
+  });
+  socket.on(SOCKET_EVENTS.DIRECT_CALL_REJECT, (data, callback) => {
+    handleCallReject(io, socket, uid, data, callback);
+  });
+  socket.on(SOCKET_EVENTS.GROUP_CALL_REJECT, (data, callback) => {
     handleCallReject(io, socket, uid, data, callback);
   });
 
@@ -795,12 +891,24 @@ function registerCallHandlers(io, socket) {
   socket.on(SOCKET_EVENTS.CALL_END, (data, callback) => {
     handleCallEnd(io, socket, uid, data, callback);
   });
+  socket.on(SOCKET_EVENTS.DIRECT_CALL_END, (data, callback) => {
+    handleCallEnd(io, socket, uid, data, callback);
+  });
+  socket.on(SOCKET_EVENTS.GROUP_CALL_END, (data, callback) => {
+    handleCallEnd(io, socket, uid, data, callback);
+  });
 
   socket.on(SOCKET_EVENTS.CALL_JOIN, (data, callback) => {
     handleCallJoin(io, socket, uid, data, callback);
   });
+  socket.on(SOCKET_EVENTS.GROUP_CALL_JOIN, (data, callback) => {
+    handleCallJoin(io, socket, uid, data, callback);
+  });
 
   socket.on(SOCKET_EVENTS.CALL_LEAVE, (data, callback) => {
+    handleCallLeave(io, socket, uid, data, callback);
+  });
+  socket.on(SOCKET_EVENTS.GROUP_CALL_LEAVE, (data, callback) => {
     handleCallLeave(io, socket, uid, data, callback);
   });
 
@@ -878,6 +986,13 @@ module.exports = {
   // Expose timer functions for callRecovery.js boot-time recovery
   startRingTimer,
   startReconnectTimer,
+  cancelRingTimer,
+  cancelAllRingTimers,
+  cancelReconnectTimer,
+  cancelAllReconnectTimers,
+  // Expose payload builders for REST controller to emit socket events
+  buildPublicCallPayload,
+  buildParticipantPayload,
   // Expose for testing/cleanup
   _activeRingTimers: activeRingTimers,
   _reconnectGraceTimers: reconnectGraceTimers,

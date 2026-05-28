@@ -16,6 +16,18 @@ const callController = require("./callController");
 // MUST be before /:callId/* routes to avoid matching "active" as a callId
 router.get("/active", authMiddleware, callController.getActiveCall);
 
+// Dev helper: force-clean all blocking calls in a conversation
+// MUST be before /:callId/* routes to avoid matching "dev" as a callId
+router.post("/dev/cleanup/:conversationId", authMiddleware, callController.devCleanupConversation);
+
+// Group call rebuild endpoints used by the current frontend.
+// MUST be before /:callId/* routes to avoid matching "group" as a callId.
+router.post("/group/initiate", authMiddleware, callController.initiateGroupCall);
+router.post("/group/:sessionId/accept", authMiddleware, callController.acceptGroupCall);
+router.post("/group/:sessionId/reject", authMiddleware, callController.rejectGroupCall);
+router.post("/group/:sessionId/leave", authMiddleware, callController.leaveGroupCall);
+router.post("/group/:sessionId/end", authMiddleware, callController.endGroupCall);
+
 // ─── Call Lifecycle ─────────────────────────────────────────────────────────
 
 // Start a new call in a conversation

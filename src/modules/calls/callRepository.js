@@ -16,7 +16,7 @@ const {
 } = require("@aws-sdk/lib-dynamodb");
 const { ddbDocClient } = require("../../config/awsConfig");
 const { CALLS_TABLE } = require("./callModel");
-const { CALL_STATUS, PARTICIPANT_STATUS, CONNECTION_STATE } = require("./call.constants");
+const { CALL_STATUS, BLOCKING_STATUSES, PARTICIPANT_STATUS, CONNECTION_STATE, ENDED_REASON } = require("./call.constants");
 
 // ─── Create ─────────────────────────────────────────────────────────────────
 
@@ -70,12 +70,13 @@ async function findActiveByConversation(conversationId) {
       TableName: CALLS_TABLE,
       IndexName: "conversationId-index",
       KeyConditionExpression: "conversationId = :cid",
-      FilterExpression: "#s = :ringing OR #s = :active",
+      FilterExpression: "#s IN (:ringing, :active, :reconnecting)",
       ExpressionAttributeNames: { "#s": "status" },
       ExpressionAttributeValues: {
         ":cid": String(conversationId),
         ":ringing": CALL_STATUS.RINGING,
         ":active": CALL_STATUS.ACTIVE,
+        ":reconnecting": CALL_STATUS.RECONNECTING,
       },
     }),
   );
@@ -95,16 +96,20 @@ async function isUserBusy(userId) {
     new ScanCommand({
       TableName: CALLS_TABLE,
       FilterExpression:
-        "(#s = :active OR #s = :ringing) AND contains(participants, :uid)",
+        "(#s = :active OR #s = :ringing)",
       ExpressionAttributeNames: { "#s": "status" },
       ExpressionAttributeValues: {
         ":active": CALL_STATUS.ACTIVE,
         ":ringing": CALL_STATUS.RINGING,
-        ":uid": String(userId),
       },
     }),
   );
-  const items = res.Items || [];
+  const uid = String(userId);
+  const items = (res.Items || []).filter((item) =>
+    Array.isArray(item.participants) &&
+    item.participants.some((p) => String(p.userId) === uid),
+  );
+  items.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
   if (items.length > 0) {
     return { busy: true, callId: items[0].callId };
   }
@@ -420,16 +425,20 @@ async function findActiveForUser(userId) {
     new ScanCommand({
       TableName: CALLS_TABLE,
       FilterExpression:
-        "(#s = :active OR #s = :ringing) AND contains(participants, :uid)",
+        "(#s = :active OR #s = :ringing)",
       ExpressionAttributeNames: { "#s": "status" },
       ExpressionAttributeValues: {
         ":active": CALL_STATUS.ACTIVE,
         ":ringing": CALL_STATUS.RINGING,
-        ":uid": String(userId),
       },
     }),
   );
-  const items = res.Items || [];
+  const uid = String(userId);
+  const items = (res.Items || []).filter((item) =>
+    Array.isArray(item.participants) &&
+    item.participants.some((p) => String(p.userId) === uid),
+  );
+  items.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
   return items.length > 0 ? items[0] : null;
 }
 
@@ -467,6 +476,49 @@ async function findAllActive() {
   return res.Items || [];
 }
 
+/**
+ * Force-end all stale calls in a conversation.
+ * Used as a defensive cleanup when a new call is started but a stale call is blocking.
+ *
+ * @param {string} conversationId
+ * @param {string} reason - Ended reason (e.g. SYSTEM_CLEANUP)
+ * @returns {Promise<number>} Number of calls cleaned up
+ */
+async function cleanupStaleConversationCalls(conversationId, reason = ENDED_REASON.SYSTEM_CLEANUP) {
+  // Find ALL calls for this conversation (any status)
+  const res = await ddbDocClient.send(
+    new QueryCommand({
+      TableName: CALLS_TABLE,
+      IndexName: "conversationId-index",
+      KeyConditionExpression: "conversationId = :cid",
+      FilterExpression: "#s IN (:ringing, :active, :reconnecting)",
+      ExpressionAttributeNames: { "#s": "status" },
+      ExpressionAttributeValues: {
+        ":cid": String(conversationId),
+        ":ringing": CALL_STATUS.RINGING,
+        ":active": CALL_STATUS.ACTIVE,
+        ":reconnecting": CALL_STATUS.RECONNECTING,
+      },
+    }),
+  );
+  const items = res.Items || [];
+  let cleaned = 0;
+  for (const item of items) {
+    try {
+      await updateStatus(item.callId, CALL_STATUS.ENDED, {
+        endedAt: new Date().toISOString(),
+        endedReason: reason,
+        endedBy: "system",
+      });
+      cleaned++;
+      console.log(`[call:stale-cleanup] callId=${item.callId} oldStatus=${item.status} newStatus=ended reason=${reason}`);
+    } catch (err) {
+      console.error(`[call:stale-cleanup] Failed to cleanup ${item.callId}:`, err.message);
+    }
+  }
+  return cleaned;
+}
+
 module.exports = {
   create,
   getById,
@@ -485,4 +537,5 @@ module.exports = {
   markCallLogCreated,
   findAllRinging,
   findAllActive,
+  cleanupStaleConversationCalls,
 };

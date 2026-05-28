@@ -17,6 +17,7 @@ const { CallError, validateStartCallInput, validateCallId, validateUserId } = re
 const AgoraProvider = require("./providers/agoraProvider");
 const {
   CALL_STATUS,
+  BLOCKING_STATUSES,
   CALL_MODE,
   CALL_TYPE,
   PARTICIPANT_STATUS,
@@ -190,13 +191,27 @@ async function createCallLogMessage(callSession) {
 
   // Use saveMessage from messageService to persist in ott_messages
   const { saveMessage } = require("../messages/messageService");
-  await saveMessage({
+  const savedMessage = await saveMessage({
     conversationId: callSession.conversationId,
     senderId: callSession.initiatorId,
     content,
     contentType: "call_log",
     callData,
   });
+
+  // Broadcast the call_log message realtime to the conversation room
+  // so all participants see it immediately (same event as normal chat messages)
+  try {
+    const { getIO } = require("../../socket/socketHandler");
+    const io = getIO();
+    if (io && savedMessage) {
+      const roomId = callSession.conversationId;
+      console.log(`[call:system-message] Broadcasting call_log to room ${roomId}`, savedMessage.id);
+      io.to(roomId).emit("receive_message", savedMessage);
+    }
+  } catch (emitErr) {
+    console.error("[call:system-message] Failed to broadcast realtime:", emitErr.message);
+  }
 }
 
 /**
@@ -286,15 +301,41 @@ async function startCall({ userId, conversationId, callType }) {
     );
   }
 
-  // 6. Check no active call in this conversation
+  // 6. Check no active call in this conversation (with stale-call recovery)
   const existingCall = await callRepository.findActiveByConversation(conversationId);
   if (existingCall) {
-    throw new CallError(
-      "An active call already exists in this conversation",
-      "CALL_EXISTS",
-      409,
+    const ageMs = Date.now() - new Date(existingCall.createdAt).getTime();
+    console.log(
+      `[call:active-check] conversationId=${conversationId} foundCallId=${existingCall.callId} ` +
+      `status=${existingCall.status} ageMs=${ageMs} BLOCKING_STATUSES=${BLOCKING_STATUSES.join(",")}`,
     );
+
+    // Auto-cleanup stale RINGING calls that exceeded the ring timeout
+    if (existingCall.status === CALL_STATUS.RINGING && ageMs > TIMEOUTS.RING_TIMEOUT_MS) {
+      console.log(
+        `[call:stale-cleanup] callId=${existingCall.callId} oldStatus=ringing newStatus=ended ` +
+        `reason=AUTO_TIMEOUT_CLEANUP ageMs=${ageMs} threshold=${TIMEOUTS.RING_TIMEOUT_MS}`,
+      );
+      try {
+        await callRepository.cleanupStaleConversationCalls(conversationId, ENDED_REASON.SYSTEM_CLEANUP);
+      } catch (cleanupErr) {
+        console.error(`[call:stale-cleanup] Error during cleanup:`, cleanupErr.message);
+      }
+      // Fall through — allow the new call
+    } else {
+      // Legitimately active call — block new call
+      console.log(
+        `[call:start-blocked] conversationId=${conversationId} callId=${existingCall.callId} ` +
+        `status=${existingCall.status} ageMs=${ageMs}`,
+      );
+      throw new CallError(
+        "An active call already exists in this conversation",
+        "CALL_EXISTS",
+        409,
+      );
+    }
   }
+  console.log(`[call:start-allowed] conversationId=${conversationId}`);
 
   // 7. Check initiator not busy
   const callerBusy = await callRepository.isUserBusy(callerId);
@@ -356,7 +397,15 @@ async function startCall({ userId, conversationId, callType }) {
   const tokenPayload = generateTokenPayload(callSession.channelName, callerId);
 
   // 13. Recipient IDs (who should receive call:incoming)
-  const recipientIds = initialParticipants.map((p) => p.userId);
+  // Always derive from the persisted call participants so group invite fan-out
+  // cannot accidentally fall back to single-callee direct-call logic.
+  const recipientIds = [
+    ...new Set(
+      callSession.participants
+        .map((p) => String(p.userId))
+        .filter((pid) => pid !== callerId),
+    ),
+  ];
 
   return { callSession, tokenPayload, recipientIds };
 }
@@ -377,19 +426,33 @@ async function acceptCall({ userId, callId }) {
   if (!call) {
     throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
   }
-  if (call.status !== CALL_STATUS.RINGING) {
-    throw new CallError(
-      `Call is not in ringing state (current: ${call.status})`,
-      "CALL_NOT_RINGING",
-      400,
-    );
-  }
 
   const uid = String(userId);
   const participant = callModel.findParticipant(call, uid);
   if (!participant) {
     throw new CallError("You are not a participant in this call", "NOT_PARTICIPANT", 403);
   }
+
+  // Idempotent: if already accepted, return success (handles double-click / race)
+  if (participant.status === PARTICIPANT_STATUS.ACCEPTED) {
+    console.log(`[call:accept] ${uid} already accepted call ${callId} — idempotent return`);
+    const tokenPayload = generateTokenPayload(call.channelName, uid);
+    if (call.callMode === CALL_MODE.GROUP) {
+      console.log(
+        `[GROUP_JOIN_TOKEN] userId=${uid} callId=${callId} channelName=${call.channelName} uid=${tokenPayload.uid}`,
+      );
+    }
+    return { callSession: call, tokenPayload };
+  }
+
+  if (call.status !== CALL_STATUS.RINGING && call.status !== CALL_STATUS.ACTIVE) {
+    throw new CallError(
+      `Call is not in a joinable state (current: ${call.status})`,
+      "CALL_NOT_RINGING",
+      400,
+    );
+  }
+
   if (participant.status !== PARTICIPANT_STATUS.INVITED) {
     throw new CallError(
       `Already responded (status: ${participant.status})`,
@@ -415,6 +478,11 @@ async function acceptCall({ userId, callId }) {
 
   // Generate token for this participant
   const tokenPayload = generateTokenPayload(finalCall.channelName, uid);
+  if (finalCall.callMode === CALL_MODE.GROUP) {
+    console.log(
+      `[GROUP_JOIN_TOKEN] userId=${uid} callId=${callId} channelName=${finalCall.channelName} uid=${tokenPayload.uid}`,
+    );
+  }
 
   return { callSession: finalCall, tokenPayload };
 }
@@ -435,6 +503,13 @@ async function rejectCall({ userId, callId }) {
   if (!call) {
     throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
   }
+
+  // Idempotent: if call already ended (e.g. caller cancelled while callee was rejecting), return success
+  if (call.status === CALL_STATUS.ENDED) {
+    console.log(`[call:reject] Call ${callId} already ended — idempotent return`);
+    return { ended: true, callSession: call };
+  }
+
   if (call.status !== CALL_STATUS.RINGING) {
     throw new CallError(
       `Call is not in ringing state (current: ${call.status})`,
@@ -520,6 +595,27 @@ async function cancelCall({ userId, callId }) {
       403,
     );
   }
+
+  // Idempotent: if call already ended, return success
+  if (call.status === CALL_STATUS.ENDED) {
+    console.log(`[call:cancel] Call ${callId} already ended — idempotent return`);
+    return { ended: true, callSession: call };
+  }
+
+  // If call is already ACTIVE (callee accepted while caller was cancelling),
+  // treat cancel as endCall instead
+  if (call.status === CALL_STATUS.ACTIVE) {
+    console.log(`[call:cancel] Call ${callId} already active — delegating to endCall`);
+    const ended = await callRepository.endCall(
+      callId,
+      userId,
+      ENDED_REASON.USER_ENDED,
+      call.startedAt,
+    );
+    await createCallLogMessage(ended);
+    return { ended: true, callSession: ended };
+  }
+
   if (call.status !== CALL_STATUS.RINGING) {
     throw new CallError(
       `Can only cancel ringing calls (current: ${call.status})`,
@@ -528,6 +624,7 @@ async function cancelCall({ userId, callId }) {
     );
   }
 
+  console.log(`[call:cancel] Cancelling ringing call ${callId} by ${userId}`);
   const ended = await callRepository.endCall(
     callId,
     userId,
@@ -543,8 +640,8 @@ async function cancelCall({ userId, callId }) {
  *
  * Rules:
  * - Direct: any participant ends for both (atomic)
- * - Group initiator: ends for everyone
- * - Group normal participant: leaves only themselves
+ * - Group explicit end by initiator: ends for everyone
+ * - Group leave: removes only that participant, including the initiator
  * - If no accepted participants remain in group: ends as group_empty
  *
  * @param {Object} params
@@ -552,13 +649,19 @@ async function cancelCall({ userId, callId }) {
  * @param {string} params.callId - The call session ID
  * @returns {Promise<{ ended: boolean, selfOnly?: boolean, callSession: Object }>}
  */
-async function endCall({ userId, callId }) {
+async function endCall({ userId, callId, leaveOnly = false }) {
   validateUserId(userId);
   validateCallId(callId);
 
   const call = await callRepository.getById(callId);
   if (!call) {
     throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
+  }
+
+  // Idempotent: if call already ended, return success
+  if (call.status === CALL_STATUS.ENDED) {
+    console.log(`[call:end] Call ${callId} already ended — idempotent return`);
+    return { ended: true, selfOnly: false, callSession: call, noop: true };
   }
 
   // Can only end active or ringing calls
@@ -591,9 +694,19 @@ async function endCall({ userId, callId }) {
 
   // Group call
   const isInitiator = String(call.initiatorId) === uid;
+  if (!leaveOnly) {
+    const currentActive = await callRepository.findActiveForUser(uid);
+    if (currentActive && String(currentActive.callId) !== String(callId)) {
+      console.warn(
+        `[call:end:stale-ignored] userId=${uid} staleCallId=${callId} currentCallId=${currentActive.callId}`,
+      );
+      return { ended: false, selfOnly: true, callSession: call, noop: true };
+    }
+  }
 
-  if (isInitiator) {
+  if (isInitiator && !leaveOnly) {
     // Initiator ends the entire call for everyone
+    console.log(`[GROUP_END] userId=${uid} callId=${callId} reason=host_ended`);
     const ended = await callRepository.endCall(
       callId,
       uid,
@@ -604,7 +717,9 @@ async function endCall({ userId, callId }) {
     return { ended: true, callSession: ended };
   }
 
-  // Normal participant: leave only themselves
+  // Group leave: remove only this participant. This is intentionally separate
+  // from explicit host end so closing one popup cannot end the whole group.
+  console.log(`[GROUP_LEAVE] userId=${uid} callId=${callId} leaveOnly=true`);
   const updated = await callRepository.markParticipantLeft(callId, uid);
 
   // Check if any accepted participants remain
@@ -622,6 +737,7 @@ async function endCall({ userId, callId }) {
       call.startedAt,
     );
     await createCallLogMessage(ended);
+    console.log(`[GROUP_END] userId=${uid} callId=${callId} reason=all_left`);
     return { ended: true, selfOnly: true, callSession: ended };
   }
 
@@ -858,6 +974,11 @@ async function handleParticipantReconnect(callId, userId) {
   const uid = String(userId);
   const updated = await callRepository.markParticipantReconnected(callId, uid);
   const tokenPayload = generateTokenPayload(updated.channelName, uid);
+  if (updated.callMode === CALL_MODE.GROUP) {
+    console.log(
+      `[GROUP_JOIN_TOKEN] userId=${uid} callId=${callId} channelName=${updated.channelName} uid=${tokenPayload.uid}`,
+    );
+  }
 
   return { callSession: updated, tokenPayload };
 }
@@ -1023,8 +1144,24 @@ async function joinCall({ userId, callId }) {
   }
 
   const tokenPayload = generateTokenPayload(updatedCall.channelName, uid);
+  console.log(
+    `[GROUP_JOIN_TOKEN] userId=${uid} callId=${callId} channelName=${updatedCall.channelName} uid=${tokenPayload.uid}`,
+  );
 
   return { callSession: updatedCall, tokenPayload };
+}
+
+/**
+ * Dev/admin helper: force-clean all blocking calls in a conversation.
+ * Use when a conversation is permanently stuck with a stale call.
+ * @param {string} conversationId
+ * @returns {Promise<number>} number of calls cleaned
+ */
+async function cleanupConversationCalls(conversationId) {
+  console.log(`[call:dev-cleanup] conversationId=${conversationId} — force cleaning all blocking calls`);
+  const cleaned = await callRepository.cleanupStaleConversationCalls(conversationId, ENDED_REASON.SYSTEM_CLEANUP);
+  console.log(`[call:dev-cleanup] conversationId=${conversationId} cleaned=${cleaned}`);
+  return cleaned;
 }
 
 module.exports = {
@@ -1042,4 +1179,5 @@ module.exports = {
   handleParticipantReconnect,
   endCallDueToDisconnect,
   joinCall,
+  cleanupConversationCalls,
 };

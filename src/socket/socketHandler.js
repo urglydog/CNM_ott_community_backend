@@ -6,6 +6,7 @@ const {
 } = require("@aws-sdk/lib-dynamodb");
 const { saveMessage } = require("../modules/messages/messageService");
 const { registerCallHandlers, handleDisconnect: handleCallDisconnect } = require("../modules/calls/callSocketHandler");
+const { registerGroupCallHandlers } = require("../modules/calls/groupCallSocketHandler");
 
 const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
 const { notifyMessageCreated } = require("../modules/notifications/notificationService");
@@ -210,6 +211,9 @@ function handleSocketConnection(io, socket) {
 
   // ── Register call signaling handlers (Phase 2c) ──
   registerCallHandlers(io, socket);
+
+  // ── Register NEW group call handlers (rebuild) ──
+  registerGroupCallHandlers(io, socket);
 
   const emitToUserSockets = (targetUserId, eventName, payload) => {
     const targetKey = String(targetUserId || "").trim();

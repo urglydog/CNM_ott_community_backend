@@ -1,0 +1,16 @@
+{
+	"mcpServers": {
+		"agora-docs": {
+			"command": "npx",
+			"args": [
+				"mcp-remote",
+				"https://mcp.agora.io"
+			],
+			"alwaysAllow": [
+				"algolia_search_index_docs_platform_aware_markdown",
+				"algolia_search_index_agora_api_refAPIRefCrawler",
+				"algolia_search_for_facet_values"
+			]
+		}
+	}
+}

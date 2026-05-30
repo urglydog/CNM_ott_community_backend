@@ -165,6 +165,29 @@ async function getChatBackground(req, res) {
   }
 }
 
+async function unfriend(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Chưa xác thực' });
+    }
+
+    const { friendshipId } = req.params;
+    if (!friendshipId) {
+      return res.status(400).json({ message: 'friendshipId là bắt buộc' });
+    }
+
+    const result = await friendService.unfriend(friendshipId, userId);
+    return res.status(200).json({
+      message: 'Đã hủy kết bạn thành công',
+      data: result
+    });
+  } catch (error) {
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({ message: error.message });
+  }
+}
+
 module.exports = {
   sendFriendRequest,
   acceptFriendRequest,
@@ -174,4 +197,5 @@ module.exports = {
   updateNickname,
   updateChatBackground,
   getChatBackground,
+  unfriend,
 };

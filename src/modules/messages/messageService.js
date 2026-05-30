@@ -27,6 +27,9 @@ const VALID_CONTENT_TYPES = new Set([
   "location",
   // Loại tin nhắn bình chọn (poll)
   "poll",
+  "reminder",
+  "reminder_due",
+  "note",
   // Call log entry — schema-only placeholder for future Agora call integration (Phase 2)
   // Stored in ott_messages with callData sub-document. No business logic here.
   "call_log",
@@ -259,6 +262,16 @@ async function saveMessage(payload) {
           },
         }
       : {}),
+    ...(payload.reminderData
+      ? {
+          reminderData: {
+            reminderId: String(payload.reminderData.reminderId || ""),
+            remindAt: payload.reminderData.remindAt || null,
+            repeat: payload.reminderData.repeat || "none",
+            status: payload.reminderData.status || "active",
+          },
+        }
+      : {}),
     // callData chỉ tồn tại khi contentType === "call_log" — lưu metadata cuộc gọi
     ...((contentType === "call_log" || contentType === "group_call_active") && payload.callData
       ? { callData: { ...payload.callData } }
@@ -310,6 +323,7 @@ async function saveMessage(payload) {
     // Trả về pollData để frontend hiển thị bình chọn
     ...(newMessage.pollData ? { pollData: newMessage.pollData } : {}),
     ...(newMessage.callData ? { callData: newMessage.callData } : {}),
+    ...(newMessage.reminderData ? { reminderData: newMessage.reminderData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
     replyTo: newMessage.replyTo,
@@ -390,6 +404,7 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         // pollData được giữ nguyên khi đọc lại từ DB
         ...(msg.pollData ? { pollData: msg.pollData } : {}),
         ...(msg.callData ? { callData: msg.callData } : {}),
+        ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         replyTo: msg.replyTo || null,
@@ -406,11 +421,20 @@ async function getMessagesForConversation(conversationId, currentUserId) {
   return enriched;
 }
 
-function resolveAttachmentType(mimetype) {
-  if (!mimetype) return "file";
-  if (mimetype.startsWith("image/")) return "image";
-  if (mimetype.startsWith("video/")) return "video";
-  if (mimetype.startsWith("audio/")) return "voice";
+function resolveAttachmentType(mimetype, originalname) {
+  if (mimetype) {
+    if (mimetype.startsWith("image/")) return "image";
+    if (mimetype.startsWith("video/")) return "video";
+    if (mimetype.startsWith("audio/")) return "voice";
+  }
+  
+  if (originalname) {
+    const ext = String(originalname).split('.').pop().toLowerCase();
+    if (['wav', 'mp3', 'm4a', 'aac', 'webm', 'ogg'].includes(ext)) return "voice";
+    if (['mp4', 'mov', 'avi'].includes(ext)) return "video";
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return "image";
+  }
+  
   return "file";
 }
 
@@ -467,8 +491,8 @@ async function saveFileMessage(data) {
     ? `channel:${channelId}`
     : `dm:${[String(senderId), String(receiverId)].sort((a, b) => Number(a) - Number(b)).join(":")}`;
 
-  const attachmentType = resolveAttachmentType(data.attachment.mimetype);
-  const messageType = attachmentType === "voice" ? "voice" : attachmentType === "video" ? "video" : "file";
+  const attachmentType = resolveAttachmentType(data.attachment.mimetype, data.attachment.originalname);
+  const messageType = attachmentType;
   const persistedMessageId = randomUUID();
   const createdAt = new Date().toISOString();
 
@@ -702,6 +726,7 @@ async function searchMessagesInConversation({
         content: msg.content,
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
         ...(msg.pollData ? { pollData: msg.pollData } : {}),
+        ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         createdAt: msg.createdAt,
@@ -898,4 +923,5 @@ module.exports = {
   searchMessagesInConversation,
   searchMessagesForUserGlobal,
   stopLiveLocationMessage,
+  enrichSenderInfo,
 };

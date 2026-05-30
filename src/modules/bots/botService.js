@@ -649,6 +649,7 @@ async function embedQuery(userQuery) {
       const values = result?.embedding?.values;
 
       if (Array.isArray(values) && values.length > 0) {
+        console.log(`[RAG DEBUG] Embedding model Succeeded: ${modelName}`);
         return values;
       }
     } catch (error) {

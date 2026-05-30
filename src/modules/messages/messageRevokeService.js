@@ -96,11 +96,72 @@ async function revokeMessage(conversationId, messageId, userId) {
     }),
   );
 
+  // 7. Auto-unpin the message if it was pinned in friendship or group
+  let updatedPinnedList = null;
+  if (conversationId.startsWith("dm:")) {
+    const parts = conversationId.split(":");
+    if (parts.length >= 3) {
+      try {
+        const friendService = require("../users/friendService");
+        const rec = await friendService.findExistingRecord(parts[1], parts[2]);
+        if (rec) {
+          let pinned = Array.isArray(rec.pinnedMessages) ? rec.pinnedMessages : [];
+          const isPinned = pinned.some(m => String(m.id) === normalizedMessageId);
+          if (isPinned) {
+            pinned = pinned.filter(m => String(m.id) !== normalizedMessageId);
+            const { UpdateCommand } = require("@aws-sdk/lib-dynamodb");
+            const FRIENDS_TABLE = process.env.DDB_FRIENDSHIPS_TABLE || "ott_friendships";
+            await ddbDocClient.send(new UpdateCommand({
+              TableName: FRIENDS_TABLE,
+              Key: { friendshipId: String(rec.friendshipId) },
+              UpdateExpression: 'SET pinnedMessages = :p, updated_at = :u',
+              ExpressionAttributeValues: {
+                ':p': pinned,
+                ':u': new Date().toISOString()
+              }
+            }));
+            updatedPinnedList = pinned;
+          }
+        }
+      } catch (err) {
+        console.error("[revokeMessage] Error unpinning from friendship:", err);
+      }
+    }
+  } else {
+    // Group chat
+    try {
+      const GROUPS_TABLE = process.env.DDB_GROUPS_TABLE || "ott_groups";
+      const result = await ddbDocClient.send(new GetCommand({
+        TableName: GROUPS_TABLE,
+        Key: { groupId: String(conversationId) }
+      }));
+      const g = result.Item;
+      if (g) {
+        let pinned = Array.isArray(g.pinnedMessages) ? g.pinnedMessages : [];
+        const isPinned = pinned.some(m => String(m.id) === normalizedMessageId);
+        if (isPinned) {
+          pinned = pinned.filter(m => String(m.id) !== normalizedMessageId);
+          const { UpdateCommand } = require("@aws-sdk/lib-dynamodb");
+          await ddbDocClient.send(new UpdateCommand({
+            TableName: GROUPS_TABLE,
+            Key: { groupId: String(conversationId) },
+            UpdateExpression: 'SET pinnedMessages = :p',
+            ExpressionAttributeValues: { ':p': pinned }
+          }));
+          updatedPinnedList = pinned;
+        }
+      }
+    } catch (err) {
+      console.error("[revokeMessage] Error unpinning from group:", err);
+    }
+  }
+
   return {
     conversationId,
     messageId: normalizedMessageId,
     revokedAt: new Date().toISOString(),
     revokedBy: userId,
+    updatedPinnedList,
   };
 }
 

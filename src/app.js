@@ -13,6 +13,7 @@ const { Server } = require("socket.io");
 const authRoutes = require("./modules/auth/authRoutes");
 const userRoutes = require("./modules/users/userRoutes");
 const friendRoutes = require("./modules/users/friendRoutes");
+const qrFriendRoutes = require("./modules/users/qrFriendRoutes");
 const messageRoutes = require("./modules/messages/messageRoutes");
 const groupRoutes = require("./modules/groups/groupRoutes");
 const channelRoutes = require("./modules/channels/channelRoutes");
@@ -24,7 +25,11 @@ const messageDeleteRoutes = require("./modules/messages/messageDeleteRoutes");
 const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
 const notificationRoutes = require("./modules/notifications/notificationRoutes");
 const callRoutes = require("./modules/calls/callRoutes");
+const reminderRoutes = require("./modules/reminders/reminderRoutes");
+const noteRoutes = require("./modules/notes/noteRoutes");
+const postRoutes = require("./modules/posts/postRoutes");
 const { recoverCallsOnBoot } = require("./modules/calls/callRecovery");
+const { startReminderScheduler } = require("./modules/reminders/reminderScheduler");
 
 // Socket Handler
 const {
@@ -87,19 +92,24 @@ app.get("/health", (req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/friends", friendRoutes);
+app.use("/api/friends", qrFriendRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/messages-extension", messageRevokeRoutes);
 app.use("/api/messages-extension", messageDeleteRoutes);
 app.use("/api/messages-extension", messageForwardRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/reminders", reminderRoutes);
+app.use("/api/notes", noteRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/channels", channelRoutes);
 app.use("/api/v1/bot", botRoutes);
 app.use("/api/uploads", uploadRoutes);
 app.use("/api/stats", statsRoutes);
 app.use("/api/calls", callRoutes);
+app.use("/api/posts", postRoutes);
 
 // Socket.io Middleware and Initialization
+app.set("io", io);
 io.use(socketAuthMiddleware);
 initializeIO(io);
 
@@ -119,6 +129,8 @@ server.listen(PORT, () => {
   recoverCallsOnBoot(io).catch((err) => {
     console.error("[BOOT] Call recovery failed:", err.message);
   });
+
+  startReminderScheduler(io);
 });
 
 module.exports = { app, server, io };

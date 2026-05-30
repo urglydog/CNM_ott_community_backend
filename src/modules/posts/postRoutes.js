@@ -8,6 +8,7 @@ router.post('/', authMiddleware, postController.createPost);
 router.get('/feed', authMiddleware, postController.getFeedPosts);
 router.get('/user/:userId', authMiddleware, postController.getUserPosts);
 router.get('/:postId', authMiddleware, postController.getPostById);
+router.put('/:postId', authMiddleware, postController.updatePost);
 router.put('/:postId/like', authMiddleware, postController.toggleLike);
 router.delete('/:postId', authMiddleware, postController.deletePost);
 

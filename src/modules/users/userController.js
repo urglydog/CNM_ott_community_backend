@@ -43,6 +43,14 @@ async function updateProfile(req, res) {
     }
 
     const updatedUser = await userService.updateProfile(userId, req.body || {});
+
+    // Emit socket event for real-time synchronization across web and mobile apps
+    const io = req.app.get('io');
+    if (io) {
+      const { emitToUserSockets } = require('../../socket/socketUserRegistry');
+      emitToUserSockets(io, userId, 'profile_updated', updatedUser);
+    }
+
     return res.json({ message: 'Cập nhật hồ sơ thành công', user: updatedUser });
   } catch (error) {
     return res.status(400).json({ message: error.message });

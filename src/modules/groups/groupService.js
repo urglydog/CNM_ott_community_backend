@@ -571,6 +571,42 @@ async function getInviteLink(groupId) {
   return { inviteCode, inviteLink };
 }
 
+function mapGroupItem(g) {
+  return {
+    groupId: g.groupId,
+    name: g.name,
+    description: g.description,
+    topic: g.type,
+    avatarUrl: g.avatar_url,
+    memberCount: g.member_count,
+    createdBy: g.created_by,
+    createdAt: g.created_at,
+    isApprovalRequired: !!g.isApprovalRequired,
+    inviteCode: g.inviteCode,
+    allowSendLinks: g.allowSendLinks || 'ALL',
+    spamFilterLevel: g.spamFilterLevel !== undefined ? g.spamFilterLevel : 1
+  };
+}
+
+async function getGroupByInviteCode(inviteCode) {
+  const normalizedCode = String(inviteCode || '').trim().toLowerCase();
+  if (!normalizedCode) {
+    throw new Error('Invalid invite code');
+  }
+
+  const scanRes = await ddbDocClient.send(new ScanCommand({
+    TableName: GROUPS_TABLE,
+    FilterExpression: 'inviteCode = :code',
+    ExpressionAttributeValues: { ':code': normalizedCode }
+  }));
+
+  if (!scanRes.Items || scanRes.Items.length === 0) {
+    throw new Error('Invalid invite code or group not found');
+  }
+
+  return mapGroupItem(scanRes.Items[0]);
+}
+
 async function joinGroupByInviteCode(userId, inviteCode) {
   // Normalize inviteCode to lowercase to match DynamoDB storage (generated via crypto.randomBytes)
   const normalizedCode = String(inviteCode).trim().toLowerCase();
@@ -606,7 +642,7 @@ async function joinGroupByInviteCode(userId, inviteCode) {
 
   if (needsApproval) {
     const reqRes = await requestToJoin(groupId, userId);
-    return { ...reqRes, status: 'PENDING' };
+    return { ...reqRes, group: mapGroupItem(group), groupId, status: 'PENDING' };
   }
 
   await addMemberToGroup(groupId, userKey, 'MEMBER');
@@ -646,7 +682,7 @@ async function joinGroupByInviteCode(userId, inviteCode) {
     });
   }
 
-  return { groupId, userId: userKey, role: 'MEMBER', status: 'JOINED' };
+  return { groupId, group: mapGroupItem(group), userId: userKey, role: 'MEMBER', status: 'JOINED' };
 }
 
 async function updateGroupSettings(groupId, requestUserId, settings) {
@@ -941,6 +977,7 @@ module.exports = {
   getGroupMembers,
   getGroupsForUser,
   getInviteLink,
+  getGroupByInviteCode,
   joinGroupByInviteCode,
   debugGetMembers,
   debugGetMembers,

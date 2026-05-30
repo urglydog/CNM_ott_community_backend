@@ -17,7 +17,6 @@ const qrFriendRoutes = require("./modules/users/qrFriendRoutes");
 const messageRoutes = require("./modules/messages/messageRoutes");
 const groupRoutes = require("./modules/groups/groupRoutes");
 const channelRoutes = require("./modules/channels/channelRoutes");
-const callRoutes = require("./modules/calls/callRoutes");
 const botRoutes = require("./modules/bots/botRoutes");
 const uploadRoutes = require("./modules/media/uploadRoutes");
 const statsRoutes = require("./modules/stats/statsRoutes");
@@ -25,6 +24,12 @@ const messageRevokeRoutes = require("./modules/messages/messageRevokeRoutes");
 const messageDeleteRoutes = require("./modules/messages/messageDeleteRoutes");
 const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
 const notificationRoutes = require("./modules/notifications/notificationRoutes");
+const callRoutes = require("./modules/calls/callRoutes");
+const reminderRoutes = require("./modules/reminders/reminderRoutes");
+const noteRoutes = require("./modules/notes/noteRoutes");
+const postRoutes = require("./modules/posts/postRoutes");
+const { recoverCallsOnBoot } = require("./modules/calls/callRecovery");
+const { startReminderScheduler } = require("./modules/reminders/reminderScheduler");
 
 // Socket Handler
 const {
@@ -93,14 +98,18 @@ app.use("/api/messages-extension", messageRevokeRoutes);
 app.use("/api/messages-extension", messageDeleteRoutes);
 app.use("/api/messages-extension", messageForwardRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/reminders", reminderRoutes);
+app.use("/api/notes", noteRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/channels", channelRoutes);
-app.use("/api/calls", callRoutes);
 app.use("/api/v1/bot", botRoutes);
 app.use("/api/uploads", uploadRoutes);
 app.use("/api/stats", statsRoutes);
+app.use("/api/calls", callRoutes);
+app.use("/api/posts", postRoutes);
 
 // Socket.io Middleware and Initialization
+app.set("io", io);
 io.use(socketAuthMiddleware);
 initializeIO(io);
 
@@ -115,6 +124,13 @@ server.listen(PORT, () => {
   console.log(
     `OTT Community backend (Restructured) is running on port ${PORT}`,
   );
+
+  // Phase 2d: Recover orphaned call state from previous server instance
+  recoverCallsOnBoot(io).catch((err) => {
+    console.error("[BOOT] Call recovery failed:", err.message);
+  });
+
+  startReminderScheduler(io);
 });
 
 module.exports = { app, server, io };

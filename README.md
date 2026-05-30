@@ -54,7 +54,7 @@ Backend phục vụ ứng dụng OTT Community, được xây dựng trên Node.
 
 - **Runtime**: Node.js
 - **Framework**: Express.js
-- **Real-time**: Socket.io (Hỗ trợ Chat, Call, Presence)
+- **Real-time**: Socket.io (Hỗ trợ Chat, Presence)
 - **Database**: 
   - **DynamoDB**: Lưu trữ Users, Messages, Groups, Channels, Friendships.
   - **MySQL**: (Tùy chọn) Phục vụ các dữ liệu quan hệ phức tạp.
@@ -71,7 +71,7 @@ Dự án được tổ chức theo mô hình mô-đun:
 │   ├── /modules
 │   │   ├── /auth          # Đăng ký, đăng nhập, JWT, Refresh Token
 │   │   ├── /users         # Quản lý Profile, Danh bạ (Friends), Tìm kiếm
-│   │   ├── /chat          # Tin nhắn, Nhóm (Groups), Kênh (Channels), Call (Zego)
+│   │   ├── /chat          # Tin nhắn, Nhóm (Groups), Kênh (Channels)
 │   │   ├── /presence      # Trạng thái Online/Offline (Real-time)
 │   │   └── /media         # Xử lý Upload Media qua S3 Presigned URL
 │   ├── /common            # Middlewares & Utils dùng chung (JWT, Auth Check)
@@ -136,7 +136,11 @@ Server sử dụng Socket.io để xử lý các sự kiện thời gian thực:
 - `join_room`: Tham gia phòng chat.
 - `send_message`: Gửi tin nhắn real-time.
 - `typing_start` / `typing_stop`: Hiệu ứng đang soạn tin.
-- `call-request` / `call-accepted`: Xử lý tín hiệu cuộc gọi.
+- `mark_read`: Đánh dấu tin nhắn đã đọc.
+- `vote_poll`: Bình chọn trong chat.
+- `start_live_location` / `update_live_location` / `stop_live_location`: Chia sẻ vị trí trực tiếp.
+
+> **Note:** Video/voice call functionality (Agora-based) is planned for Phase 2.
 
 ---
 © 2024 OTT Community Team

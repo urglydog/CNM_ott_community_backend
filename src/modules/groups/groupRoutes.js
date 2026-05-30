@@ -9,6 +9,7 @@ router.delete('/:groupId/disband', authMiddleware, groupController.disbandGroup)
 router.post('/:groupId/disband', authMiddleware, groupController.disbandGroup);
 
 router.get('/', groupController.listGroups);
+router.get('/invite/:inviteCode', authMiddleware, groupController.getGroupByInviteCode);
 router.get('/:groupId', groupController.getGroupById);
 router.post('/:groupId/members', authMiddleware, groupController.addMembers);
 router.delete('/:groupId/members/:userId', authMiddleware, groupController.kickMember);

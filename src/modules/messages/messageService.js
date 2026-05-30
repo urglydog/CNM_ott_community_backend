@@ -25,16 +25,20 @@ const VALID_CONTENT_TYPES = new Set([
   "system",
   // Loại tin nhắn vị trí — lưu tọa độ {lat, lng} dưới dạng locationData
   "location",
-  // Loại tin nhắn log cuộc gọi từ ZegoCloud webhook
-  "call_log",
   // Loại tin nhắn bình chọn (poll)
   "poll",
+  "reminder",
+  "reminder_due",
+  "note",
+  // Call log entry — schema-only placeholder for future Agora call integration (Phase 2)
+  // Stored in ott_messages with callData sub-document. No business logic here.
+  "call_log",
 ]);
 
 /**
  * Sanitize và chuẩn hóa contentType.
  * - Giá trị không hợp lệ → mặc định "text"
- * - Cho phép: text | image | file | video | emoji | sticker
+ * - Cho phép: text | image | file | video | emoji | sticker | system | location | poll | call_log
  */
 function normalizeContentType(raw) {
   const ct = String(raw || "text")
@@ -256,6 +260,20 @@ async function saveMessage(payload) {
           },
         }
       : {}),
+    ...(payload.reminderData
+      ? {
+          reminderData: {
+            reminderId: String(payload.reminderData.reminderId || ""),
+            remindAt: payload.reminderData.remindAt || null,
+            repeat: payload.reminderData.repeat || "none",
+            status: payload.reminderData.status || "active",
+          },
+        }
+      : {}),
+    // callData chỉ tồn tại khi contentType === "call_log" — lưu metadata cuộc gọi
+    ...(contentType === "call_log" && payload.callData
+      ? { callData: { ...payload.callData } }
+      : {}),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
     // replyTo: lưu ID của tin nhắn gốc đang được trả lời
@@ -302,6 +320,7 @@ async function saveMessage(payload) {
     ...(newMessage.locationData ? { locationData: newMessage.locationData } : {}),
     // Trả về pollData để frontend hiển thị bình chọn
     ...(newMessage.pollData ? { pollData: newMessage.pollData } : {}),
+    ...(newMessage.reminderData ? { reminderData: newMessage.reminderData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
     replyTo: newMessage.replyTo,
@@ -375,14 +394,13 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         conversationId,
         senderId: msg.senderId,
         contentType: msg.contentType,
-        messageType: msg.messageType,           // ← cần cho call_log UI
         content: msg.content,
-        callData: msg.callData || null,          // ← cần cho call_log UI
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
         // locationData được giữ nguyên khi đọc lại từ DB
         ...(msg.locationData ? { locationData: msg.locationData } : {}),
         // pollData được giữ nguyên khi đọc lại từ DB
         ...(msg.pollData ? { pollData: msg.pollData } : {}),
+        ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         replyTo: msg.replyTo || null,
@@ -704,6 +722,7 @@ async function searchMessagesInConversation({
         content: msg.content,
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
         ...(msg.pollData ? { pollData: msg.pollData } : {}),
+        ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         createdAt: msg.createdAt,
@@ -890,159 +909,8 @@ async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
   return messages[idx];
 }
 
-/**
- * Lưu log cuộc gọi (Call Log) từ ZegoCloud Webhook vào DynamoDB.
- * @param {object} payload - { conversationId, senderId, callData: { callType, status, duration } }
- */
-async function saveCallLogMessage({ conversationId, senderId, callData }) {
-  // ── Validate & Sanitize đầu vào ──────────────────────────────────────────
-  if (!conversationId) throw new Error("[saveCallLogMessage] conversationId is required");
-  if (!callData) throw new Error("[saveCallLogMessage] callData is required");
-
-  // senderId có thể thiếu từ ZegoCloud webhook → fallback về 'zego_webhook'
-  const resolvedSenderId = senderId && String(senderId).trim()
-    ? String(senderId).trim()
-    : "zego_webhook";
-
-  const id = Date.now();
-  const messageId = randomUUID();
-  const createdAt = new Date().toISOString();
-
-  const newMessage = {
-    id,
-    messageId,
-    senderId: resolvedSenderId,
-    contentType: "call_log", // backward compatible
-    messageType: "call_log", // user specific request
-    content: "Cuộc gọi " + (callData.callType === "video" ? "video" : "thoại"),
-    callData: {
-      callType: callData.callType || "voice",
-      status: callData.status || "missed",
-      duration: Number(callData.duration) || 0,
-      // Giữ roomId nếu có (dùng cho banner group_call_started → nút [Tham gia])
-      ...(callData.roomId ? { roomId: String(callData.roomId) } : {}),
-      // Giữ messageType nếu có (phân biệt group_call_started vs call_log thông thường)
-      ...(callData.messageType ? { messageType: String(callData.messageType) } : {}),
-    },
-    createdAt,
-  };
-
-  // ── Bước 1: Lấy document hiện tại từ DynamoDB ───────────────────────────
-  let messages = [];
-  try {
-    const getRes = await ddbDocClient.send(
-      new GetCommand({
-        TableName: MESSAGES_TABLE,
-        Key: { conversationId: String(conversationId) },
-      })
-    );
-    const existing = getRes.Item || { conversationId: String(conversationId), messages: [] };
-    messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
-  } catch (getError) {
-    console.error("❌ [DYNAMODB GET ERROR] Không đọc được messages cũ:", getError.message, getError.stack);
-    // Tiếp tục với mảng rỗng — sẽ tạo document mới
-    messages = [];
-  }
-
-  messages.push(newMessage);
-
-  // ── Bước 2: Ghi document cập nhật vào DynamoDB ──────────────────────────
-  const itemToSave = {
-    conversationId: String(conversationId),
-    messages,
-  };
-
-  console.log("📦 [DYNAMODB PAYLOAD]:", JSON.stringify(itemToSave, null, 2));
-
-  try {
-    await ddbDocClient.send(
-      new PutCommand({
-        TableName: MESSAGES_TABLE,
-        Item: itemToSave,
-      })
-    );
-    console.log(`✅ [DYNAMODB PUT OK] conversationId=${conversationId}, messageId=${messageId}`);
-  } catch (error) {
-    console.error("❌ [DYNAMODB ERROR]:", error.message, error.stack);
-    throw error; // re-throw để controller biết lưu thất bại
-  }
-
-  // ── Bước 3: Enrich thông tin người gọi để trả về Frontend ───────────────
-  const info = await enrichSenderInfo(resolvedSenderId);
-  return {
-    ...newMessage,
-    conversationId: String(conversationId),
-    senderDisplayName: info.senderDisplayName,
-    senderAvatarUrl: info.senderAvatarUrl,
-  };
-}
-
-/**
- * Tìm tin nhắn group_call_started (callData.roomId === roomId && status === "started")
- * trong conversation và UPDATE tại chỗ thành status completed/missed với duration.
- * KHÔNG tạo tin nhắn mới — chỉ cập nhật existing message.
- *
- * @returns {object|null} - Message đã được update, hoặc null nếu không tìm thấy
- */
-async function updateCallLogMessage({ conversationId, roomId, status, durationSec, messageId }) {
-  if (!conversationId || !messageId) throw new Error("[updateCallLogMessage] conversationId và messageId là bắt buộc");
-
-  // Bước 1: Đọc document hiện tại
-  const getRes = await ddbDocClient.send(
-    new GetCommand({ TableName: MESSAGES_TABLE, Key: { conversationId: String(conversationId) } })
-  );
-  const existing = getRes.Item || { conversationId: String(conversationId), messages: [] };
-  const messages = Array.isArray(existing.messages) ? existing.messages.slice() : [];
-
-  // Bước 2: Tìm message cần update - BẮT BUỘC theo messageId
-  const targetIdx = messages.findIndex(
-    (m) => String(m.messageId) === String(messageId)
-  );
-
-  if (targetIdx === -1) {
-    console.warn(`[updateCallLogMessage] Không tìm thấy message cho messageId=${messageId} trong ${conversationId}`);
-    return null;
-  }
-
-  // Bước 3: Update tại chỗ
-  const updatedMsg = {
-    ...messages[targetIdx],
-    callData: {
-      ...messages[targetIdx].callData,
-      status,
-      duration: Number(durationSec) || 0,
-      // Xóa messageType "group_call_started" — giờ là call_log hoàn thành
-      messageType: undefined,
-    },
-    contentType: "call_log",
-    messageType: "call_log",
-    content: "Cuộc gọi " + (messages[targetIdx].callData?.callType === "video" ? "video" : "thoại"),
-  };
-  // Dọn undefined keys
-  if (updatedMsg.callData.messageType === undefined) delete updatedMsg.callData.messageType;
-
-  messages[targetIdx] = updatedMsg;
-
-  // Bước 4: Ghi lại DynamoDB
-  await ddbDocClient.send(
-    new PutCommand({ TableName: MESSAGES_TABLE, Item: { conversationId: String(conversationId), messages } })
-  );
-  console.log(`✅ [updateCallLogMessage] Updated messageId=${updatedMsg.messageId} → status=${status}, duration=${durationSec}s`);
-
-  // Bước 5: Enrich sender info để trả về
-  const info = await enrichSenderInfo(updatedMsg.senderId);
-  return {
-    ...updatedMsg,
-    conversationId: String(conversationId),
-    senderDisplayName: info.senderDisplayName,
-    senderAvatarUrl: info.senderAvatarUrl,
-  };
-}
-
 module.exports = {
   saveMessage,
-  saveCallLogMessage,
-  updateCallLogMessage,
   saveStickerMessage,
   getMessagesForConversation,
   getRepliedMessageInfo,

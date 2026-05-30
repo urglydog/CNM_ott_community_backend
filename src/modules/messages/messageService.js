@@ -276,6 +276,7 @@ async function saveMessage(payload) {
       : {}),
     attachments: payload.attachments || null,
     reactions: payload.reactions || null,
+    storyReply: payload.storyReply || null,
     // replyTo: lưu ID của tin nhắn gốc đang được trả lời
     replyTo: payload.replyTo || null,
     mentions: Array.isArray(payload.mentions) ? payload.mentions.map(String) : [],
@@ -323,6 +324,7 @@ async function saveMessage(payload) {
     ...(newMessage.reminderData ? { reminderData: newMessage.reminderData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
+    storyReply: newMessage.storyReply,
     replyTo: newMessage.replyTo,
     mentions: newMessage.mentions,
     // Trả về đầy đủ thông tin replyTo đã populate để frontend hiển thị
@@ -403,6 +405,7 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
+        storyReply: msg.storyReply || null,
         replyTo: msg.replyTo || null,
         mentions: msg.mentions || [],
         createdAt: msg.createdAt,

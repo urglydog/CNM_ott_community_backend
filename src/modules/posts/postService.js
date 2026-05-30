@@ -127,6 +127,39 @@ async function getUserPosts(userId, { limit = 20 } = {}) {
   return { posts: await Promise.all(posts.map(enrichPost)), count: posts.length };
 }
 
+async function updatePost(postId, userId, { content } = {}) {
+  const post = await getPostById(postId);
+  if (!post) throw new Error('Bài viết không tồn tại');
+  if (String(post.userId) !== String(userId)) {
+    throw new Error('Bạn không có quyền chỉnh sửa bài viết này');
+  }
+  if (Date.now() - new Date(post.createdAt).getTime() >= 7 * 24 * 60 * 60 * 1000) {
+    throw new Error('Bài viết quá 7 ngày không thể chỉnh sửa');
+  }
+
+  const nextContent = String(content || '').trim();
+  if (!nextContent && (!post.media || post.media.length === 0)) {
+    throw new Error('Bài viết cần có nội dung hoặc hình ảnh/video');
+  }
+
+  const updatedAt = new Date().toISOString();
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: POSTS_TABLE,
+    Key: { postId: String(postId) },
+    UpdateExpression: 'SET #content = :content, #updatedAt = :updatedAt',
+    ExpressionAttributeNames: {
+      '#content': 'content',
+      '#updatedAt': 'updatedAt',
+    },
+    ExpressionAttributeValues: {
+      ':content': nextContent,
+      ':updatedAt': updatedAt,
+    },
+  }));
+
+  return getPostById(postId);
+}
+
 async function toggleLike(postId, userId) {
   const post = await getPostById(postId);
   if (!post) throw new Error('Bài viết không tồn tại');
@@ -382,6 +415,7 @@ module.exports = {
   getPostById,
   getFeedPosts,
   getUserPosts,
+  updatePost,
   toggleLike,
   deletePost,
   createComment,

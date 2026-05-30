@@ -16,9 +16,9 @@ async function uploadDirect(req, res) {
       return res.status(400).json({ message: 'Vui lòng chọn tệp cần tải lên' });
     }
 
-    const { keyPrefix } = req.body || {};
+    const { keyPrefix, folder } = req.body || {};
     const result = await uploadService.uploadBufferDirect({
-      keyPrefix,
+      keyPrefix: keyPrefix || folder,
       contentType: req.file.mimetype,
       buffer: req.file.buffer,
     });

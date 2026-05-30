@@ -25,7 +25,9 @@ const messageDeleteRoutes = require("./modules/messages/messageDeleteRoutes");
 const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
 const notificationRoutes = require("./modules/notifications/notificationRoutes");
 const callRoutes = require("./modules/calls/callRoutes");
+const reminderRoutes = require("./modules/reminders/reminderRoutes");
 const { recoverCallsOnBoot } = require("./modules/calls/callRecovery");
+const { startReminderScheduler } = require("./modules/reminders/reminderScheduler");
 
 // Socket Handler
 const {
@@ -94,6 +96,7 @@ app.use("/api/messages-extension", messageRevokeRoutes);
 app.use("/api/messages-extension", messageDeleteRoutes);
 app.use("/api/messages-extension", messageForwardRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/reminders", reminderRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/channels", channelRoutes);
 app.use("/api/v1/bot", botRoutes);
@@ -121,6 +124,8 @@ server.listen(PORT, () => {
   recoverCallsOnBoot(io).catch((err) => {
     console.error("[BOOT] Call recovery failed:", err.message);
   });
+
+  startReminderScheduler(io);
 });
 
 module.exports = { app, server, io };

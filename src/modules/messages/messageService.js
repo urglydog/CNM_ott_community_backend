@@ -27,6 +27,8 @@ const VALID_CONTENT_TYPES = new Set([
   "location",
   // Loại tin nhắn bình chọn (poll)
   "poll",
+  "reminder",
+  "reminder_due",
   // Call log entry — schema-only placeholder for future Agora call integration (Phase 2)
   // Stored in ott_messages with callData sub-document. No business logic here.
   "call_log",
@@ -257,6 +259,16 @@ async function saveMessage(payload) {
           },
         }
       : {}),
+    ...(payload.reminderData
+      ? {
+          reminderData: {
+            reminderId: String(payload.reminderData.reminderId || ""),
+            remindAt: payload.reminderData.remindAt || null,
+            repeat: payload.reminderData.repeat || "none",
+            status: payload.reminderData.status || "active",
+          },
+        }
+      : {}),
     // callData chỉ tồn tại khi contentType === "call_log" — lưu metadata cuộc gọi
     ...(contentType === "call_log" && payload.callData
       ? { callData: { ...payload.callData } }
@@ -307,6 +319,7 @@ async function saveMessage(payload) {
     ...(newMessage.locationData ? { locationData: newMessage.locationData } : {}),
     // Trả về pollData để frontend hiển thị bình chọn
     ...(newMessage.pollData ? { pollData: newMessage.pollData } : {}),
+    ...(newMessage.reminderData ? { reminderData: newMessage.reminderData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
     replyTo: newMessage.replyTo,
@@ -386,6 +399,7 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         ...(msg.locationData ? { locationData: msg.locationData } : {}),
         // pollData được giữ nguyên khi đọc lại từ DB
         ...(msg.pollData ? { pollData: msg.pollData } : {}),
+        ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         replyTo: msg.replyTo || null,
@@ -707,6 +721,7 @@ async function searchMessagesInConversation({
         content: msg.content,
         ...(msg.stickerData ? { stickerData: msg.stickerData } : {}),
         ...(msg.pollData ? { pollData: msg.pollData } : {}),
+        ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
         createdAt: msg.createdAt,

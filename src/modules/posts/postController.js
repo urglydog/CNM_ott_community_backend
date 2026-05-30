@@ -80,8 +80,8 @@ async function createComment(req, res) {
     if (!userId) return res.status(401).json({ message: 'Chưa xác thực' });
 
     const { postId } = req.params;
-    const { content } = req.body || {};
-    const comment = await postService.createComment(postId, userId, { content });
+    const { content, parentCommentId } = req.body || {};
+    const comment = await postService.createComment(postId, userId, { content, parentCommentId });
     res.status(201).json(comment);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -96,6 +96,30 @@ async function getComments(req, res) {
     res.json(result);
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+}
+
+async function toggleCommentLike(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'ChÆ°a xÃ¡c thá»±c' });
+
+    const result = await postService.toggleCommentLike(req.params.commentId, userId);
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
+async function updateComment(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Chưa xác thực' });
+
+    const result = await postService.updateComment(req.params.commentId, userId, req.body?.content);
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
   }
 }
 
@@ -120,5 +144,7 @@ module.exports = {
   deletePost,
   createComment,
   getComments,
+  updateComment,
+  toggleCommentLike,
   deleteComment,
 };

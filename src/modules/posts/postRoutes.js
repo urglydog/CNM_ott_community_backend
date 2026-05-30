@@ -14,6 +14,8 @@ router.delete('/:postId', authMiddleware, postController.deletePost);
 // Comments
 router.post('/:postId/comments', authMiddleware, postController.createComment);
 router.get('/:postId/comments', authMiddleware, postController.getComments);
+router.put('/comments/:commentId', authMiddleware, postController.updateComment);
+router.put('/comments/:commentId/like', authMiddleware, postController.toggleCommentLike);
 router.delete('/comments/:commentId', authMiddleware, postController.deleteComment);
 
 module.exports = router;

@@ -2,6 +2,9 @@
 
 const groupCallService = require('./groupCallService');
 const { onlineUsers: defaultOnlineUsers } = require('../../socket/socketUserRegistry');
+const { ddbDocClient } = require('../../config/awsConfig');
+const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
 
 /**
  * GROUP CALL SOCKET HANDLER — CLEAN REBUILD
@@ -12,6 +15,62 @@ const { onlineUsers: defaultOnlineUsers } = require('../../socket/socketUserRegi
 
 function getSocketUserId(socket) {
   return socket.userId || socket.user?.userId || socket.user?.id;
+}
+
+/**
+ * Look up user display info from ott_users table.
+ */
+async function getUserDisplayInfo(userId) {
+  try {
+    const result = await ddbDocClient.send(
+      new GetCommand({
+        TableName: USERS_TABLE,
+        Key: { userId: String(userId) },
+      }),
+    );
+    const u = result.Item;
+    return {
+      displayName: u?.display_name || u?.username || String(userId),
+      avatarUrl: u?.avatar_url || null,
+    };
+  } catch {
+    return { displayName: String(userId), avatarUrl: null };
+  }
+}
+
+/**
+ * Generate deterministic Agora UID from userId (same algorithm as groupCallService.hashCode).
+ */
+function hashCode(str) {
+  let hash = 0;
+  const s = String(str);
+  for (let i = 0; i < s.length; i++) {
+    const char = s.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+/**
+ * Enrich a list of participants with displayName, avatarUrl, and agoraUid.
+ * @param {Array<{userId: string, role?: string, status?: string}>} participants
+ * @returns {Promise<Array<{userId, displayName, avatarUrl, agoraUid, role, status}>>}
+ */
+async function enrichParticipants(participants) {
+  return Promise.all(
+    (participants || []).map(async (p) => {
+      const info = await getUserDisplayInfo(p.userId);
+      return {
+        userId: p.userId,
+        displayName: info.displayName,
+        avatarUrl: info.avatarUrl,
+        agoraUid: hashCode(p.userId),
+        ...(p.role !== undefined && { role: p.role }),
+        ...(p.status !== undefined && { status: p.status }),
+      };
+    }),
+  );
 }
 
 function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnlineUsers) {
@@ -39,6 +98,8 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
       const { session, hostJoinPayload, inviteeUserIds } = result;
 
       // Send join payload to host (the caller)
+      const enrichedParticipants = await enrichParticipants(result.participants);
+
       socket.emit('group-call:started', {
         sessionId: session.id,
         callType: 'GROUP',
@@ -46,7 +107,7 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
         token: hostJoinPayload.token,
         uid: hostJoinPayload.uid,
         conversationId,
-        participants: result.participants,
+        participants: enrichedParticipants,
       });
 
       // Emit incoming to each invitee
@@ -62,7 +123,7 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
             conversationId,
             channelName: session.channelName,
             hostUserId: userId,
-            participants: result.participants,
+            participants: enrichedParticipants,
           });
         }
       }
@@ -92,6 +153,7 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
       // We need to get joined participants to notify them
       const groupCallRepo = require('./groupCallRepository');
       const joinedParticipants = await groupCallRepo.getJoinedParticipants(sessionId);
+      const enrichedJoined = await enrichParticipants(joinedParticipants);
 
       for (const p of joinedParticipants) {
         if (String(p.userId) === String(userId)) continue; // skip self
@@ -100,16 +162,14 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
           s.emit('group-call:participant-joined', {
             sessionId,
             joinedUserId: userId,
-            participants: joinedParticipants.map((jp) => ({
-              userId: jp.userId,
-              status: jp.status,
-            })),
+            participants: enrichedJoined,
           });
         }
       }
 
       // Also notify still-RINGING participants so they know someone joined
       const allParticipants = await groupCallRepo.getParticipantsBySession(sessionId);
+      const enrichedAll = await enrichParticipants(allParticipants);
       const ringingParticipants = allParticipants.filter(
         (p) => p.status === 'RINGING' || p.status === 'INVITED'
       );
@@ -119,10 +179,7 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
           s.emit('group-call:state', {
             sessionId,
             status: 'ACTIVE',
-            participants: allParticipants.map((ap) => ({
-              userId: ap.userId,
-              status: ap.status,
-            })),
+            participants: enrichedAll,
           });
         }
       }

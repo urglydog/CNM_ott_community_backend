@@ -6,6 +6,7 @@ const {
   PutCommand,
   QueryCommand,
   ScanCommand,
+  UpdateCommand,
 } = require('@aws-sdk/lib-dynamodb');
 const { ddbDocClient } = require('../../config/awsConfig');
 const { CALLS_TABLE } = require('./callModel');
@@ -132,6 +133,8 @@ async function createSession({ conversationId, channelName, hostUserId }) {
     endedAt: null,
     endedReason: null,
     endedBy: null,
+    activeCallMessageCreated: false,
+    callLogCreated: false,
     createdAt: now,
     updatedAt: now,
   };
@@ -333,6 +336,52 @@ async function getRawSession(sessionId) {
   return result.Item || null;
 }
 
+async function markActiveCallMessageCreated(sessionId) {
+  try {
+    await ddbDocClient.send(
+      new UpdateCommand({
+        TableName: CALLS_TABLE,
+        Key: { callId: String(sessionId) },
+        UpdateExpression: "SET activeCallMessageCreated = :true",
+        ConditionExpression: "activeCallMessageCreated = :false",
+        ExpressionAttributeValues: {
+          ":true": true,
+          ":false": false,
+        },
+      }),
+    );
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      return false;
+    }
+    throw err;
+  }
+}
+
+async function markCallLogCreated(sessionId) {
+  try {
+    await ddbDocClient.send(
+      new UpdateCommand({
+        TableName: CALLS_TABLE,
+        Key: { callId: String(sessionId) },
+        UpdateExpression: "SET callLogCreated = :true",
+        ConditionExpression: "callLogCreated = :false",
+        ExpressionAttributeValues: {
+          ":true": true,
+          ":false": false,
+        },
+      }),
+    );
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      return false;
+    }
+    throw err;
+  }
+}
+
 module.exports = {
   ensureTables,
   createSession,
@@ -347,4 +396,6 @@ module.exports = {
   getActiveSessionByConversation,
   getActiveSessionForUser,
   countJoinedParticipants,
+  markActiveCallMessageCreated,
+  markCallLogCreated,
 };

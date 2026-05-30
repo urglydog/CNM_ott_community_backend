@@ -33,6 +33,8 @@ const VALID_CONTENT_TYPES = new Set([
   // Call log entry — schema-only placeholder for future Agora call integration (Phase 2)
   // Stored in ott_messages with callData sub-document. No business logic here.
   "call_log",
+  // Group call active message — system message when a group call starts
+  "group_call_active",
 ]);
 
 /**
@@ -271,7 +273,7 @@ async function saveMessage(payload) {
         }
       : {}),
     // callData chỉ tồn tại khi contentType === "call_log" — lưu metadata cuộc gọi
-    ...(contentType === "call_log" && payload.callData
+    ...((contentType === "call_log" || contentType === "group_call_active") && payload.callData
       ? { callData: { ...payload.callData } }
       : {}),
     attachments: payload.attachments || null,
@@ -320,6 +322,7 @@ async function saveMessage(payload) {
     ...(newMessage.locationData ? { locationData: newMessage.locationData } : {}),
     // Trả về pollData để frontend hiển thị bình chọn
     ...(newMessage.pollData ? { pollData: newMessage.pollData } : {}),
+    ...(newMessage.callData ? { callData: newMessage.callData } : {}),
     ...(newMessage.reminderData ? { reminderData: newMessage.reminderData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
@@ -400,6 +403,7 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         ...(msg.locationData ? { locationData: msg.locationData } : {}),
         // pollData được giữ nguyên khi đọc lại từ DB
         ...(msg.pollData ? { pollData: msg.pollData } : {}),
+        ...(msg.callData ? { callData: msg.callData } : {}),
         ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,

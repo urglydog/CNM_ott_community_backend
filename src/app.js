@@ -26,6 +26,7 @@ const messageForwardRoutes = require("./modules/messages/messageForwardRoutes");
 const notificationRoutes = require("./modules/notifications/notificationRoutes");
 const callRoutes = require("./modules/calls/callRoutes");
 const reminderRoutes = require("./modules/reminders/reminderRoutes");
+const noteRoutes = require("./modules/notes/noteRoutes");
 const { recoverCallsOnBoot } = require("./modules/calls/callRecovery");
 const { startReminderScheduler } = require("./modules/reminders/reminderScheduler");
 
@@ -97,6 +98,7 @@ app.use("/api/messages-extension", messageDeleteRoutes);
 app.use("/api/messages-extension", messageForwardRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/reminders", reminderRoutes);
+app.use("/api/notes", noteRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/channels", channelRoutes);
 app.use("/api/v1/bot", botRoutes);

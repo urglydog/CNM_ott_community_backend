@@ -29,6 +29,7 @@ const VALID_CONTENT_TYPES = new Set([
   "poll",
   "reminder",
   "reminder_due",
+  "note",
   // Call log entry — schema-only placeholder for future Agora call integration (Phase 2)
   // Stored in ott_messages with callData sub-document. No business logic here.
   "call_log",

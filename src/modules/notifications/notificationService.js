@@ -163,6 +163,7 @@ function buildMessagePreview(message) {
   if (contentType === "emoji") return content || "[Biểu tượng cảm xúc]";
   if (contentType === "reminder") return "[Nhắc hẹn]";
   if (contentType === "reminder_due") return content || "Đến giờ nhắc hẹn";
+  if (contentType === "note") return content ? `[Ghi chú] ${content}` : "[Ghi chú]";
   if (content) return content;
 
   const attachment = Array.isArray(message?.attachments) ? message.attachments[0] : null;

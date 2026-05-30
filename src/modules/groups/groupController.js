@@ -111,6 +111,23 @@ async function getInviteInfo(req, res) {
   }
 }
 
+async function getGroupByInviteCode(req, res) {
+  try {
+    const { inviteCode } = req.params;
+    const group = await groupService.getGroupByInviteCode(inviteCode);
+    res.json(group);
+  } catch (error) {
+    if (
+      error.message === 'Invalid invite code' ||
+      error.message === 'Invalid invite code or group not found'
+    ) {
+      res.status(404).json({ message: error.message });
+    } else {
+      res.status(500).json({ message: error.message });
+    }
+  }
+}
+
 async function joinGroup(req, res) {
   try {
     const { inviteCode } = req.params;
@@ -402,6 +419,7 @@ module.exports = {
   getGroupMembers,
   getGroupsForUser,
   getInviteInfo,
+  getGroupByInviteCode,
   joinGroup,
   debugMembers,
   disbandGroup,

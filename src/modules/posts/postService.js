@@ -6,6 +6,31 @@ const userService = require('../users/userService');
 const POSTS_TABLE = process.env.DDB_POSTS_TABLE || 'ott_posts';
 const COMMENTS_TABLE = process.env.DDB_COMMENTS_TABLE || 'ott_comments';
 
+async function enrichLikes(likes) {
+  const ids = Array.isArray(likes) ? likes : [];
+  return Promise.all(ids.map(async (userId) => {
+    try {
+      const user = await userService.getUserById(userId);
+      return {
+        userId: String(userId),
+        displayName: user?.display_name || user?.username || 'NgÆ°á»i dÃ¹ng',
+        avatarUrl: user?.avatar_url || null,
+      };
+    } catch {
+      return { userId: String(userId), displayName: 'NgÆ°á»i dÃ¹ng', avatarUrl: null };
+    }
+  }));
+}
+
+async function enrichPost(post) {
+  return {
+    ...post,
+    likes: Array.isArray(post.likes) ? post.likes : [],
+    likeCount: Array.isArray(post.likes) ? post.likes.length : (post.likeCount || 0),
+    likeUsers: await enrichLikes(post.likes),
+  };
+}
+
 // ─── Posts ────────────────────────────────────────────────────────────────────
 
 async function createPost(userId, { content, media }) {
@@ -48,7 +73,7 @@ async function getPostById(postId) {
     TableName: POSTS_TABLE,
     Key: { postId: String(postId) },
   }));
-  return result.Item || null;
+  return result.Item ? enrichPost(result.Item) : null;
 }
 
 async function getFeedPosts(userId, { limit = 20, lastKey } = {}) {
@@ -82,7 +107,7 @@ async function getFeedPosts(userId, { limit = 20, lastKey } = {}) {
     .slice(0, limit);
 
   return {
-    posts: feedPosts,
+    posts: await Promise.all(feedPosts.map(enrichPost)),
     count: feedPosts.length,
   };
 }
@@ -99,7 +124,7 @@ async function getUserPosts(userId, { limit = 20 } = {}) {
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
     .slice(0, limit);
 
-  return { posts, count: posts.length };
+  return { posts: await Promise.all(posts.map(enrichPost)), count: posts.length };
 }
 
 async function toggleLike(postId, userId) {
@@ -137,6 +162,7 @@ async function toggleLike(postId, userId) {
     liked: !alreadyLiked,
     likeCount: newLikes.length,
     likes: newLikes,
+    likeUsers: await enrichLikes(newLikes),
   };
 }
 
@@ -157,7 +183,7 @@ async function deletePost(postId, userId) {
 
 // ─── Comments ────────────────────────────────────────────────────────────────
 
-async function createComment(postId, userId, { content }) {
+async function createComment(postId, userId, { content, parentCommentId }) {
   if (!postId || !userId) throw new Error('Thiếu postId hoặc userId');
   if (!content || !content.trim()) throw new Error('Bình luận không được để trống');
 
@@ -169,6 +195,18 @@ async function createComment(postId, userId, { content }) {
 
   const commentId = randomUUID();
   const now = new Date().toISOString();
+  let parentComment = null;
+
+  if (parentCommentId) {
+    const parentResult = await ddbDocClient.send(new GetCommand({
+      TableName: COMMENTS_TABLE,
+      Key: { commentId: String(parentCommentId) },
+    }));
+    parentComment = parentResult.Item;
+    if (!parentComment || String(parentComment.postId) !== String(postId)) {
+      throw new Error('BÃ¬nh luáº­n gá»‘c khÃ´ng tá»“n táº¡i');
+    }
+  }
 
   const comment = {
     commentId,
@@ -177,6 +215,10 @@ async function createComment(postId, userId, { content }) {
     authorName: user.display_name || user.username || 'Unknown',
     authorAvatar: user.avatar_url || null,
     content: String(content).trim(),
+    parentCommentId: parentComment ? String(parentComment.commentId) : null,
+    rootCommentId: parentComment ? String(parentComment.rootCommentId || parentComment.commentId) : commentId,
+    likes: [],
+    likeCount: 0,
     createdAt: now,
   };
 
@@ -216,7 +258,71 @@ async function getComments(postId, { limit = 50 } = {}) {
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
     .slice(0, limit);
 
-  return { comments, count: comments.length };
+  const enrichedComments = await Promise.all(comments.map(async (comment) => ({
+    ...comment,
+    parentCommentId: comment.parentCommentId || null,
+    rootCommentId: comment.rootCommentId || comment.commentId,
+    likes: Array.isArray(comment.likes) ? comment.likes : [],
+    likeCount: Array.isArray(comment.likes) ? comment.likes.length : (comment.likeCount || 0),
+    likeUsers: await enrichLikes(comment.likes),
+  })));
+
+  return { comments: enrichedComments, count: enrichedComments.length };
+}
+
+async function toggleCommentLike(commentId, userId) {
+  const result = await ddbDocClient.send(new GetCommand({
+    TableName: COMMENTS_TABLE,
+    Key: { commentId: String(commentId) },
+  }));
+  const comment = result.Item;
+  if (!comment) throw new Error('BÃ¬nh luáº­n khÃ´ng tá»“n táº¡i');
+
+  const likes = Array.isArray(comment.likes) ? comment.likes : [];
+  const userIdStr = String(userId);
+  const alreadyLiked = likes.includes(userIdStr);
+  const newLikes = alreadyLiked ? likes.filter(id => id !== userIdStr) : [...likes, userIdStr];
+
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: COMMENTS_TABLE,
+    Key: { commentId: String(commentId) },
+    UpdateExpression: 'SET #likes = :likes, #likeCount = :likeCount',
+    ExpressionAttributeNames: { '#likes': 'likes', '#likeCount': 'likeCount' },
+    ExpressionAttributeValues: { ':likes': newLikes, ':likeCount': newLikes.length },
+  }));
+
+  return {
+    liked: !alreadyLiked,
+    likeCount: newLikes.length,
+    likes: newLikes,
+    likeUsers: await enrichLikes(newLikes),
+  };
+}
+
+async function updateComment(commentId, userId, content) {
+  if (!content || !String(content).trim()) throw new Error('Bình luận không được để trống');
+
+  const result = await ddbDocClient.send(new GetCommand({
+    TableName: COMMENTS_TABLE,
+    Key: { commentId: String(commentId) },
+  }));
+  const comment = result.Item;
+  if (!comment) throw new Error('Bình luận không tồn tại');
+  if (String(comment.userId) !== String(userId)) {
+    throw new Error('Bạn không có quyền chỉnh sửa bình luận này');
+  }
+
+  const updatedAt = new Date().toISOString();
+  const nextContent = String(content).trim();
+  await ddbDocClient.send(new UpdateCommand({
+    TableName: COMMENTS_TABLE,
+    Key: { commentId: String(commentId) },
+    UpdateExpression: 'SET #content = :content, #updatedAt = :updatedAt',
+    ExpressionAttributeNames: { '#content': 'content', '#updatedAt': 'updatedAt' },
+    ExpressionAttributeValues: { ':content': nextContent, ':updatedAt': updatedAt },
+  }));
+
+  return { ...comment, content: nextContent, updatedAt };
 }
 
 async function deleteComment(commentId, userId) {
@@ -231,25 +337,44 @@ async function deleteComment(commentId, userId) {
     throw new Error('Bạn không có quyền xóa bình luận này');
   }
 
-  await ddbDocClient.send(new DeleteCommand({
+  const branchResult = await ddbDocClient.send(new ScanCommand({
     TableName: COMMENTS_TABLE,
-    Key: { commentId: String(commentId) },
+    FilterExpression: '#pid = :pid',
+    ExpressionAttributeNames: { '#pid': 'postId' },
+    ExpressionAttributeValues: { ':pid': String(comment.postId) },
   }));
+  const allComments = branchResult.Items || [];
+  const deletedIds = new Set([String(commentId)]);
+  let foundChild = true;
+  while (foundChild) {
+    foundChild = false;
+    for (const item of allComments) {
+      if (item.parentCommentId && deletedIds.has(String(item.parentCommentId)) && !deletedIds.has(String(item.commentId))) {
+        deletedIds.add(String(item.commentId));
+        foundChild = true;
+      }
+    }
+  }
+
+  await Promise.all([...deletedIds].map(id => ddbDocClient.send(new DeleteCommand({
+    TableName: COMMENTS_TABLE,
+    Key: { commentId: id },
+  }))));
 
   // Decrease comment count on post
   try {
     await ddbDocClient.send(new UpdateCommand({
       TableName: POSTS_TABLE,
       Key: { postId: String(comment.postId) },
-      UpdateExpression: 'SET #commentCount = if_not_exists(#commentCount, :one) - :one',
+      UpdateExpression: 'SET #commentCount = if_not_exists(#commentCount, :deletedCount) - :deletedCount',
       ExpressionAttributeNames: { '#commentCount': 'commentCount' },
-      ExpressionAttributeValues: { ':one': 1 },
+      ExpressionAttributeValues: { ':deletedCount': deletedIds.size },
     }));
   } catch (e) {
     console.warn('Failed to decrease comment count:', e.message);
   }
 
-  return { deleted: true };
+  return { deleted: true, deletedCommentIds: [...deletedIds] };
 }
 
 module.exports = {
@@ -261,5 +386,7 @@ module.exports = {
   deletePost,
   createComment,
   getComments,
+  updateComment,
+  toggleCommentLike,
   deleteComment,
 };

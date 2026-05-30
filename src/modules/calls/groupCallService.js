@@ -66,6 +66,9 @@ async function startGroupCall({ conversationId, hostUserId, memberUserIds }) {
   // Return full session + host join info
   const allParticipants = await groupCallRepo.getParticipantsBySession(session.id);
 
+  // Create system message in chat
+  await createGroupCallActiveMessage(session, allParticipants);
+
   return {
     session: {
       id: session.id,
@@ -208,6 +211,7 @@ async function endGroupCall({ sessionId, userId, reason = 'host_ended' }) {
   }
 
   await groupCallRepo.endSession(sessionId, reason);
+  await createGroupCallLogMessage(sessionId, reason);
 
   return { sessionId, reason };
 }
@@ -232,6 +236,7 @@ async function checkAndMaybeEndSession(sessionId, reason) {
   if (joinedCount === 0 && ringingCount === 0) {
     console.log(`[GROUP_CALL_END] auto-ending sessionId=${sessionId} reason=${reason}`);
     await groupCallRepo.endSession(sessionId, reason);
+    await createGroupCallLogMessage(sessionId, reason);
     return true;
   }
   return false;
@@ -251,6 +256,178 @@ function hashCode(str) {
   return Math.abs(hash);
 }
 
+function formatDuration(seconds) {
+  if (!seconds || seconds <= 0) return "0:00";
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/**
+ * Create a "group_call_active" system message when a group call starts.
+ * IDEMPOTENT: uses activeCallMessageCreated flag to prevent duplicate messages.
+ *
+ * @param {Object} session - The group call session
+ * @param {string} session.id - The session/call ID
+ * @param {string} session.conversationId - The conversation ID
+ * @param {string} session.hostUserId - The initiator's user ID
+ * @param {string} session.channelName - The Agora channel name
+ * @param {string} session.startedAt - When the call started
+ * @param {Array} participants - Array of { userId, role, status }
+ */
+async function createGroupCallActiveMessage(session, participants) {
+  if (!session || !session.conversationId) return;
+
+  // Idempotency guard
+  const marked = await groupCallRepo.markActiveCallMessageCreated(session.id);
+  if (!marked) return; // Already created
+
+  const participantIds = (participants || []).map((p) => String(p.userId));
+
+  const callData = {
+    callId: session.id,
+    callMode: "group",
+    callType: "video",
+    callStatus: "active",
+    conversationId: session.conversationId,
+    startedAt: session.startedAt || new Date().toISOString(),
+    initiatorId: session.hostUserId,
+    participantIds,
+  };
+
+  try {
+    const { saveMessage } = require("../messages/messageService");
+    const savedMessage = await saveMessage({
+      conversationId: session.conversationId,
+      senderId: session.hostUserId,
+      content: "Cuộc gọi nhóm đang diễn ra",
+      contentType: "group_call_active",
+      callData,
+    });
+
+    // Broadcast realtime
+    try {
+      const { getIO } = require("../../socket/socketHandler");
+      const io = getIO();
+      if (io && savedMessage) {
+        const roomId = session.conversationId;
+        console.log(`[group-call:system-message] Broadcasting group_call_active to room ${roomId}`, savedMessage.id);
+        io.to(roomId).emit("receive_message", savedMessage);
+      }
+    } catch (emitErr) {
+      console.error("[group-call:system-message] Failed to broadcast realtime:", emitErr.message);
+    }
+  } catch (err) {
+    console.error("[group-call:system-message] Failed to create message:", err.message);
+    // Don't throw — message creation failure should not break the call flow
+  }
+}
+
+/**
+ * Create a "call_log" system message when a group call ends.
+ * IDEMPOTENT: uses callLogCreated flag to prevent duplicate messages.
+ *
+ * @param {string} sessionId - The ended session ID
+ * @param {string} endedReason - Why the call ended
+ */
+async function createGroupCallLogMessage(sessionId, endedReason) {
+  if (!sessionId) return;
+
+  // Idempotency guard
+  const marked = await groupCallRepo.markCallLogCreated(sessionId);
+  if (!marked) return; // Already created
+
+  try {
+    // Re-read session to get final state
+    const session = await groupCallRepo.getSession(sessionId);
+    if (!session || !session.conversationId) return;
+
+    const participants = await groupCallRepo.getParticipantsBySession(sessionId);
+    const norm = (s) => String(s || '').toLowerCase();
+
+    const acceptedCount = participants.filter((p) => norm(p.status) === 'joined').length;
+    const rejectedCount = participants.filter((p) => norm(p.status) === 'rejected').length;
+    const missedCount = participants.filter(
+      (p) => norm(p.status) === 'missed' || norm(p.status) === 'ringing' || norm(p.status) === 'invited'
+    ).length;
+    const participantCount = participants.length;
+
+    // Calculate duration
+    const startedAt = session.startedAt || session.createdAt;
+    const endedAt = session.endedAt || new Date().toISOString();
+    let durationSeconds = 0;
+    if (startedAt) {
+      durationSeconds = Math.max(0, Math.floor((new Date(endedAt).getTime() - new Date(startedAt).getTime()) / 1000));
+    }
+
+    // Build content string
+    let statusSuffix = "";
+    switch (endedReason) {
+      case "host_ended":
+      case "user_ended":
+        statusSuffix = durationSeconds > 0 ? ` · ${formatDuration(durationSeconds)}` : " · đã kết thúc";
+        break;
+      case "all_left":
+      case "group_empty":
+        statusSuffix = " · tất cả đã rời";
+        break;
+      case "all_rejected":
+        statusSuffix = " · đã từ chối";
+        break;
+      case "replaced":
+        statusSuffix = " · bị thay thế";
+        break;
+      case "system_cleanup":
+        statusSuffix = " · hệ thống";
+        break;
+      default:
+        statusSuffix = durationSeconds > 0 ? ` · ${formatDuration(durationSeconds)}` : "";
+        break;
+    }
+
+    const content = `Cuộc gọi nhóm${statusSuffix}`;
+
+    const callData = {
+      callId: sessionId,
+      callMode: "group",
+      callType: session.callType || "video",
+      callStatus: "ended",
+      endedReason: endedReason || null,
+      durationSeconds,
+      initiatorId: session.initiatorId || session.hostUserId || session.callerId,
+      acceptedCount,
+      rejectedCount,
+      missedCount,
+      participantCount,
+    };
+
+    const { saveMessage } = require("../messages/messageService");
+    const savedMessage = await saveMessage({
+      conversationId: session.conversationId,
+      senderId: session.initiatorId || session.hostUserId || session.callerId,
+      content,
+      contentType: "call_log",
+      callData,
+    });
+
+    // Broadcast realtime
+    try {
+      const { getIO } = require("../../socket/socketHandler");
+      const io = getIO();
+      if (io && savedMessage) {
+        const roomId = session.conversationId;
+        console.log(`[group-call:call-log] Broadcasting call_log to room ${roomId}`, savedMessage.id);
+        io.to(roomId).emit("receive_message", savedMessage);
+      }
+    } catch (emitErr) {
+      console.error("[group-call:call-log] Failed to broadcast realtime:", emitErr.message);
+    }
+  } catch (err) {
+    console.error("[group-call:call-log] Failed to create call_log:", err.message);
+    // Don't throw — message creation failure should not break the call flow
+  }
+}
+
 module.exports = {
   startGroupCall,
   acceptGroupCall,
@@ -258,4 +435,6 @@ module.exports = {
   leaveGroupCall,
   endGroupCall,
   hashCode,
+  createGroupCallActiveMessage,
+  createGroupCallLogMessage,
 };

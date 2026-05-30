@@ -62,6 +62,18 @@ async function toggleLike(req, res) {
   }
 }
 
+async function updatePost(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ message: 'Chưa xác thực' });
+
+    const result = await postService.updatePost(req.params.postId, userId, req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+}
+
 async function deletePost(req, res) {
   try {
     const userId = req.user?.userId;
@@ -140,6 +152,7 @@ module.exports = {
   getFeedPosts,
   getUserPosts,
   getPostById,
+  updatePost,
   toggleLike,
   deletePost,
   createComment,

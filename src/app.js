@@ -28,6 +28,7 @@ const callRoutes = require("./modules/calls/callRoutes");
 const reminderRoutes = require("./modules/reminders/reminderRoutes");
 const noteRoutes = require("./modules/notes/noteRoutes");
 const postRoutes = require("./modules/posts/postRoutes");
+const storyRoutes = require("./modules/stories/storyRoutes");
 const { recoverCallsOnBoot } = require("./modules/calls/callRecovery");
 const { startReminderScheduler } = require("./modules/reminders/reminderScheduler");
 
@@ -107,6 +108,7 @@ app.use("/api/uploads", uploadRoutes);
 app.use("/api/stats", statsRoutes);
 app.use("/api/calls", callRoutes);
 app.use("/api/posts", postRoutes);
+app.use("/api/stories", storyRoutes);
 
 // Socket.io Middleware and Initialization
 app.set("io", io);

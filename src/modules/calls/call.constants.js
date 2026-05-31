@@ -52,6 +52,7 @@ const ENDED_REASON = {
   CALLEE_REJECTED: "callee_rejected",
   MISSED: "missed",
   TIMEOUT: "timeout",
+  NO_ANSWER_TIMEOUT: "no_answer_timeout",
   GROUP_EMPTY: "group_empty",
   DISCONNECT_TIMEOUT: "disconnect_timeout",
   SYSTEM_CLEANUP: "system_cleanup",

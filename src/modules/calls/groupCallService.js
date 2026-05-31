@@ -202,18 +202,16 @@ async function endGroupCall({ sessionId, userId, reason = 'host_ended' }) {
     throw new Error('Session not found');
   }
 
-  // Mark remaining participants as LEFT
-  const participants = await groupCallRepo.getParticipantsBySession(sessionId);
-  for (const p of participants) {
-    if (p.status === 'JOINED' || p.status === 'RINGING' || p.status === 'INVITED') {
-      await groupCallRepo.updateParticipantStatus(sessionId, p.userId, 'LEFT');
-    }
-  }
+  const endedSession = await finalizeSession(sessionId, reason, {
+    joinedStatus: 'LEFT',
+    pendingStatus: 'MISSED',
+  });
 
-  await groupCallRepo.endSession(sessionId, reason);
-  await createGroupCallLogMessage(sessionId, reason);
-
-  return { sessionId, reason };
+  return {
+    sessionId,
+    reason,
+    conversationId: endedSession?.conversationId || session.conversationId,
+  };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -233,13 +231,42 @@ async function checkAndMaybeEndSession(sessionId, reason) {
   // Diagnostic log
   console.log(`[GROUP_ALL_LEFT_CHECK] sessionId=${sessionId} joinedCount=${joinedCount} ringingCount=${ringingCount} participants=[${allParticipants.map((p) => `${p.userId}:${norm(p.status)}`).join(',')}]`);
 
-  if (joinedCount === 0 && ringingCount === 0) {
+  if (joinedCount === 0) {
     console.log(`[GROUP_CALL_END] auto-ending sessionId=${sessionId} reason=${reason}`);
-    await groupCallRepo.endSession(sessionId, reason);
-    await createGroupCallLogMessage(sessionId, reason);
+    await finalizeSession(sessionId, reason, {
+      joinedStatus: 'LEFT',
+      pendingStatus: 'MISSED',
+    });
     return true;
   }
   return false;
+}
+
+async function finalizeSession(
+  sessionId,
+  reason,
+  {
+    joinedStatus = 'LEFT',
+    pendingStatus = 'MISSED',
+  } = {},
+) {
+  const participants = await groupCallRepo.getParticipantsBySession(sessionId);
+  const norm = (s) => String(s || '').toLowerCase();
+
+  for (const participant of participants) {
+    const status = norm(participant.status);
+    if (status === 'joined' || status === 'reconnecting') {
+      await groupCallRepo.updateParticipantStatus(sessionId, participant.userId, joinedStatus);
+      continue;
+    }
+    if (status === 'ringing' || status === 'invited') {
+      await groupCallRepo.updateParticipantStatus(sessionId, participant.userId, pendingStatus);
+    }
+  }
+
+  const endedSession = await groupCallRepo.endSession(sessionId, reason);
+  await createGroupCallLogMessage(sessionId, reason);
+  return endedSession;
 }
 
 /**
@@ -361,34 +388,12 @@ async function createGroupCallLogMessage(sessionId, endedReason) {
     }
 
     // Build content string
-    let statusSuffix = "";
-    switch (endedReason) {
-      case "host_ended":
-      case "user_ended":
-        statusSuffix = durationSeconds > 0 ? ` · ${formatDuration(durationSeconds)}` : " · đã kết thúc";
-        break;
-      case "all_left":
-      case "group_empty":
-        statusSuffix = " · tất cả đã rời";
-        break;
-      case "all_rejected":
-        statusSuffix = " · đã từ chối";
-        break;
-      case "replaced":
-        statusSuffix = " · bị thay thế";
-        break;
-      case "system_cleanup":
-        statusSuffix = " · hệ thống";
-        break;
-      default:
-        statusSuffix = durationSeconds > 0 ? ` · ${formatDuration(durationSeconds)}` : "";
-        break;
-    }
-
-    const content = `Cuộc gọi nhóm${statusSuffix}`;
+    const suffix = durationSeconds > 0 ? ` · ${formatDuration(durationSeconds)}` : "";
+    const content = `Cuộc gọi đã kết thúc${suffix}`;
 
     const callData = {
       callId: sessionId,
+      conversationId: session.conversationId,
       callMode: "group",
       callType: session.callType || "video",
       callStatus: "ended",

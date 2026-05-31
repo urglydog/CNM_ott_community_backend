@@ -215,6 +215,7 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
       const session = await groupCallRepo.getSession(sessionId);
       if (session && session.status === 'ENDED') {
         await broadcastSessionEnded(io, sessionId, onlineUsers);
+        emitConversationCallEnded(io, session, 'all_rejected');
       }
     } catch (err) {
       console.error('[GROUP_CALL_REJECT_ERROR]', err.message);
@@ -249,6 +250,7 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
       const session = await groupCallRepo.getSession(sessionId);
       if (session && session.status === 'ENDED') {
         await broadcastSessionEnded(io, sessionId, onlineUsers);
+        emitConversationCallEnded(io, session, 'all_left');
       }
     } catch (err) {
       console.error('[GROUP_CALL_LEAVE_ERROR]', err.message);
@@ -272,6 +274,8 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
 
       // Broadcast ended to ALL participants
       await broadcastSessionEnded(io, sessionId, onlineUsers, result.reason);
+      const session = await require('./groupCallRepository').getSession(sessionId);
+      emitConversationCallEnded(io, session, result.reason);
     } catch (err) {
       console.error('[GROUP_CALL_END_ERROR]', err.message);
     }
@@ -282,6 +286,7 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
 
 async function broadcastSessionEnded(io, sessionId, onlineUsers, reason = 'ended') {
   const groupCallRepo = require('./groupCallRepository');
+  const session = await groupCallRepo.getSession(sessionId);
   const allParticipants = await groupCallRepo.getParticipantsBySession(sessionId);
   
   for (const p of allParticipants) {
@@ -289,10 +294,26 @@ async function broadcastSessionEnded(io, sessionId, onlineUsers, reason = 'ended
     for (const s of targetSockets) {
       s.emit('group-call:ended', {
         sessionId,
+        callId: sessionId,
+        conversationId: session?.conversationId || null,
         reason,
       });
     }
   }
+}
+
+function emitConversationCallEnded(io, session, reason = 'ended') {
+  if (!session?.conversationId) return;
+
+  io.to(String(session.conversationId)).emit('group_call_ended', {
+    type: 'GROUP_CALL',
+    status: 'ended',
+    phase: 'ended',
+    conversationId: String(session.conversationId),
+    callId: String(session.id || session.callId),
+    reason,
+    content: 'Cuộc gọi đã kết thúc',
+  });
 }
 
 function getUserSockets(io, userId, onlineUsers) {

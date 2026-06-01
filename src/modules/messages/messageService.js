@@ -11,6 +11,8 @@ const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
 const FILE_MESSAGES_TABLE = process.env.DYNAMODB_TABLE_NAME || MESSAGES_TABLE;
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME;
 const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
+const BOT_AI_AVATAR_URL =
+  process.env.BOT_AI_AVATAR_URL || "/botai-avatar.svg";
 
 // conversationId vẫn giữ dạng "channel:1" hoặc "direct:1" để tương thích với API hiện tại
 
@@ -130,6 +132,13 @@ function validateEmojiData(content) {
   // Chỉ cần non-empty string là đủ, không cần kiểm tra unicode sâu
 }
 async function enrichSenderInfo(senderId) {
+  if (String(senderId) === "ai-bot") {
+    return {
+      senderDisplayName: "BotAI",
+      senderAvatarUrl: BOT_AI_AVATAR_URL,
+    };
+  }
+
   try {
     const result = await ddbDocClient.send(
       new GetCommand({
@@ -859,6 +868,69 @@ async function searchMessagesForUserGlobal({
     data: enriched,
   };
 }
+
+function resolveTimeRangeBounds(timeRange) {
+  const now = new Date();
+  const normalized = String(timeRange || "").trim().toLowerCase();
+
+  if (!normalized) {
+    return {};
+  }
+
+  if (normalized === "morning") {
+    const from = new Date(now);
+    from.setHours(5, 0, 0, 0);
+    const to = new Date(now);
+    to.setHours(11, 59, 59, 999);
+    return { fromDate: from.toISOString(), toDate: to.toISOString() };
+  }
+
+  const lastHoursMatch = normalized.match(/^last_(\d+)_hours$/);
+  if (lastHoursMatch) {
+    const hours = Number(lastHoursMatch[1] || 0);
+    if (hours > 0) {
+      const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
+      return { fromDate: from.toISOString(), toDate: now.toISOString() };
+    }
+  }
+
+  return {};
+}
+
+async function fetchMessages({
+  conversationId,
+  timeRange,
+  focus,
+  currentUserId,
+  limit = 30,
+}) {
+  const bounds = resolveTimeRangeBounds(timeRange);
+  const messages = await getMessagesForConversation(conversationId, currentUserId);
+  let data = messages.slice();
+
+  if (bounds.fromDate || bounds.toDate) {
+    const fromMs = bounds.fromDate ? new Date(bounds.fromDate).getTime() : null;
+    const toMs = bounds.toDate ? new Date(bounds.toDate).getTime() : null;
+
+    data = data.filter((item) => {
+      const createdMs = item?.createdAt ? new Date(item.createdAt).getTime() : null;
+      if (createdMs == null) return false;
+      if (fromMs != null && createdMs < fromMs) return false;
+      if (toMs != null && createdMs > toMs) return false;
+      return true;
+    });
+  }
+
+  data = data.slice(-Math.max(1, Math.min(Number(limit) || 30, 50)));
+
+  return {
+    conversationId,
+    timeRange: timeRange || null,
+    focus: focus || "general",
+    count: data.length,
+    data,
+  };
+}
 /**
  * Dừng phên chia sẻ vị trí trực tiếp.
  * Cập nhật field locationData.isLive = false và locationData.liveUntil = now
@@ -925,6 +997,7 @@ module.exports = {
   saveFileMessage,
   searchMessagesInConversation,
   searchMessagesForUserGlobal,
+  fetchMessages,
   stopLiveLocationMessage,
   enrichSenderInfo,
 };

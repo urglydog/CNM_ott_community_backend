@@ -1,61 +1,125 @@
 const path = require("path");
 const dotenv = require("dotenv");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const { QdrantClient } = require("@qdrant/js-client-rest");
+const OpenAI = require("openai");
+
+const redis = require("../../config/redisConfig");
+const reminderService = require("../reminders/reminderService");
+const messageService = require("../messages/messageService");
+const qdrantService = require("../../services/qdrantService");
 
 dotenv.config({
   path:
     process.env.DOTENV_PATH || path.join(__dirname, "..", "..", "..", ".env"),
 });
 
-const NO_ANSWER_MESSAGE =
-  "Xin lỗi, hiện tại tôi không có thông tin về vấn đề này trong hệ thống. Bạn có muốn đặt câu hỏi khác không?";
-
+const SYSTEM_PROMPT =
+  'Bạn là Trợ lý AI thông minh tích hợp trong ứng dụng nhắn tin OTT Community. Nhiệm vụ của bạn là hỗ trợ người dùng quản lý công việc, tóm tắt thông tin và giải đáp thắc mắc về chính sách cộng đồng một cách ngắn gọn, lịch sự. BẮT BUỘC gọi công cụ (tool) khi người dùng yêu cầu nhắc nhở, tóm tắt chat hoặc hỏi về chính sách, KHÔNG tự bịa câu trả lời.';
+const MEMORY_KEY_PREFIX = "bot_session:";
+const MEMORY_TTL_SECONDS = 24 * 60 * 60;
+const MAX_HISTORY_MESSAGES = 10;
+const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const DEFAULT_BASE_URL =
+  process.env.GEMINI_OPENAI_BASE_URL ||
+  process.env.OPENAI_BASE_URL ||
+  "https://generativelanguage.googleapis.com/v1beta/openai/";
 const GEMINI_API_KEY =
   process.env.GEMINI_API_KEY ||
   process.env.GOOGLE_API_KEY ||
   process.env.GOOGLE_GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
-const GEMINI_EMBEDDING_MODEL =
-  process.env.GEMINI_EMBEDDING_MODEL || "gemini-embedding-001";
-const QDRANT_URL = process.env.QDRANT_URL;
-const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
-const QDRANT_COLLECTION_NAME =
-  process.env.QDRANT_COLLECTION_NAME ||
-  process.env.QDRANT_COLLECTION ||
-  "ott_community_knowledge";
-const RAG_SCORE_THRESHOLD = Number(process.env.RAG_SCORE_THRESHOLD || 0.7);
-const RAG_TOP_K = Number(process.env.RAG_TOP_K || 4);
-const RAG_FALLBACK_SCORE_THRESHOLD = Number(
-  process.env.RAG_FALLBACK_SCORE_THRESHOLD || 0.45,
-);
-const RAG_FALLBACK_TOP_K = Number(process.env.RAG_FALLBACK_TOP_K || 2);
-const RAG_LITE_MODE =
-  String(process.env.RAG_LITE_MODE || "true").toLowerCase() === "true";
-const RAG_GENERATE_TIMEOUT_MS = Number(
-  process.env.RAG_GENERATE_TIMEOUT_MS || 5000,
-);
 
-const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
-const qdrantClient = QDRANT_URL
-  ? new QdrantClient({
-      url: QDRANT_URL,
-      apiKey: QDRANT_API_KEY || undefined,
-    })
-  : null;
+const agentTools = [
+  {
+    type: "function",
+    function: {
+      name: "createReminder",
+      description:
+        "Tạo lịch nhắc nhở cá nhân, báo thức hoặc lịch hẹn cho người dùng.",
+      parameters: {
+        type: "object",
+        properties: {
+          content: {
+            type: "string",
+            description: "Nội dung cần nhắc",
+          },
+          time: {
+            type: "string",
+            description: "Thời gian chuẩn ISO 8601",
+          },
+        },
+        required: ["content", "time"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "summarizeConversation",
+      description:
+        "Tóm tắt nội dung tin nhắn nhóm, bóc tách công việc hoặc liệt kê các ý chính trong nhóm chat.",
+      parameters: {
+        type: "object",
+        properties: {
+          timeRange: {
+            type: "string",
+            description: "Khoảng thời gian, VD: morning, last_2_hours",
+          },
+          focus: {
+            type: "string",
+            description: "Mục tiêu tóm tắt, VD: tasks, general",
+          },
+        },
+        required: ["timeRange", "focus"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "communityPolicySearch",
+      description:
+        "Tìm kiếm ngữ nghĩa (RAG) về quy định sử dụng, chính sách cộng đồng hoặc tài liệu SDK.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Câu hỏi hoặc từ khóa cần tra cứu",
+          },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    },
+  },
+];
 
-if (!qdrantClient) {
-  // eslint-disable-next-line no-console
-  console.warn(
-    "[RAG WARNING] qdrantClient is null! QDRANT_URL not set properly. URL:",
-    QDRANT_URL,
-  );
+function getOpenAIClient() {
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is not configured");
+  }
+
+  return new OpenAI({
+    apiKey: GEMINI_API_KEY,
+    baseURL: DEFAULT_BASE_URL,
+  });
 }
 
 function cleanText(value) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim();
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function isGlobalAiConversation(conversationId) {
+  return String(conversationId || "").startsWith("ai-global:");
+}
+
+function resolveReminderConversationId(context) {
+  if (!isGlobalAiConversation(context.conversationId)) {
+    return context.conversationId;
+  }
+
+  return `dm:${context.userId}:${context.userId}`;
 }
 
 function uniqueModels(models) {
@@ -64,855 +128,494 @@ function uniqueModels(models) {
   ];
 }
 
-function normalizeGenerationModelName(modelName) {
-  const normalized = String(modelName || "").trim();
-  if (!normalized) {
-    return "";
-  }
-
-  if (normalized === "gemini-1.5-flash" || normalized === "gemini-1.5-pro") {
-    return "gemini-2.0-flash";
-  }
-
-  return normalized;
+function buildMemoryKey(userId) {
+  return `${MEMORY_KEY_PREFIX}${String(userId || "").trim()}`;
 }
 
-function withTimeout(promise, timeoutMs, timeoutMessage) {
-  let timeoutHandle;
-
-  const timeoutPromise = new Promise((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      reject(new Error(timeoutMessage || "Operation timed out"));
-    }, timeoutMs);
-  });
-
-  return Promise.race([promise, timeoutPromise]).finally(() => {
-    clearTimeout(timeoutHandle);
-  });
+function isTemporaryModelError(error) {
+  const status = Number(error?.status || error?.response?.status || 0);
+  return status === 429 || status === 503;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function buildTemporaryUnavailableReply() {
+  return "BotAI đang bận hoặc tạm quá tải nên chưa xử lý được yêu cầu này. Bạn thử lại sau ít phút giúp mình nhé.";
 }
 
-function parseRetryDelayMs(error) {
-  const details =
-    error?.errorDetails ||
-    error?.details ||
-    error?.response?.data?.error?.details;
+function extractAssistantText(message) {
+  if (!message) return "";
 
-  if (!Array.isArray(details)) {
-    return null;
+  if (typeof message.content === "string") {
+    return cleanText(message.content);
   }
 
-  const retryInfo = details.find(
-    (item) =>
-      item && item["@type"] === "type.googleapis.com/google.rpc.RetryInfo",
-  );
-
-  const retryDelay = retryInfo?.retryDelay;
-  if (typeof retryDelay !== "string") {
-    return null;
-  }
-
-  const secondsMatch = retryDelay.match(/^(\d+)s$/);
-  if (secondsMatch) {
-    return Number(secondsMatch[1]) * 1000;
-  }
-
-  const msMatch = retryDelay.match(/^(\d+)ms$/);
-  if (msMatch) {
-    return Number(msMatch[1]);
-  }
-
-  return null;
-}
-
-function isQuotaError(error) {
-  const statusCode = Number(error?.status || error?.code || 0);
-  const text = String(error?.message || "").toLowerCase();
-
-  return (
-    statusCode === 429 ||
-    text.includes("quota") ||
-    text.includes("resource_exhausted")
-  );
-}
-
-function extractPayloadText(payload) {
-  if (!payload || typeof payload !== "object") {
-    return "";
-  }
-
-  const directFields = [
-    payload.text,
-    payload.content,
-    payload.chunk,
-    payload.description,
-    payload.answer,
-    payload.title,
-    payload.name,
-    payload.question,
-  ]
-    .map(cleanText)
-    .filter(Boolean);
-
-  if (directFields.length > 0) {
-    return directFields.join(" - ");
-  }
-
-  try {
-    return cleanText(JSON.stringify(payload));
-  } catch {
-    return "";
-  }
-}
-
-function formatRetrievedContext(results) {
-  return results
-    .map((item, index) => {
-      const text = extractPayloadText(item.payload);
-      return `${index + 1}. ${text}`;
-    })
-    .filter((line) => line.split(" ").length > 1)
-    .join("\n");
-}
-
-function buildPrompt(userQuery, retrievedContext) {
-  return `
-VAI TRO:
-Ban la tro ly AI cua he thong OTT Community.
-Ban CHI duoc phep tra loi dua tren NGU CANH ben duoi.
-
-NGU CANH:
-${retrievedContext}
-
-QUY TAC BAT BUOC:
-1. CHI su dung thong tin trong NGU CANH. Khong dung kien thuc ben ngoai, khong tu suy dien.
-2. Neu cau hoi la dang so luong (bao nhieu, toi da, gioi han, moi ngay...), phai tra loi truc tiep con so truoc.
-3. Uu tien dinh dang cho cau hoi so luong:
-  "<con so> nguoi/ngay. <giai thich ngan gon theo ngu canh>."
-4. Neu NGU CANH khong co thong tin, chi duoc tra loi dung cau nay:
-  "Xin lỗi, hiện tại tôi không có thông tin về vấn đề này trong hệ thống. Bạn có muốn đặt câu hỏi khác không?"
-5. Tra loi bang tieng Viet, ro rang, ngan gon.
-
-CAU HOI:
-${userQuery}
-
-TRA LOI:
-`.trim();
-}
-
-function normalizeVietnamese(value) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-}
-
-function tokenizeVietnamese(value) {
-  const stopWords = new Set([
-    "la",
-    "co",
-    "cua",
-    "cho",
-    "va",
-    "voi",
-    "trong",
-    "tren",
-    "duoc",
-    "khong",
-    "toi",
-    "ban",
-    "minh",
-    "anh",
-    "chi",
-    "em",
-    "neu",
-    "thi",
-    "hay",
-    "bao",
-    "nhieu",
-    "mot",
-    "nhung",
-    "cac",
-    "the",
-    "nao",
-    "gi",
-    "sao",
-    "a",
-    "b",
-  ]);
-
-  return normalizeVietnamese(value)
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length >= 2 && !stopWords.has(token));
-}
-
-function isQueryRelevantToContext(userQuery, context) {
-  const queryTokens = tokenizeVietnamese(userQuery);
-  if (queryTokens.length === 0) {
-    return false;
-  }
-
-  const domainKeywords = [
-    "zalo",
-    "chinh",
-    "sach",
-    "ket",
-    "ban",
-    "nhom",
-    "group",
-    "thanh",
-    "vien",
-    "file",
-    "tap",
-    "tin",
-    "dung",
-    "luong",
-    "kich",
-    "thuoc",
-    "voice",
-    "ghi",
-    "am",
-    "tai",
-    "khoan",
-    "khoa",
-    "khieu",
-    "nai",
-    "spam",
-    "forward",
-  ];
-  const hasDomainKeyword = queryTokens.some((token) =>
-    domainKeywords.includes(token),
-  );
-
-  const contextTokens = new Set(tokenizeVietnamese(context));
-  let overlapCount = 0;
-
-  for (const token of queryTokens) {
-    if (contextTokens.has(token)) {
-      overlapCount += 1;
-    }
-  }
-
-  if (hasDomainKeyword && overlapCount >= 1) {
-    return true;
-  }
-
-  // Neu khong co tu khoa mien chinh sach, bat buoc trung it nhat 2 token
-  // de tranh match nham tu don le (vi du "chua" voi "suc chua").
-  return overlapCount >= 2;
-}
-
-function tryBuildFallbackAnswer(userQuery, retrievedContext) {
-  const normalizedQuery = normalizeVietnamese(userQuery);
-  const normalizedContext = normalizeVietnamese(retrievedContext);
-  const asksAboutGroup =
-    normalizedQuery.includes("nhom") || normalizedQuery.includes("group");
-  const asksAboutFriend =
-    normalizedQuery.includes("ket ban") ||
-    normalizedQuery.includes("ban be") ||
-    normalizedQuery.includes("loi moi") ||
-    normalizedQuery.includes("friend");
-  const asksAboutFriendLimit =
-    asksAboutFriend &&
-    (normalizedQuery.includes("bao nhieu") ||
-      normalizedQuery.includes("gioi han") ||
-      normalizedQuery.includes("toi da") ||
-      normalizedQuery.includes("moi ngay"));
-  const asksAboutFriendReport =
-    asksAboutFriend &&
-    (normalizedQuery.includes("bao cao") ||
-      normalizedQuery.includes("tu choi") ||
-      normalizedQuery.includes("bi gi") ||
-      normalizedQuery.includes("se bi") ||
-      normalizedQuery.includes("khoa") ||
-      normalizedQuery.includes("xu ly"));
-  const asksAboutGroupLeader =
-    normalizedQuery.includes("truong nhom") ||
-    normalizedQuery.includes("nhom truong") ||
-    normalizedQuery.includes("pho nhom") ||
-    normalizedQuery.includes("quan tri");
-  const asksAboutFile =
-    normalizedQuery.includes("file") ||
-    normalizedQuery.includes("tap tin") ||
-    normalizedQuery.includes("dung luong") ||
-    normalizedQuery.includes("kich thuoc") ||
-    normalizedQuery.includes("video") ||
-    normalizedQuery.includes("hinh anh") ||
-    normalizedQuery.includes("tai lieu");
-  const asksAboutVoiceMessage =
-    normalizedQuery.includes("tin nhan thoai") ||
-    normalizedQuery.includes("ghi am") ||
-    normalizedQuery.includes("giong noi") ||
-    normalizedQuery.includes("voice message") ||
-    normalizedQuery.includes("thoi luong");
-
-  const isQuantityQuestion =
-    normalizedQuery.includes("bao nhieu") ||
-    normalizedQuery.includes("moi ngay") ||
-    normalizedQuery.includes("mot ngay") ||
-    normalizedQuery.includes("gioi han") ||
-    normalizedQuery.includes("toi da");
-
-  const contextHasFriendLimitInfo =
-    normalizedContext.includes("yeu cau ket ban") &&
-    normalizedContext.includes("moi ngay");
-
-  const contextHasGroupLimitInfo =
-    normalizedContext.includes("nhom") &&
-    (normalizedContext.includes("thanh vien") ||
-      normalizedContext.includes("suc chua") ||
-      normalizedContext.includes("toi da"));
-  const contextHasGroupLeaderInfo =
-    normalizedContext.includes("truong nhom") &&
-    normalizedContext.includes("pho nhom");
-  const contextHasFriendReportInfo =
-    normalizedContext.includes("loi moi ket ban") &&
-    normalizedContext.includes("bao cao") &&
-    normalizedContext.includes("khoa") &&
-    normalizedContext.includes("ngay");
-
-  const contextHasFileLimitInfo =
-    (normalizedContext.includes("kich thuoc file") ||
-      normalizedContext.includes("dung luong toi da") ||
-      normalizedContext.includes("ho tro gui file") ||
-      normalizedContext.includes("gui file")) &&
-    (normalizedContext.includes("gb") || normalizedContext.includes("mb"));
-  const contextHasVoiceLimitInfo =
-    (normalizedContext.includes("tin nhan thoai") ||
-      normalizedContext.includes("ghi am giong noi") ||
-      normalizedContext.includes("voice message")) &&
-    (normalizedContext.includes("phut") ||
-      normalizedContext.includes("minute"));
-
-  const isFriendLimitQuestion =
-    isQuantityQuestion && contextHasFriendLimitInfo && asksAboutFriendLimit;
-  const isGroupLimitQuestion = isQuantityQuestion && contextHasGroupLimitInfo;
-  const isFileLimitQuestion =
-    isQuantityQuestion && contextHasFileLimitInfo && asksAboutFile;
-  const isVoiceLimitQuestion =
-    contextHasVoiceLimitInfo && asksAboutVoiceMessage;
-  const isGroupLeaderQuestion =
-    asksAboutGroupLeader && contextHasGroupLeaderInfo;
-  const isFriendReportQuestion =
-    asksAboutFriendReport && contextHasFriendReportInfo;
-
-  if (isGroupLeaderQuestion) {
-    return "1 truong nhom va toi da 5 pho nhom. Moi nhom Zalo chi duoc phep co 1 Truong nhom va toi da 5 Pho nhom theo chinh sach trong he thong.";
-  }
-
-  if (isFriendReportQuestion) {
-    const temporaryLockDays = normalizedContext.match(
-      /khoa[^\n\.]{0,80}tam thoi[^\n\.]{0,40}(\d{1,2})\s*ngay/,
+  if (Array.isArray(message.content)) {
+    return cleanText(
+      message.content
+        .map((item) => {
+          if (typeof item === "string") return item;
+          if (item?.type === "text") return item.text;
+          return "";
+        })
+        .join(" "),
     );
-    if (temporaryLockDays && temporaryLockDays[1]) {
-      const value = temporaryLockDays[1];
-      return `${value} ngay. Neu gui loi moi ket ban lien tuc va bi tu choi hoac bao cao nhieu lan, tai khoan se bi khoa tinh nang ket ban tam thoi ${value} ngay.`;
-    }
-
-    return "Tai khoan se bi khoa tinh nang ket ban tam thoi 7 ngay neu gui loi moi ket ban lien tuc va bi tu choi hoac bao cao nhieu lan.";
-  }
-
-  if (isFileLimitQuestion) {
-    const genericFileLimit = normalizedContext.match(/(\d{1,4})\s*(gb|mb)/);
-    if (genericFileLimit && genericFileLimit[1] && genericFileLimit[2]) {
-      const value = genericFileLimit[1];
-      const unit = String(genericFileLimit[2]).toUpperCase();
-      return `${value}${unit}. Zalo ho tro gui file toi da ${value}${unit} cho moi lan gui theo chinh sach trong he thong.`;
-    }
-
-    const fileLimit = normalizedContext.match(
-      /(kich thuoc file|dung luong toi da|ho tro gui file|gui file)[^\d]{0,40}(\d{1,4})\s*(gb|mb)/,
-    );
-
-    if (fileLimit && fileLimit[2] && fileLimit[3]) {
-      const value = fileLimit[2];
-      const unit = String(fileLimit[3]).toUpperCase();
-      return `${value}${unit}. Zalo ho tro gui file toi da ${value}${unit} cho moi lan gui theo chinh sach trong he thong.`;
-    }
-  }
-
-  if (isVoiceLimitQuestion) {
-    const voiceLimit = normalizedContext.match(
-      /(tin nhan thoai|ghi am giong noi|voice message)[^\d]{0,60}(\d{1,3})\s*(phut|minute)/,
-    );
-    if (voiceLimit && voiceLimit[2]) {
-      const value = voiceLimit[2];
-      return `${value} phut. Thoi luong toi da cho mot tin nhan ghi am giong noi la ${value} phut theo chinh sach trong he thong.`;
-    }
-
-    const genericMinute = normalizedContext.match(/(\d{1,3})\s*(phut|minute)/);
-    if (genericMinute && genericMinute[1]) {
-      const value = genericMinute[1];
-      return `${value} phut. Thoi luong toi da cho mot tin nhan ghi am giong noi la ${value} phut theo chinh sach trong he thong.`;
-    }
-  }
-
-  if (isGroupLimitQuestion && asksAboutGroup) {
-    const groupLimit = normalizedContext.match(
-      /(nhom|group)[^\n\.]{0,80}(toi da|suc chua)[^\d]{0,30}(\d{2,5})[^\n\.]{0,40}(thanh vien|nguoi)/,
-    );
-    if (groupLimit && groupLimit[3]) {
-      const value = groupLimit[3];
-      return `${value} nguoi. Mot nhom chat Zalo co suc chua toi da ${value} thanh vien theo chinh sach trong he thong.`;
-    }
-
-    const genericGroupNumber = normalizedContext.match(
-      /(\d{2,5})[^\n\.]{0,60}(thanh vien|nguoi)[^\n\.]{0,80}(nhom|group)/,
-    );
-    if (genericGroupNumber && genericGroupNumber[1]) {
-      const value = genericGroupNumber[1];
-      return `${value} nguoi. Mot nhom chat Zalo co suc chua toi da ${value} thanh vien theo chinh sach trong he thong.`;
-    }
-  }
-
-  if (isFriendLimitQuestion && !asksAboutGroup) {
-    const directLimit = normalizedContext.match(
-      /gioi han[^\d]{0,40}(\d{1,4})[^\n\.]{0,100}yeu cau ket ban[^\n\.]{0,40}moi ngay/,
-    );
-    if (directLimit && directLimit[1]) {
-      const value = directLimit[1];
-      return `${value} nguoi/ngay. Zalo gioi han toi da ${value} yeu cau ket ban moi ngay theo chinh sach trong he thong.`;
-    }
-
-    const genericNumber = normalizedContext.match(
-      /(\d{1,4})[^\n\.]{0,100}yeu cau ket ban[^\n\.]{0,40}moi ngay/,
-    );
-    if (genericNumber && genericNumber[1]) {
-      const value = genericNumber[1];
-      return `${value} nguoi/ngay. Zalo gioi han toi da ${value} yeu cau ket ban moi ngay theo chinh sach trong he thong.`;
-    }
-  }
-
-  if (isGroupLimitQuestion && asksAboutGroup) {
-    const groupLimit = normalizedContext.match(
-      /(nhom|group)[^\n\.]{0,80}(toi da|suc chua)[^\d]{0,30}(\d{2,5})[^\n\.]{0,40}(thanh vien|nguoi)/,
-    );
-    if (groupLimit && groupLimit[3]) {
-      const value = groupLimit[3];
-      return `${value} nguoi. Mot nhom chat Zalo co suc chua toi da ${value} thanh vien theo chinh sach trong he thong.`;
-    }
-
-    const genericGroupNumber = normalizedContext.match(
-      /(\d{2,5})[^\n\.]{0,60}(thanh vien|nguoi)[^\n\.]{0,80}(nhom|group)/,
-    );
-    if (genericGroupNumber && genericGroupNumber[1]) {
-      const value = genericGroupNumber[1];
-      return `${value} nguoi. Mot nhom chat Zalo co suc chua toi da ${value} thanh vien theo chinh sach trong he thong.`;
-    }
   }
 
   return "";
 }
 
-function buildLiteAnswerFromContext(results, userQuery) {
-  if (!Array.isArray(results) || results.length === 0) {
-    return "";
-  }
+async function getConversationHistory(userId) {
+  const key = buildMemoryKey(userId);
+  let rawHistory = null;
 
-  const texts = results
-    .map((item) => extractPayloadText(item?.payload))
-    .filter(Boolean);
-
-  if (texts.length === 0) {
-    return "";
-  }
-
-  const normalizedCombined = normalizeVietnamese(texts.join("\n"));
-  const hasQueryContext = normalizeVietnamese(userQuery || "");
-  const asksAboutFile =
-    hasQueryContext.includes("file") ||
-    hasQueryContext.includes("tap tin") ||
-    hasQueryContext.includes("dung luong") ||
-    hasQueryContext.includes("kich thuoc");
-  const asksAboutGroup =
-    hasQueryContext.includes("nhom") || hasQueryContext.includes("group");
-  const asksAboutFriend =
-    hasQueryContext.includes("ket ban") ||
-    hasQueryContext.includes("ban be") ||
-    hasQueryContext.includes("loi moi");
-  const asksAboutFriendLimit =
-    asksAboutFriend &&
-    (hasQueryContext.includes("bao nhieu") ||
-      hasQueryContext.includes("gioi han") ||
-      hasQueryContext.includes("toi da") ||
-      hasQueryContext.includes("moi ngay"));
-  const asksAboutFriendReport =
-    asksAboutFriend &&
-    (hasQueryContext.includes("bao cao") ||
-      hasQueryContext.includes("tu choi") ||
-      hasQueryContext.includes("bi gi") ||
-      hasQueryContext.includes("se bi") ||
-      hasQueryContext.includes("khoa") ||
-      hasQueryContext.includes("xu ly"));
-  const asksAboutGroupLeader =
-    hasQueryContext.includes("truong nhom") ||
-    hasQueryContext.includes("nhom truong") ||
-    hasQueryContext.includes("pho nhom") ||
-    hasQueryContext.includes("quan tri");
-  const asksAboutVoiceMessage =
-    hasQueryContext.includes("tin nhan thoai") ||
-    hasQueryContext.includes("ghi am") ||
-    hasQueryContext.includes("giong noi") ||
-    hasQueryContext.includes("voice message") ||
-    hasQueryContext.includes("thoi luong");
-
-  if (asksAboutFile) {
-    const limit = normalizedCombined.match(/(\d{1,4})\s*(gb|mb)/);
-    if (limit && limit[1] && limit[2]) {
-      const value = limit[1];
-      const unit = String(limit[2]).toUpperCase();
-      return `${value}${unit}. Zalo ho tro gui file toi da ${value}${unit} cho moi lan gui.`;
-    }
-  }
-
-  if (asksAboutVoiceMessage) {
-    const limit = normalizedCombined.match(/(\d{1,3})\s*(phut|minute)/);
-    if (limit && limit[1]) {
-      const value = limit[1];
-      return `${value} phut. Thoi luong toi da cho mot tin nhan ghi am giong noi la ${value} phut.`;
-    }
-  }
-
-  if (asksAboutGroupLeader) {
-    const ownerMatch = normalizedCombined.match(
-      /(\d{1,2})[^\n\.]{0,30}(truong nhom|nhom truong)/,
+  try {
+    rawHistory = await redis.get(key);
+  } catch (error) {
+    console.error(
+      "[botService] Redis read failed, continuing without memory:",
+      error.message,
     );
-    const deputyMatch = normalizedCombined.match(
-      /(\d{1,2})[^\n\.]{0,30}(pho nhom)/,
-    );
-
-    if (ownerMatch && deputyMatch && ownerMatch[1] && deputyMatch[1]) {
-      return `${ownerMatch[1]} truong nhom va toi da ${deputyMatch[1]} pho nhom. Moi nhom chi duoc phep co ${ownerMatch[1]} Truong nhom va toi da ${deputyMatch[1]} Pho nhom.`;
-    }
+    return [];
   }
 
-  if (asksAboutGroup) {
-    const limit = normalizedCombined.match(
-      /(nhom|group)[^\n\.]{0,100}(\d{2,5})[^\n\.]{0,40}(thanh vien|nguoi)/,
-    );
-    if (limit && limit[2]) {
-      const value = limit[2];
-      return `${value} nguoi. Mot nhom chat Zalo co suc chua toi da ${value} thanh vien.`;
-    }
+  if (!rawHistory) {
+    return [];
   }
 
-  if (asksAboutFriendReport) {
-    const reportLock = normalizedCombined.match(
-      /khoa[^\n\.]{0,80}tam thoi[^\n\.]{0,40}(\d{1,2})\s*ngay/,
-    );
-    if (reportLock && reportLock[1]) {
-      return `${reportLock[1]} ngay. Neu gui loi moi ket ban lien tuc va bi tu choi hoac bao cao nhieu lan, tai khoan se bi khoa tinh nang ket ban tam thoi ${reportLock[1]} ngay.`;
+  try {
+    const parsed = JSON.parse(rawHistory);
+    if (!Array.isArray(parsed)) {
+      return [];
     }
 
-    return "Tai khoan se bi khoa tinh nang ket ban tam thoi 7 ngay neu gui loi moi ket ban lien tuc va bi tu choi hoac bao cao nhieu lan.";
+    return parsed
+      .filter(
+        (item) =>
+          item &&
+          typeof item === "object" &&
+          (item.role === "user" || item.role === "assistant") &&
+          typeof item.content === "string",
+      )
+      .slice(-MAX_HISTORY_MESSAGES);
+  } catch (error) {
+    console.error("[botService] Failed to parse Redis history:", error.message);
+    return [];
   }
-
-  if (asksAboutFriendLimit) {
-    const limit = normalizedCombined.match(
-      /(\d{1,4})[^\n\.]{0,100}yeu cau ket ban[^\n\.]{0,40}moi ngay/,
-    );
-    if (limit && limit[1]) {
-      const value = limit[1];
-      return `${value} nguoi/ngay. Zalo gioi han toi da ${value} yeu cau ket ban moi ngay.`;
-    }
-  }
-
-  const top = texts[0];
-
-  const sentence = top.split(/(?<=[\.\!\?])\s+/)[0] || top;
-  return cleanText(sentence);
 }
 
-async function embedQuery(userQuery) {
-  if (!genAI) {
-    throw new Error("GEMINI_API_KEY is not configured");
+async function saveConversationHistory(userId, entries) {
+  const key = buildMemoryKey(userId);
+  const normalizedEntries = entries
+    .filter(
+      (item) =>
+        item &&
+        typeof item === "object" &&
+        (item.role === "user" || item.role === "assistant") &&
+        typeof item.content === "string" &&
+        item.content.trim(),
+    )
+    .slice(-MAX_HISTORY_MESSAGES);
+
+  try {
+    await redis.set(
+      key,
+      JSON.stringify(normalizedEntries),
+      "EX",
+      MEMORY_TTL_SECONDS,
+    );
+  } catch (error) {
+    console.error(
+      "[botService] Redis write failed, response will not be persisted:",
+      error.message,
+    );
   }
+}
 
-  const embeddingCandidates = uniqueModels([
-    GEMINI_EMBEDDING_MODEL,
-    "gemini-embedding-001",
-    "embedding-001",
-    "text-embedding-004",
+function buildMessages(history, userMessage) {
+  const currentTime = new Date().toLocaleString("vi-VN", {
+    timeZone: "Asia/Ho_Chi_Minh",
+  });
+  const dynamicPrompt = `${SYSTEM_PROMPT}\nThời gian hiện tại của hệ thống: ${currentTime}`;
+
+  return [
+    {
+      role: "system",
+      content: dynamicPrompt,
+    },
+    ...history,
+    {
+      role: "user",
+      content: userMessage,
+    },
+  ];
+}
+
+async function createChatCompletion({ messages, tools }) {
+  const openai = getOpenAIClient();
+  const candidateModels = uniqueModels([
+    DEFAULT_MODEL,
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
   ]);
-
   let lastError;
 
-  for (const modelName of embeddingCandidates) {
+  for (const modelName of candidateModels) {
     try {
-      const embeddingModel = genAI.getGenerativeModel({ model: modelName });
-      const result = await embeddingModel.embedContent(cleanText(userQuery));
-      const values = result?.embedding?.values;
-
-      if (Array.isArray(values) && values.length > 0) {
-        console.log(`[RAG DEBUG] Embedding model Succeeded: ${modelName}`);
-        return values;
-      }
+      return await openai.chat.completions.create({
+        model: modelName,
+        messages,
+        tools,
+        tool_choice: tools?.length ? "auto" : undefined,
+        temperature: 0.3,
+      });
     } catch (error) {
       lastError = error;
-      // eslint-disable-next-line no-console
       console.error(
-        `[RAG] Embedding model failed: ${modelName}. ${error?.message || error}`,
-      );
-    }
-  }
-
-  throw (
-    lastError ||
-    new Error(
-      "Khong tao duoc embedding cho cau hoi. Hay kiem tra GEMINI_EMBEDDING_MODEL va quyen API key.",
-    )
-  );
-}
-
-async function searchContextFromQdrant(userQuery) {
-  if (!qdrantClient) {
-    // eslint-disable-next-line no-console
-    console.error("[RAG] qdrantClient is null!");
-    return { results: [], context: "", bestScore: 0 };
-  }
-
-  let vector;
-  try {
-    vector = await embedQuery(userQuery);
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error(
-      "[RAG] Khong tao duoc embedding, fallback ve no-answer:",
-      error?.message || error,
-    );
-    return { results: [], context: "", bestScore: 0 };
-  }
-
-  let searchResults = [];
-  try {
-    searchResults = await qdrantClient.search(QDRANT_COLLECTION_NAME, {
-      vector,
-      limit: RAG_TOP_K,
-      with_payload: true,
-      with_vectors: false,
-    });
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.error(
-      "[RAG] Qdrant search failed, fallback ve no-answer:",
-      error?.message || error,
-    );
-    return { results: [], context: "", bestScore: 0 };
-  }
-
-  // eslint-disable-next-line no-console
-  console.log("[RAG DEBUG] Search results count:", searchResults?.length);
-  if (searchResults && searchResults.length > 0) {
-    // eslint-disable-next-line no-console
-    console.log("[RAG DEBUG] Top score:", searchResults[0]?.score);
-  }
-
-  const filteredResults = Array.isArray(searchResults)
-    ? searchResults.filter((item) => (item?.score || 0) >= RAG_SCORE_THRESHOLD)
-    : [];
-
-  // eslint-disable-next-line no-console
-  console.log(
-    "[RAG DEBUG] Filtered results after threshold:",
-    filteredResults.length,
-    "Threshold:",
-    RAG_SCORE_THRESHOLD,
-  );
-
-  const bestScore =
-    Array.isArray(searchResults) && searchResults.length > 0
-      ? Number(searchResults[0]?.score || 0)
-      : 0;
-
-  const fallbackResults =
-    filteredResults.length === 0 &&
-    Array.isArray(searchResults) &&
-    bestScore >= RAG_FALLBACK_SCORE_THRESHOLD
-      ? searchResults.slice(0, Math.max(1, RAG_FALLBACK_TOP_K))
-      : [];
-
-  const finalResults =
-    filteredResults.length > 0 ? filteredResults : fallbackResults;
-
-  if (filteredResults.length === 0 && fallbackResults.length > 0) {
-    // eslint-disable-next-line no-console
-    console.log(
-      "[RAG DEBUG] Using fallback results:",
-      fallbackResults.length,
-      "bestScore:",
-      bestScore,
-      "fallbackThreshold:",
-      RAG_FALLBACK_SCORE_THRESHOLD,
-    );
-  }
-
-  return {
-    results: finalResults,
-    context: formatRetrievedContext(finalResults),
-    bestScore,
-  };
-}
-
-async function generateAnswer(userQuery, retrievedContext) {
-  if (!genAI) {
-    throw new Error("GEMINI_API_KEY is not configured");
-  }
-
-  const prompt = buildPrompt(userQuery, retrievedContext);
-  const generationCandidates = uniqueModels([
-    normalizeGenerationModelName(GEMINI_MODEL),
-    "gemini-2.0-flash",
-  ]);
-
-  let lastError;
-
-  for (const modelName of generationCandidates) {
-    try {
-      const model = genAI.getGenerativeModel({ model: modelName });
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      const text = cleanText(response.text());
-      if (text) return text;
-    } catch (error) {
-      lastError = error;
-
-      if (isQuotaError(error)) {
-        const retryDelayMs = parseRetryDelayMs(error);
-        const canRetryWithinWindow =
-          retryDelayMs &&
-          retryDelayMs > 0 &&
-          retryDelayMs < RAG_GENERATE_TIMEOUT_MS;
-
-        if (canRetryWithinWindow) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[RAG] Quota reached for ${modelName}. Waiting ${Math.ceil(retryDelayMs / 1000)}s before retrying once.`,
-          );
-
-          await sleep(retryDelayMs);
-
-          try {
-            const model = genAI.getGenerativeModel({ model: modelName });
-            const result = await model.generateContent(prompt);
-            const response = await result.response;
-            const text = cleanText(response.text());
-            if (text) return text;
-          } catch (retryError) {
-            lastError = retryError;
-            // eslint-disable-next-line no-console
-            console.error(
-              `[RAG] Retry after quota delay failed: ${modelName}. ${retryError?.message || retryError}`,
-            );
-            continue;
-          }
-        } else {
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[RAG] Quota reached for ${modelName}. Skip long retry to keep fast fallback path.`,
-          );
-          continue;
-        }
-      }
-
-      // eslint-disable-next-line no-console
-      console.error(
-        `[RAG] Generation model failed: ${modelName}. ${error?.message || error}`,
-      );
-    }
-  }
-
-  throw (
-    lastError ||
-    new Error(
-      "Khong the tao cau tra loi tu Gemini. Hay kiem tra GEMINI_MODEL hoac quyen API key.",
-    )
-  );
-}
-
-async function askAI(userQuestion) {
-  const userQuery = cleanText(userQuestion);
-
-  if (!userQuery) {
-    return "Vui long nhap cau hoi truoc khi gui cho AI.";
-  }
-
-  // eslint-disable-next-line no-console
-  console.log("[RAG] Starting search for query:", userQuery);
-
-  const { results, context, bestScore } =
-    await searchContextFromQdrant(userQuery);
-
-  // eslint-disable-next-line no-console
-  console.log(
-    "[RAG] askAI - results.length:",
-    results.length,
-    "bestScore:",
-    bestScore,
-    "context length:",
-    context?.length,
-  );
-
-  if (!results.length || !context) {
-    // eslint-disable-next-line no-console
-    console.log(
-      "[RAG] Returning NO_ANSWER because:",
-      !results.length ? "no results" : "",
-      !context ? "no context" : "",
-    );
-    return NO_ANSWER_MESSAGE;
-  }
-
-  if (!isQueryRelevantToContext(userQuery, context)) {
-    // eslint-disable-next-line no-console
-    console.log(
-      "[RAG] Returning NO_ANSWER because query is not relevant to context",
-    );
-    return NO_ANSWER_MESSAGE;
-  }
-
-  if (genAI) {
-    try {
-      const answer = await withTimeout(
-        generateAnswer(userQuery, context),
-        Math.max(500, RAG_GENERATE_TIMEOUT_MS),
-        "Generate timed out",
-      );
-
-      if (answer) {
-        return answer;
-      }
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[RAG] Generate-first failed or timed out, fallback to fast answer:",
+        `[botService] Chat completion failed with model ${modelName}:`,
         error?.message || error,
       );
     }
   }
 
-  const fallbackAnswer = tryBuildFallbackAnswer(userQuery, context);
-  if (fallbackAnswer) {
-    return fallbackAnswer;
+  throw lastError;
+}
+
+async function emitStatus(onStatus, status, payload = {}) {
+  if (typeof onStatus !== "function") {
+    return;
   }
 
-  if (RAG_LITE_MODE || !genAI) {
-    const liteAnswer = buildLiteAnswerFromContext(results, userQuery);
-    if (liteAnswer) {
-      return liteAnswer;
+  await onStatus(status, payload);
+}
+
+async function executeTool(functionName, args, context) {
+  switch (functionName) {
+    case "createReminder": {
+      const reminderPayload = {
+        conversationId: resolveReminderConversationId(context),
+        creatorId: context.userId,
+        content: args.content,
+        remindAt: args.time,
+        repeat: "none",
+      };
+
+      const result = await reminderService.create(reminderPayload);
+      return {
+        ok: true,
+        tool: functionName,
+        reminderId: result?.reminder?.reminderId || null,
+        remindAt: result?.reminder?.remindAt || args.time,
+        content: result?.reminder?.content || args.content,
+        reminder: result?.reminder || null,
+        message: result?.message || null,
+      };
+    }
+
+    case "summarizeConversation": {
+      if (isGlobalAiConversation(context.conversationId)) {
+        return {
+          ok: false,
+          tool: functionName,
+          error:
+            "SUMMARY_REQUIRES_CONTEXTUAL_CHAT",
+          message:
+            "Tóm tắt hội thoại chỉ khả dụng khi bạn mở AI từ một cuộc trò chuyện cụ thể.",
+        };
+      }
+
+      const messageResult = await messageService.fetchMessages({
+        conversationId: context.conversationId,
+        timeRange: args.timeRange,
+        focus: args.focus,
+        currentUserId: context.userId,
+        limit: 30,
+      });
+
+      return {
+        ok: true,
+        tool: functionName,
+        timeRange: args.timeRange,
+        focus: args.focus,
+        conversationId: context.conversationId,
+        messages: messageResult?.data || messageResult?.messages || [],
+        count:
+          messageResult?.count ||
+          messageResult?.data?.length ||
+          messageResult?.messages?.length ||
+          0,
+      };
+    }
+
+    case "communityPolicySearch": {
+      const searchResult = await qdrantService.search({
+        query: args.query,
+        limit: 4,
+      });
+
+      return {
+        ok: true,
+        tool: functionName,
+        query: args.query,
+        ...searchResult,
+      };
+    }
+
+    default:
+      throw new Error(`Unsupported tool: ${functionName}`);
+  }
+}
+
+async function processToolCalls(toolCalls, messages, context) {
+  const executedTools = [];
+
+  for (const toolCall of toolCalls) {
+    const functionName = toolCall?.function?.name;
+    const rawArguments = toolCall?.function?.arguments || "{}";
+    let args = {};
+
+    try {
+      args = JSON.parse(rawArguments);
+    } catch (error) {
+      console.error(
+        `[botService] Invalid tool arguments for ${functionName}:`,
+        error.message,
+      );
+
+      const parseErrorResult = {
+        ok: false,
+        tool: functionName,
+        error: "INVALID_TOOL_ARGUMENTS",
+        details: "LLM returned malformed JSON arguments.",
+        rawArguments,
+      };
+
+      console.warn("[botService] Tool arguments parse failed", {
+        userId: context.userId,
+        conversationId: context.conversationId,
+        functionName,
+        rawArguments,
+      });
+
+      messages.push({
+        tool_call_id: toolCall.id,
+        role: "tool",
+        name: functionName,
+        content: JSON.stringify(parseErrorResult),
+      });
+
+      executedTools.push(parseErrorResult);
+      continue;
+    }
+
+    try {
+      console.log("[botService] Executing tool", {
+        userId: context.userId,
+        conversationId: context.conversationId,
+        functionName,
+        args,
+      });
+
+      const result = await executeTool(functionName, args, context);
+
+      console.log("[botService] Tool execution result", {
+        userId: context.userId,
+        conversationId: context.conversationId,
+        functionName,
+        result,
+      });
+
+      messages.push({
+        tool_call_id: toolCall.id,
+        role: "tool",
+        name: functionName,
+        content: JSON.stringify(result),
+      });
+
+      executedTools.push(result);
+    } catch (error) {
+      console.error(
+        `[botService] Tool execution failed for ${functionName}:`,
+        error.message,
+      );
+
+      const toolErrorResult = {
+        ok: false,
+        tool: functionName,
+        error: error.message || "Tool execution failed",
+      };
+
+      messages.push({
+        tool_call_id: toolCall.id,
+        role: "tool",
+        name: functionName,
+        content: JSON.stringify(toolErrorResult),
+      });
+
+      executedTools.push(toolErrorResult);
     }
   }
 
-  return NO_ANSWER_MESSAGE;
+  return executedTools;
+}
+
+async function processChatMessage({
+  userId,
+  message,
+  conversationId,
+  onStatus,
+}) {
+  const normalizedUserId = String(userId || "").trim();
+  const normalizedMessage = cleanText(message);
+  const normalizedConversationId = String(conversationId || "").trim();
+
+  if (!normalizedUserId) {
+    throw new Error("userId is required");
+  }
+
+  if (!normalizedMessage) {
+    throw new Error("message is required");
+  }
+
+  try {
+    const history = await getConversationHistory(normalizedUserId);
+    const messages = buildMessages(history, normalizedMessage);
+
+    console.log("[botService] User question", {
+      userId: normalizedUserId,
+      conversationId: normalizedConversationId || null,
+      message: normalizedMessage,
+      historyCount: history.length,
+    });
+
+    await emitStatus(onStatus, "bot_typing", {
+      stage: "thinking",
+      conversationId: normalizedConversationId || null,
+    });
+
+    const firstResponse = await createChatCompletion({
+      messages,
+      tools: agentTools,
+    });
+    const assistantMessage = firstResponse?.choices?.[0]?.message;
+    const toolCalls = assistantMessage?.tool_calls || [];
+    let finalReply = extractAssistantText(assistantMessage);
+    let executedTools = [];
+
+    console.log("[botService] First model response", {
+      userId: normalizedUserId,
+      conversationId: normalizedConversationId || null,
+      hasToolCalls: toolCalls.length > 0,
+      toolNames: toolCalls.map((item) => item?.function?.name).filter(Boolean),
+      assistantPreview: finalReply || "",
+    });
+
+    if (assistantMessage) {
+      messages.push({
+        role: "assistant",
+        content: assistantMessage.content || "",
+        tool_calls: toolCalls,
+      });
+    }
+
+    if (toolCalls.length > 0) {
+      await emitStatus(onStatus, "bot_tool_executing", {
+        stage: "tool_execution",
+        conversationId: normalizedConversationId || null,
+        toolNames: toolCalls.map((item) => item?.function?.name).filter(Boolean),
+      });
+
+      executedTools = await processToolCalls(toolCalls, messages, {
+        userId: normalizedUserId,
+        conversationId: normalizedConversationId,
+      });
+
+      await emitStatus(onStatus, "bot_typing", {
+        stage: "finalizing",
+        conversationId: normalizedConversationId || null,
+      });
+
+      const secondResponse = await createChatCompletion({
+        messages,
+        tools: agentTools,
+      });
+      const finalMessage = secondResponse?.choices?.[0]?.message;
+      finalReply = extractAssistantText(finalMessage);
+
+      console.log("[botService] Final model response after tools", {
+        userId: normalizedUserId,
+        conversationId: normalizedConversationId || null,
+        reply: finalReply || "",
+      });
+    }
+
+    const safeReply =
+      finalReply ||
+      "Xin lỗi, tôi chưa thể tạo phản hồi phù hợp lúc này. Bạn thử lại giúp tôi nhé.";
+
+    if (!toolCalls.length) {
+      console.log("[botService] Final model response without tools", {
+        userId: normalizedUserId,
+        conversationId: normalizedConversationId || null,
+        reply: safeReply,
+      });
+    }
+
+    await saveConversationHistory(normalizedUserId, [
+      ...history,
+      { role: "user", content: normalizedMessage },
+      { role: "assistant", content: safeReply },
+    ]);
+
+    return {
+      reply: safeReply,
+      sender: "BotAI",
+      status: toolCalls.length > 0 ? "tool_completed" : "completed",
+      toolCalls: executedTools,
+      conversationId: normalizedConversationId || null,
+    };
+  } catch (error) {
+    console.error("[botService] processChatMessage error:", error);
+
+    if (isTemporaryModelError(error)) {
+      const fallbackReply = buildTemporaryUnavailableReply();
+      const history = await getConversationHistory(normalizedUserId);
+
+      await saveConversationHistory(normalizedUserId, [
+        ...history,
+        { role: "user", content: normalizedMessage },
+        { role: "assistant", content: fallbackReply },
+      ]);
+
+      return {
+        reply: fallbackReply,
+        sender: "BotAI",
+        status: "temporarily_unavailable",
+        toolCalls: [],
+        conversationId: normalizedConversationId || null,
+        degraded: true,
+      };
+    }
+
+    throw error;
+  }
+}
+
+async function askAI(userQuestion, options = {}) {
+  const result = await processChatMessage({
+    userId: options.userId || "legacy-bot-user",
+    message: userQuestion,
+    conversationId: options.conversationId || "legacy-bot-conversation",
+    onStatus: options.onStatus,
+  });
+
+  return result.reply;
 }
 
 module.exports = {
+  SYSTEM_PROMPT,
+  agentTools,
   askAI,
-  NO_ANSWER_MESSAGE,
-  searchContextFromQdrant,
-  generateAnswer,
+  getConversationHistory,
+  processChatMessage,
+  saveConversationHistory,
 };

@@ -1,5 +1,6 @@
 const reminderService = require("./reminderService");
 const { notifyMessageCreated } = require("../notifications/notificationService");
+const { saveMessage } = require("../messages/messageService");
 
 const DEFAULT_INTERVAL_MS = 30 * 1000;
 
@@ -16,7 +17,29 @@ async function tick(io) {
       const locked = await reminderService.markReminderFiring(reminder.reminderId);
       if (!locked) continue;
 
-      const message = await reminderService.buildReminderDueMessage(reminder);
+      const dueMessage = await reminderService.buildReminderDueMessage(reminder);
+      let message = dueMessage;
+
+      try {
+        const persistedMessage = await saveMessage({
+          conversationId: dueMessage.conversationId,
+          senderId: dueMessage.senderId,
+          contentType: dueMessage.contentType,
+          content: dueMessage.content,
+          reminderData: dueMessage.reminderData,
+        });
+        message = {
+          ...persistedMessage,
+          senderDisplayName: dueMessage.senderDisplayName,
+          senderAvatarUrl: dueMessage.senderAvatarUrl,
+        };
+      } catch (persistError) {
+        console.error(
+          "[reminders] failed to persist due reminder message:",
+          persistError.message,
+        );
+      }
+
       if (io) {
         io.to(reminder.conversationId).emit("reminder:due", {
           reminder,

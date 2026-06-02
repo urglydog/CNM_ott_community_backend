@@ -50,7 +50,8 @@ function isLiveParticipant(participant) {
   return (
     status === PARTICIPANT_STATUS.JOINED ||
     status === PARTICIPANT_STATUS.RINGING ||
-    status === PARTICIPANT_STATUS.INVITED
+    status === PARTICIPANT_STATUS.INVITED ||
+    status === PARTICIPANT_STATUS.RECONNECTING
   );
 }
 
@@ -129,7 +130,7 @@ async function createSession({ conversationId, channelName, hostUserId }) {
     status: SESSION_STATUS.RINGING,
     channelName,
     participants: [],
-    startedAt: now,
+    startedAt: null,
     endedAt: null,
     endedReason: null,
     endedBy: null,
@@ -170,6 +171,9 @@ async function updateSessionStatus(sessionId, status, endReason = null) {
 
   session.status = storedStatus;
   session.updatedAt = now;
+  if (storedStatus === SESSION_STATUS.ACTIVE && !session.startedAt) {
+    session.startedAt = now;
+  }
   if (ended) {
     session.endedAt = now;
     session.endedReason = endReason;
@@ -382,6 +386,56 @@ async function markCallLogCreated(sessionId) {
   }
 }
 
+// ─── Disconnect / Reconnect ─────────────────────────────────────────────────
+
+/**
+ * Mark a participant as disconnected (socket lost).
+ * Sets status to 'reconnecting' and records disconnectedAt.
+ */
+async function markParticipantDisconnected(sessionId, userId) {
+  const session = await getRawSession(sessionId);
+  if (!session) throw new Error(`Session ${sessionId} not found`);
+
+  const participants = Array.isArray(session.participants) ? session.participants : [];
+  const idx = participants.findIndex((p) => String(p.userId) === String(userId));
+  if (idx === -1) throw new Error(`Participant ${userId} not found`);
+
+  participants[idx] = {
+    ...participants[idx],
+    status: 'reconnecting',
+    disconnectedAt: nowIso(),
+  };
+
+  session.participants = participants;
+  session.updatedAt = nowIso();
+  await putSession(session);
+  return toServiceSession(session);
+}
+
+/**
+ * Mark a participant as reconnected after a disconnect.
+ * Sets status back to 'joined' and records reconnectedAt.
+ */
+async function markParticipantReconnected(sessionId, userId) {
+  const session = await getRawSession(sessionId);
+  if (!session) throw new Error(`Session ${sessionId} not found`);
+
+  const participants = Array.isArray(session.participants) ? session.participants : [];
+  const idx = participants.findIndex((p) => String(p.userId) === String(userId));
+  if (idx === -1) throw new Error(`Participant ${userId} not found`);
+
+  participants[idx] = {
+    ...participants[idx],
+    status: 'joined',
+    reconnectedAt: nowIso(),
+  };
+
+  session.participants = participants;
+  session.updatedAt = nowIso();
+  await putSession(session);
+  return toServiceSession(session);
+}
+
 module.exports = {
   ensureTables,
   createSession,
@@ -398,4 +452,6 @@ module.exports = {
   countJoinedParticipants,
   markActiveCallMessageCreated,
   markCallLogCreated,
+  markParticipantDisconnected,
+  markParticipantReconnected,
 };

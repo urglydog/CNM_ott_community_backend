@@ -113,6 +113,22 @@ async function resolveConversation(conversationId) {
   };
 }
 
+async function isUserInGroupConversation(conversationId, userId) {
+  if (!conversationId || !userId) return false;
+
+  const memberRes = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MEMBERS_TABLE,
+      Key: {
+        groupId: String(conversationId),
+        userId: String(userId),
+      },
+    }),
+  );
+
+  return !!memberRes.Item;
+}
+
 /**
  * Create a call_log message in ott_messages when a call reaches a terminal state.
  * This is the ONLY place call_log messages are generated.
@@ -275,11 +291,13 @@ async function startCall({ userId, conversationId, callType }) {
   const conversation = await resolveConversation(conversationId);
   const { callMode, members } = conversation;
 
-  // 3. Group audio is not supported (Zalo-like rule: group calls are video-only)
-  if (callMode === CALL_MODE.GROUP && normalizedType === CALL_TYPE.AUDIO) {
+  // 3. Group calls are handled exclusively by the group call rebuild system
+  //    (groupCallService + groupCallRepository). The unified callService only
+  //    handles direct (1:1) calls. Reject any group call attempt here.
+  if (callMode === CALL_MODE.GROUP) {
     throw new CallError(
-      "Group calls support video only. Audio group calls are not allowed.",
-      "GROUP_AUDIO_NOT_ALLOWED",
+      "Group calls must use the group call API (POST /api/calls/group/initiate).",
+      "USE_GROUP_CALL_API",
       400,
     );
   }
@@ -1169,6 +1187,15 @@ async function joinCall({ userId, callId }) {
   }
 
   const uid = String(userId);
+  const isCurrentMember = await isUserInGroupConversation(call.conversationId, uid);
+  if (!isCurrentMember) {
+    throw new CallError(
+      "You are not a member of this group",
+      "NOT_GROUP_MEMBER",
+      403,
+    );
+  }
+
   const existing = callModel.findParticipant(call, uid);
 
   let updatedCall;

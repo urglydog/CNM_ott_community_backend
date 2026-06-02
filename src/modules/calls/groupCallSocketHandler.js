@@ -6,6 +6,64 @@ const { ddbDocClient } = require('../../config/awsConfig');
 const { GetCommand } = require('@aws-sdk/lib-dynamodb');
 const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
 
+// ── Reconnect grace timers for group calls ──────────────────────────────────
+// Separate from direct call timers in callSocketHandler.js
+const groupReconnectTimers = new Map(); // key: "sessionId:userId" → setTimeout
+
+function startGroupReconnectTimer(io, sessionId, userId, onlineUsers, timeoutMs) {
+  const key = `${sessionId}:${userId}`;
+  if (groupReconnectTimers.has(key)) return;
+
+  const timer = setTimeout(async () => {
+    groupReconnectTimers.delete(key);
+    try {
+      const result = await groupCallService.endCallDueToDisconnect(sessionId, userId);
+      if (result.ended) {
+        await broadcastSessionEnded(io, sessionId, onlineUsers, 'disconnect_timeout');
+        const session = await require('./groupCallRepository').getSession(sessionId);
+        emitConversationCallEnded(io, session, 'disconnect_timeout');
+      } else {
+        // Notify remaining participants that this user left
+        const groupCallRepo = require('./groupCallRepository');
+        const joinedParticipants = await groupCallRepo.getJoinedParticipants(sessionId);
+        for (const p of joinedParticipants) {
+          const targetSockets = getUserSockets(io, p.userId, onlineUsers);
+          for (const s of targetSockets) {
+            s.emit('group-call:participant-left', {
+              sessionId,
+              leftUserId: userId,
+              reason: 'disconnect_timeout',
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[GROUP_CALL] Reconnect timeout error for ${sessionId}:${userId}:`, err.message);
+    }
+  }, timeoutMs || 30000); // 30s default
+
+  groupReconnectTimers.set(key, timer);
+}
+
+function cancelGroupReconnectTimer(sessionId, userId) {
+  const key = `${sessionId}:${userId}`;
+  const timer = groupReconnectTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    groupReconnectTimers.delete(key);
+  }
+}
+
+function cancelAllGroupReconnectTimers(sessionId) {
+  const prefix = `${sessionId}:`;
+  for (const [key, timer] of groupReconnectTimers.entries()) {
+    if (key.startsWith(prefix)) {
+      clearTimeout(timer);
+      groupReconnectTimers.delete(key);
+    }
+  }
+}
+
 /**
  * GROUP CALL SOCKET HANDLER — CLEAN REBUILD
  *
@@ -280,6 +338,65 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
       console.error('[GROUP_CALL_END_ERROR]', err.message);
     }
   });
+
+  // ── Reconnect: check if user was in a group call with disconnected state ──
+  const userId = getSocketUserId(socket);
+  (async () => {
+    try {
+      const groupCallRepo = require('./groupCallRepository');
+      const activeSession = await groupCallRepo.getActiveSessionForUser(userId);
+      if (!activeSession) return;
+
+      const participant = (activeSession.participants || []).find(
+        (p) => String(p.userId) === String(userId)
+      );
+      if (!participant) return;
+
+      const norm = (s) => String(s || '').toLowerCase();
+      if (norm(participant.status) === 'reconnecting') {
+        // User was disconnected — reconnect them
+        cancelGroupReconnectTimer(activeSession.id, userId);
+
+        const result = await groupCallService.handleReconnect(activeSession.id, userId);
+        if (!result) return;
+
+        const { session, tokenPayload } = result;
+
+        // Join call room
+        socket.join(`call:${activeSession.id}`);
+
+        // Send fresh token to reconnecting user
+        socket.emit('call:participant-reconnected', {
+          callId: activeSession.id,
+          userId,
+          token: tokenPayload.token,
+          uid: tokenPayload.uid,
+          channelName: tokenPayload.channelName,
+        });
+
+        // Notify other participants
+        const joinedParticipants = await groupCallRepo.getJoinedParticipants(activeSession.id);
+        for (const p of joinedParticipants) {
+          if (String(p.userId) === String(userId)) continue;
+          const targetSockets = getUserSockets(io, p.userId, onlineUsers);
+          for (const s of targetSockets) {
+            s.emit('call:participant-reconnected', {
+              callId: activeSession.id,
+              userId,
+            });
+          }
+        }
+
+        console.log(`[GROUP_CALL_RECONNECT] User ${userId} reconnected to group call ${activeSession.id}`);
+      } else if (norm(participant.status) === 'joined') {
+        // User is already joined — just rejoin the socket room
+        socket.join(`call:${activeSession.id}`);
+        console.log(`[GROUP_CALL_RECONNECT] User ${userId} re-joined group call room ${activeSession.id}`);
+      }
+    } catch (err) {
+      console.error(`[GROUP_CALL_RECONNECT] Reconnect check error for user ${userId}:`, err.message);
+    }
+  })();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -328,7 +445,62 @@ function getUserSockets(io, userId, onlineUsers) {
   return sockets;
 }
 
+/**
+ * Handle socket disconnect for group calls.
+ * Called from socketHandler.js when a socket disconnects.
+ * Checks if the user was in an active group call and starts reconnect timer.
+ */
+async function handleGroupCallDisconnect(io, userId, socketId, onlineUsers) {
+  if (!userId) return;
+
+  try {
+    // Check if user has other sockets connected (multi-device)
+    const userKey = String(userId);
+    const remainingSockets = onlineUsers.get(userKey);
+    if (remainingSockets && remainingSockets.size > 0) return;
+
+    // Check if user is in an active group call
+    const groupCallRepo = require('./groupCallRepository');
+    const activeSession = await groupCallRepo.getActiveSessionForUser(userId);
+    if (!activeSession) return;
+
+    const participant = (activeSession.participants || []).find(
+      (p) => String(p.userId) === String(userId)
+    );
+    if (!participant) return;
+
+    const norm = (s) => String(s || '').toLowerCase();
+    if (norm(participant.status) !== 'joined') return;
+
+    // Mark participant as disconnected
+    await groupCallService.handleDisconnect(activeSession.id, userId);
+
+    // Notify other participants
+    const joinedParticipants = await groupCallRepo.getJoinedParticipants(activeSession.id);
+    for (const p of joinedParticipants) {
+      if (String(p.userId) === String(userId)) continue;
+      const targetSockets = getUserSockets(io, p.userId, onlineUsers);
+      for (const s of targetSockets) {
+        s.emit('call:participant-disconnected', {
+          callId: activeSession.id,
+          userId,
+          graceMs: 30000,
+        });
+      }
+    }
+
+    // Start reconnect grace timer
+    startGroupReconnectTimer(io, activeSession.id, userId, onlineUsers, 30000);
+
+    console.log(`[GROUP_CALL_DISCONNECT] User ${userId} disconnected from group call ${activeSession.id}, reconnect grace started (30s)`);
+  } catch (err) {
+    console.error(`[GROUP_CALL_DISCONNECT] Error for user ${userId}:`, err.message);
+  }
+}
+
 module.exports = {
   registerGroupCallHandlers: registerGroupCallSocketHandlers,
   registerGroupCallSocketHandlers,
+  handleGroupCallDisconnect,
+  startGroupReconnectTimer,
 };

@@ -27,6 +27,8 @@ router.post("/group/:sessionId/accept", authMiddleware, callController.acceptGro
 router.post("/group/:sessionId/reject", authMiddleware, callController.rejectGroupCall);
 router.post("/group/:sessionId/leave", authMiddleware, callController.leaveGroupCall);
 router.post("/group/:sessionId/end", authMiddleware, callController.endGroupCall);
+// Get active group call for a conversation (for "Join" button in chat)
+router.get("/group/active", authMiddleware, callController.getActiveGroupCall);
 
 // ─── Call Lifecycle ─────────────────────────────────────────────────────────
 

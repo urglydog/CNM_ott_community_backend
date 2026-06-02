@@ -57,6 +57,17 @@ function handleError(res, error) {
   });
 }
 
+function handleGroupCallError(res, error, logLabel) {
+  const status = error.status || error.statusCode || 500;
+  if (status >= 500) {
+    console.error(`[${logLabel}] Unexpected error:`, error.message);
+  }
+  return res.status(status).json({
+    message: error.message || "Internal server error",
+    code: error.code || (status === 403 ? "FORBIDDEN" : "INTERNAL_ERROR"),
+  });
+}
+
 // ── Socket emission helpers (mirror callSocketHandler logic for REST path) ──
 
 /**
@@ -128,6 +139,14 @@ async function initiateGroupCall(req, res) {
       return res.status(400).json({ message: "conversationId is required" });
     }
 
+    const isMember = await groupService.checkUserInGroup(conversationId, userId);
+    if (!isMember) {
+      return res.status(403).json({
+        message: "You are not a member of this group",
+        code: "NOT_GROUP_MEMBER",
+      });
+    }
+
     const members = await groupService.getGroupMembers(conversationId);
     const memberUserIds = [
       ...new Set([String(userId), ...members.map((m) => String(m.userId)).filter(Boolean)]),
@@ -168,8 +187,7 @@ async function initiateGroupCall(req, res) {
       message: "Group call initiated",
     });
   } catch (error) {
-    console.error("[groupCall:initiate] Unexpected error:", error.message);
-    return res.status(500).json({ message: error.message });
+    return handleGroupCallError(res, error, "groupCall:initiate");
   }
 }
 
@@ -198,8 +216,7 @@ async function acceptGroupCall(req, res) {
       message: "Group call accepted",
     });
   } catch (error) {
-    console.error("[groupCall:accept] Unexpected error:", error.message);
-    return res.status(500).json({ message: error.message });
+    return handleGroupCallError(res, error, "groupCall:accept");
   }
 }
 
@@ -216,8 +233,7 @@ async function rejectGroupCall(req, res) {
     );
     return res.json({ data: { rejected: true }, message: "Group call rejected" });
   } catch (error) {
-    console.error("[groupCall:reject] Unexpected error:", error.message);
-    return res.status(500).json({ message: error.message });
+    return handleGroupCallError(res, error, "groupCall:reject");
   }
 }
 
@@ -226,16 +242,50 @@ async function leaveGroupCall(req, res) {
     const userId = getUserId(req);
     const { sessionId } = req.params;
     await groupCallService.leaveGroupCall({ sessionId, userId });
+
+    // Check if session auto-ended (last participant left)
+    const session = await groupCallRepo.getSession(sessionId);
+    const ended = session && session.status === "ENDED";
+
+    // Notify remaining participants
     await emitGroupToParticipants(
       sessionId,
       "group-call:participant-left",
       { sessionId, leftUserId: String(userId), userId: String(userId) },
       userId,
     );
-    return res.json({ data: { ended: false }, message: "Left group call" });
+
+    // If session ended (last person left), broadcast ended event
+    if (ended) {
+      const io = getIO();
+      if (io) {
+        const participants = await groupCallRepo.getParticipantsBySession(sessionId);
+        for (const p of participants) {
+          emitToUserSockets(io, p.userId, "group-call:ended", {
+            sessionId,
+            callId: sessionId,
+            conversationId: session?.conversationId || null,
+            reason: "all_left",
+          });
+        }
+        // Also emit to conversation room for banner cleanup
+        if (session?.conversationId) {
+          io.to(String(session.conversationId)).emit("group_call_ended", {
+            type: "GROUP_CALL",
+            status: "ended",
+            phase: "ended",
+            conversationId: String(session.conversationId),
+            callId: String(sessionId),
+            reason: "all_left",
+            content: "Cuộc gọi đã kết thúc",
+          });
+        }
+      }
+    }
+
+    return res.json({ data: { ended }, message: ended ? "Group call ended" : "Left group call" });
   } catch (error) {
-    console.error("[groupCall:leave] Unexpected error:", error.message);
-    return res.status(500).json({ message: error.message });
+    return handleGroupCallError(res, error, "groupCall:leave");
   }
 }
 
@@ -250,8 +300,66 @@ async function endGroupCall(req, res) {
     });
     return res.json({ data: { ended: true }, message: "Group call ended" });
   } catch (error) {
-    console.error("[groupCall:end] Unexpected error:", error.message);
-    return res.status(500).json({ message: error.message });
+    return handleGroupCallError(res, error, "groupCall:end");
+  }
+}
+
+// ─── GET /api/calls/group/active?conversationId=... ────────────────────────
+
+/**
+ * Get the active group call session for a conversation.
+ * Used by frontend to show "Join" button in group chat when a call is ongoing.
+ *
+ * Query: ?conversationId=<id>
+ * Returns: { session } or { session: null }
+ */
+async function getActiveGroupCall(req, res) {
+  try {
+    const userId = getUserId(req);
+    const { conversationId } = req.query;
+
+    if (!conversationId) {
+      return res.status(400).json({ message: "conversationId is required" });
+    }
+
+    const isMember = await groupService.checkUserInGroup(conversationId, userId);
+    if (!isMember) {
+      return res.status(403).json({
+        message: "You are not a member of this group",
+        code: "NOT_GROUP_MEMBER",
+      });
+    }
+
+    const session = await groupCallRepo.getActiveSessionByConversation(conversationId);
+
+    if (!session) {
+      return res.json({ session: null });
+    }
+
+    // Verify user is a participant (or at least a member of the conversation)
+    const isParticipant = (session.participants || []).some(
+      (p) => String(p.userId) === String(userId),
+    );
+
+    return res.json({
+      session: {
+        id: session.id || session.callId,
+        callType: session.callType,
+        conversationId: session.conversationId,
+        channelName: session.channelName,
+        hostUserId: session.hostUserId || session.callerId || session.initiatorId,
+        status: session.status,
+        participants: (session.participants || []).map((p) => ({
+          userId: p.userId,
+          role: p.role,
+          status: p.status,
+        })),
+        startedAt: session.startedAt,
+        isParticipant,
+      },
+    });
+  } catch (error) {
+    return handleGroupCallError(res, error, "groupCall:getActive");
   }
 }
 
@@ -643,6 +751,7 @@ module.exports = {
   rejectGroupCall,
   leaveGroupCall,
   endGroupCall,
+  getActiveGroupCall,
   startCall,
   getToken,
   acceptCall,

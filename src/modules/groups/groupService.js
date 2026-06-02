@@ -36,6 +36,44 @@ function forceLeaveGroup(userId, groupId) {
   }
 }
 
+async function checkUserInGroup(groupId, userId) {
+  const groupKey = String(groupId || '').trim();
+  const userKey = String(userId || '').trim();
+  if (!groupKey || !userKey) return false;
+
+  const memberRes = await ddbDocClient.send(new GetCommand({
+    TableName: MEMBERS_TABLE,
+    Key: { groupId: groupKey, userId: userKey }
+  }));
+
+  return !!memberRes.Item;
+}
+
+async function cleanupGroupIfEmpty(groupId) {
+  const groupKey = String(groupId || '').trim();
+  if (!groupKey) return false;
+
+  const membersRes = await ddbDocClient.send(new QueryCommand({
+    TableName: MEMBERS_TABLE,
+    KeyConditionExpression: 'groupId = :gid',
+    ExpressionAttributeValues: { ':gid': groupKey }
+  }));
+
+  if ((membersRes.Items || []).length > 0) return false;
+
+  await ddbDocClient.send(new DeleteCommand({
+    TableName: GROUPS_TABLE,
+    Key: { groupId: groupKey }
+  }));
+
+  const io = getActiveIO();
+  if (io) {
+    io.to(groupKey).emit('group:deleted', { groupId: groupKey });
+  }
+
+  return true;
+}
+
 function generateInviteCode() {
   return crypto.randomBytes(4).toString('hex');
 }
@@ -182,8 +220,8 @@ async function addMembersToGroup(groupId, requestUserId, userIds) {
   }));
   const reqMember = reqMemberRes.Item;
 
-  if (!reqMember || (reqMember.role !== 'OWNER' && reqMember.role !== 'owner' && reqMember.role !== 'DEPUTY' && reqMember.role !== 'deputy')) {
-    const err = new Error('403 Forbidden: Only OWNER or DEPUTY can add members');
+  if (!reqMember) {
+    const err = new Error('403 Forbidden: You are not a member of this group');
     err.status = 403;
     throw err;
   }
@@ -305,6 +343,7 @@ async function kickMember(groupId, requestUserId, targetUserId) {
   }));
 
   forceLeaveGroup(targetKey, groupKey);
+  await cleanupGroupIfEmpty(groupKey);
 
   return { message: 'Member kicked successfully' };
 }
@@ -454,6 +493,7 @@ async function leaveGroup(groupId, requestUserId, newOwnerId = null) {
   }));
 
   forceLeaveGroup(reqUserKey, groupKey);
+  await cleanupGroupIfEmpty(groupKey);
 
   return { message: 'Successfully left the group' };
 }
@@ -713,6 +753,34 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
     changed = true;
   }
 
+  if (settings.name !== undefined) {
+    const name = String(settings.name).trim();
+    if (!name) {
+      const err = new Error('400 Bad Request: Group name is required');
+      err.status = 400;
+      throw err;
+    }
+    updateExpr += '#name = :name, ';
+    exprNames['#name'] = 'name';
+    exprValues[':name'] = name;
+    changed = true;
+  }
+
+  if (settings.description !== undefined) {
+    updateExpr += '#description = :description, ';
+    exprNames['#description'] = 'description';
+    exprValues[':description'] = String(settings.description || '');
+    changed = true;
+  }
+
+  const nextAvatarUrl = settings.avatarUrl !== undefined ? settings.avatarUrl : settings.avatar_url;
+  if (nextAvatarUrl !== undefined) {
+    updateExpr += '#avatarUrl = :avatarUrl, ';
+    exprNames['#avatarUrl'] = 'avatar_url';
+    exprValues[':avatarUrl'] = nextAvatarUrl || null;
+    changed = true;
+  }
+
   if (settings.allowSendLinks !== undefined) {
     updateExpr += '#allowSend = :allowSend, ';
     exprNames['#allowSend'] = 'allowSendLinks';
@@ -744,6 +812,9 @@ async function updateGroupSettings(groupId, requestUserId, settings) {
       io.to(groupKey).emit('SERVER:GROUP_SETTINGS_UPDATED', {
         groupId: groupKey,
         settings: {
+          name: settings.name !== undefined ? String(settings.name).trim() : undefined,
+          description: settings.description !== undefined ? String(settings.description || '') : undefined,
+          avatarUrl: nextAvatarUrl !== undefined ? nextAvatarUrl || null : undefined,
           isApprovalRequired: settings.isApprovalRequired,
           allowSendLinks: settings.allowSendLinks,
           spamFilterLevel: settings.spamFilterLevel
@@ -974,6 +1045,7 @@ module.exports = {
   kickMember,
   updateRole,
   leaveGroup,
+  checkUserInGroup,
   getGroupMembers,
   getGroupsForUser,
   getInviteLink,

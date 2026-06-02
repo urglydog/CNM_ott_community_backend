@@ -988,6 +988,90 @@ async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
   return messages[idx];
 }
 
+/**
+ * Mark a group_call_active message as ended when the group call finishes.
+ * Finds the message by callId in callData, sets callStatus to "ended" and endedAt.
+ *
+ * IDEMPOTENT: if message already marked ended, returns it without writing.
+ *
+ * @param {string} conversationId
+ * @param {string} callId - The group call session ID
+ * @param {string} [endedAt] - ISO timestamp (defaults to now)
+ * @returns {Promise<Object|null>} The updated message or null if not found
+ */
+async function markGroupCallActiveMessageEnded(conversationId, callId, endedAt) {
+  if (!conversationId || !callId) return null;
+
+  const res = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MESSAGES_TABLE,
+      Key: { conversationId },
+    })
+  );
+
+  if (!res.Item || !Array.isArray(res.Item.messages)) {
+    return null;
+  }
+
+  const messages = res.Item.messages.slice();
+  const idx = messages.findIndex(
+    (m) => m.contentType === "group_call_active" && m.callData?.callId === callId,
+  );
+  if (idx === -1) return null;
+
+  const msg = messages[idx];
+  if (!msg.callData) return null;
+
+  // Idempotent: already ended
+  if (msg.callData.callStatus === "ended") return msg;
+
+  const now = endedAt || new Date().toISOString();
+
+  // Update in-place
+  messages[idx] = {
+    ...msg,
+    content: "Cuộc gọi nhóm đã kết thúc",
+    callData: {
+      ...msg.callData,
+      callStatus: "ended",
+      endedAt: now,
+    },
+  };
+
+  // Write back full messages array (DynamoDB document store)
+  await ddbDocClient.send(
+    new PutCommand({
+      TableName: MESSAGES_TABLE,
+      Item: {
+        conversationId,
+        messages,
+      },
+    })
+  );
+
+  // Broadcast message update realtime
+  try {
+    const { getIO } = require("../../socket/socketHandler");
+    const io = getIO();
+    if (io) {
+      const updatedMessage = messages[idx];
+      console.log(`[message:updated] Broadcasting update to room ${conversationId}`, updatedMessage.id);
+      io.to(conversationId).emit("message:updated", {
+        conversationId,
+        messageId: String(updatedMessage.id),
+        contentType: updatedMessage.contentType,
+        content: updatedMessage.content,
+        callData: updatedMessage.callData,
+        updatedAt: updatedMessage.callData?.endedAt || now,
+      });
+    }
+  } catch (emitErr) {
+    console.error("[message:updated] Failed to broadcast:", emitErr.message);
+  }
+
+  return messages[idx];
+}
+
 module.exports = {
   saveMessage,
   saveStickerMessage,
@@ -999,5 +1083,6 @@ module.exports = {
   searchMessagesForUserGlobal,
   fetchMessages,
   stopLiveLocationMessage,
+  markGroupCallActiveMessageEnded,
   enrichSenderInfo,
 };

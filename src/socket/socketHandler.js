@@ -6,7 +6,7 @@ const {
 } = require("@aws-sdk/lib-dynamodb");
 const { saveMessage } = require("../modules/messages/messageService");
 const { registerCallHandlers, handleDisconnect: handleCallDisconnect } = require("../modules/calls/callSocketHandler");
-const { registerGroupCallHandlers } = require("../modules/calls/groupCallSocketHandler");
+const { registerGroupCallHandlers, handleGroupCallDisconnect } = require("../modules/calls/groupCallSocketHandler");
 
 const { saveReadReceipt, getUserLastReadMessage } = require("../modules/messages/readReceiptService");
 const { notifyMessageCreated } = require("../modules/notifications/notificationService");
@@ -961,6 +961,12 @@ function handleSocketConnection(io, socket) {
       // when handleCallDisconnect checks for remaining sockets
       handleCallDisconnect(io, userIdKey, socket.id).catch((err) => {
         console.error(`[call-socket] Disconnect handler error:`, err.message);
+      });
+
+      // ── Group call disconnect handling ──
+      // Checks if user was in an active group call and starts reconnect timer
+      handleGroupCallDisconnect(io, userIdKey, socket.id, onlineUsers).catch((err) => {
+        console.error(`[group-call-socket] Disconnect handler error:`, err.message);
       });
     }
 

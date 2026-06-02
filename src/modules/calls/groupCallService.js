@@ -2,6 +2,7 @@
 
 const groupCallRepo = require('./groupCallRepository');
 const AgoraProvider = require('./providers/agoraProvider');
+const groupService = require('../groups/groupService');
 
 const agoraProvider = new AgoraProvider();
 
@@ -15,6 +16,18 @@ const agoraProvider = new AgoraProvider();
 
 async function startGroupCall({ conversationId, hostUserId, memberUserIds }) {
   console.log(`[GROUP_CALL_START] conversationId=${conversationId} host=${hostUserId}`);
+
+  const groupMemberIds = await getGroupMemberIds(conversationId);
+  ensureGroupMember(groupMemberIds, hostUserId);
+
+  const requestedIds = Array.isArray(memberUserIds)
+    ? memberUserIds.map((id) => String(id)).filter(Boolean)
+    : [];
+  const selectedIds = requestedIds.length > 0 ? requestedIds : groupMemberIds;
+  const allowedIds = new Set(groupMemberIds);
+  const participantUserIds = [
+    ...new Set([String(hostUserId), ...selectedIds.filter((id) => allowedIds.has(String(id)))]),
+  ];
 
   // Check for existing active session
   const existing = await groupCallRepo.getActiveSessionByConversation(conversationId);
@@ -43,8 +56,8 @@ async function startGroupCall({ conversationId, hostUserId, memberUserIds }) {
     status: 'JOINED',
   });
 
-  const invitees = memberUserIds.filter((id) => id !== hostUserId);
-  console.log(`[GROUP_CALL_MEMBERS] members=[${memberUserIds.join(',')}] invitees=[${invitees.join(',')}]`);
+  const invitees = participantUserIds.filter((id) => id !== String(hostUserId));
+  console.log(`[GROUP_CALL_MEMBERS] members=[${participantUserIds.join(',')}] invitees=[${invitees.join(',')}]`);
 
   for (const memberId of invitees) {
     await groupCallRepo.createParticipant({
@@ -107,6 +120,7 @@ async function acceptGroupCall({ sessionId, userId }) {
   if (session.status === 'ENDED' || session.status === 'FAILED') {
     throw new Error('Session already ended');
   }
+  await assertUserInGroup(session.conversationId, userId);
 
   const participant = await groupCallRepo.getParticipant(sessionId, userId);
   if (!participant) {
@@ -216,6 +230,29 @@ async function endGroupCall({ sessionId, userId, reason = 'host_ended' }) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+function notGroupMemberError() {
+  const err = new Error('You are not a member of this group');
+  err.status = 403;
+  err.code = 'NOT_GROUP_MEMBER';
+  return err;
+}
+
+async function getGroupMemberIds(conversationId) {
+  const members = await groupService.getGroupMembers(conversationId);
+  return members.map((m) => String(m.userId)).filter(Boolean);
+}
+
+function ensureGroupMember(memberUserIds, userId) {
+  if (!memberUserIds.includes(String(userId))) {
+    throw notGroupMemberError();
+  }
+}
+
+async function assertUserInGroup(conversationId, userId) {
+  const isMember = await groupService.checkUserInGroup(conversationId, userId);
+  if (!isMember) throw notGroupMemberError();
+}
+
 async function checkAndMaybeEndSession(sessionId, reason) {
   // Single read to avoid race conditions between multiple DynamoDB queries
   const allParticipants = await groupCallRepo.getParticipantsBySession(sessionId);
@@ -231,7 +268,9 @@ async function checkAndMaybeEndSession(sessionId, reason) {
   // Diagnostic log
   console.log(`[GROUP_ALL_LEFT_CHECK] sessionId=${sessionId} joinedCount=${joinedCount} ringingCount=${ringingCount} participants=[${allParticipants.map((p) => `${p.userId}:${norm(p.status)}`).join(',')}]`);
 
-  if (joinedCount === 0) {
+  const reconnectingCount = allParticipants.filter((p) => norm(p.status) === 'reconnecting').length;
+
+  if (joinedCount === 0 && reconnectingCount === 0) {
     console.log(`[GROUP_CALL_END] auto-ending sessionId=${sessionId} reason=${reason}`);
     await finalizeSession(sessionId, reason, {
       joinedStatus: 'LEFT',
@@ -266,7 +305,87 @@ async function finalizeSession(
 
   const endedSession = await groupCallRepo.endSession(sessionId, reason);
   await createGroupCallLogMessage(sessionId, reason);
+
+  // Update the existing group_call_active message to ended status
+  // so FE doesn't show stale "Tham gia" button after reload
+  try {
+    const { markGroupCallActiveMessageEnded } = require("../messages/messageService");
+    const endedAt = endedSession?.endedAt || new Date().toISOString();
+    const conversationId = endedSession?.conversationId || sessionId;
+    await markGroupCallActiveMessageEnded(conversationId, sessionId, endedAt);
+  } catch (markErr) {
+    console.error("[group-call] Failed to mark active message as ended:", markErr.message);
+    // Non-fatal — don't break the call end flow
+  }
+
   return endedSession;
+}
+
+// ── Disconnect / Reconnect handling ────────────────────────────────────────
+
+/**
+ * Handle participant socket disconnect during an active group call.
+ * Marks the participant as reconnecting in DB.
+ *
+ * @param {string} sessionId
+ * @param {string} userId
+ * @returns {Promise<Object|null>} Updated session or null if not applicable
+ */
+async function handleDisconnect(sessionId, userId) {
+  const participant = await groupCallRepo.getParticipant(sessionId, userId);
+  if (!participant) return null;
+
+  const norm = (s) => String(s || '').toLowerCase();
+  if (norm(participant.status) !== 'joined') return null;
+
+  console.log(`[GROUP_CALL_DISCONNECT] sessionId=${sessionId} userId=${userId}`);
+  return groupCallRepo.markParticipantDisconnected(sessionId, userId);
+}
+
+/**
+ * Handle participant reconnect after a disconnect.
+ * Marks participant as joined, returns fresh Agora token.
+ *
+ * @param {string} sessionId
+ * @param {string} userId
+ * @returns {Promise<{session: Object, tokenPayload: Object}|null>}
+ */
+async function handleReconnect(sessionId, userId) {
+  const participant = await groupCallRepo.getParticipant(sessionId, userId);
+  if (!participant) return null;
+
+  const norm = (s) => String(s || '').toLowerCase();
+  if (norm(participant.status) !== 'reconnecting') return null;
+
+  console.log(`[GROUP_CALL_RECONNECT] sessionId=${sessionId} userId=${userId}`);
+  const session = await groupCallRepo.markParticipantReconnected(sessionId, userId);
+
+  const uid = hashCode(userId);
+  const token = agoraProvider.generateToken(session.channelName, uid);
+
+  return {
+    session,
+    tokenPayload: { token, uid, channelName: session.channelName },
+  };
+}
+
+/**
+ * End a group call participant's presence due to disconnect timeout.
+ * Marks participant as LEFT, then checks if session should end.
+ *
+ * @param {string} sessionId
+ * @param {string} userId
+ * @returns {Promise<{ended: boolean}>}
+ */
+async function endCallDueToDisconnect(sessionId, userId) {
+  console.log(`[GROUP_CALL_DISCONNECT_TIMEOUT] sessionId=${sessionId} userId=${userId}`);
+
+  const participant = await groupCallRepo.getParticipant(sessionId, userId);
+  if (!participant) return { ended: false };
+
+  await groupCallRepo.updateParticipantStatus(sessionId, userId, 'LEFT');
+  const ended = await checkAndMaybeEndSession(sessionId, 'disconnect_timeout');
+  return { ended };
 }
 
 /**
@@ -439,6 +558,9 @@ module.exports = {
   rejectGroupCall,
   leaveGroupCall,
   endGroupCall,
+  handleDisconnect,
+  handleReconnect,
+  endCallDueToDisconnect,
   hashCode,
   createGroupCallActiveMessage,
   createGroupCallLogMessage,

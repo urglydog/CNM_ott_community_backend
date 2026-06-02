@@ -17,6 +17,7 @@
 const callService = require("./callService");
 const callModel = require("./callModel");
 const { emitToUserSockets: emitToUserSocketsRegistry, onlineUsers } = require("../../socket/socketUserRegistry");
+const { sendPushNotificationForCall } = require("../notifications/notificationService");
 const {
   SOCKET_EVENTS,
   CALL_STATUS,
@@ -437,6 +438,26 @@ async function handleCallStart(io, socket, userId, data, callback) {
     if (callSession.callMode === CALL_MODE.GROUP) {
       console.log(`[GROUP_CALL_INVITE] emittedCount=${emittedCount}`);
     }
+
+    // --- FCM Push Notification ---
+    try {
+      const { getUserById } = require("../users/userService");
+      const hostDisplayInfo = await getUserById(userId);
+      sendPushNotificationForCall({
+        recipients: recipientIds,
+        callerName: hostDisplayInfo?.display_name || hostDisplayInfo?.username || String(userId),
+        data: {
+          callType: callSession.callMode,
+          callId: callId,
+          conversationId: callSession.conversationId,
+          channelName: callSession.channelName,
+          callerId: userId,
+        }
+      }).catch(err => console.error('[FCM_PUSH_ERROR]', err));
+    } catch (e) {
+      console.error('[FCM_PUSH_SETUP_ERROR]', e);
+    }
+    // -----------------------------
 
     // Start ringing timeout
     // Fix 4: Direct = one timer for callId, Group = per-participant timers

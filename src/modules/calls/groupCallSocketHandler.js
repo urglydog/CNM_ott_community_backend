@@ -5,6 +5,7 @@ const { onlineUsers: defaultOnlineUsers } = require('../../socket/socketUserRegi
 const { ddbDocClient } = require('../../config/awsConfig');
 const { GetCommand } = require('@aws-sdk/lib-dynamodb');
 const USERS_TABLE = process.env.DDB_USERS_TABLE || 'ott_users';
+const { sendPushNotificationForCall } = require('../notifications/notificationService');
 
 // ── Reconnect grace timers for group calls ──────────────────────────────────
 // Separate from direct call timers in callSocketHandler.js
@@ -185,6 +186,20 @@ function registerGroupCallSocketHandlers(io, socket, onlineUsers = defaultOnline
           });
         }
       }
+      // FCM push notification for invitees
+      const hostDisplayInfo = await getUserDisplayInfo(userId);
+      sendPushNotificationForCall({
+        recipients: inviteeUserIds,
+        callerName: hostDisplayInfo.displayName,
+        data: {
+          callType: 'GROUP',
+          callId: session.id,
+          conversationId,
+          channelName: session.channelName,
+          callerId: userId,
+        }
+      }).catch(err => console.error('[FCM_PUSH_ERROR]', err));
+
     } catch (err) {
       console.error('[GROUP_CALL_START_ERROR]', err.message);
       socket.emit('group-call:error', { message: err.message });

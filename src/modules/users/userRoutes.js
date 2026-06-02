@@ -5,6 +5,7 @@ const userController = require('./userController');
 const authMiddleware = require('../../common/middlewares/authMiddleware');
 
 router.get('/me', authMiddleware, userController.getMe);
+router.post('/me/fcm-token', authMiddleware, userController.saveFcmToken);
 router.put('/profile', authMiddleware, userController.updateProfile);
 router.post('/change-password', authMiddleware, userController.changePassword);
 

@@ -653,6 +653,45 @@ async function updateProfile(userId, payload) {
   return getUserById(user.userId || userId);
 }
 
+async function saveFcmToken(userId, token, platform) {
+  if (!userId || !token) return;
+  const user = await getUserById(userId);
+  if (!user) return;
+
+  const currentTokens = Array.isArray(user.fcm_tokens) ? user.fcm_tokens : [];
+  if (!currentTokens.includes(token)) {
+    const updatedTokens = [...currentTokens, token];
+    await ddbDocClient.send(new UpdateCommand({
+      TableName: USERS_TABLE,
+      Key: { userId: String(user.userId || userId) },
+      UpdateExpression: 'SET fcm_tokens = :fcm_tokens',
+      ExpressionAttributeValues: {
+        ':fcm_tokens': updatedTokens,
+      },
+    }));
+  }
+}
+
+async function removeFcmToken(userId, token) {
+  if (!userId || !token) return;
+  const user = await getUserById(userId);
+  if (!user) return;
+
+  const currentTokens = Array.isArray(user.fcm_tokens) ? user.fcm_tokens : [];
+  const updatedTokens = currentTokens.filter(t => t !== token);
+  
+  if (currentTokens.length !== updatedTokens.length) {
+    await ddbDocClient.send(new UpdateCommand({
+      TableName: USERS_TABLE,
+      Key: { userId: String(user.userId || userId) },
+      UpdateExpression: 'SET fcm_tokens = :fcm_tokens',
+      ExpressionAttributeValues: {
+        ':fcm_tokens': updatedTokens,
+      },
+    }));
+  }
+}
+
 async function changePassword(userId, currentPassword, newPassword, username) {
   if (!currentPassword || !newPassword) {
     throw new Error('Thiếu mật khẩu hiện tại hoặc mật khẩu mới');
@@ -872,4 +911,6 @@ module.exports = {
   sendPhoneOTP,
   verifyPhoneOTP,
   resetPassword,
+  saveFcmToken,
+  removeFcmToken,
 };

@@ -35,6 +35,23 @@ async function getMe(req, res) {
   }
 }
 
+async function saveFcmToken(req, res) {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Chưa xác thực' });
+    }
+    const { token, platform } = req.body;
+    if (!token) {
+      return res.status(400).json({ message: 'Thiếu FCM token' });
+    }
+    await userService.saveFcmToken(userId, token, platform);
+    return res.json({ message: 'Lưu FCM token thành công' });
+  } catch (error) {
+    return res.status(400).json({ message: error.message });
+  }
+}
+
 async function updateProfile(req, res) {
   try {
     const userId = req.user?.userId;
@@ -157,6 +174,7 @@ module.exports = {
   getUserById,
   listUsers,
   getMe,
+  saveFcmToken,
   updateProfile,
   changePassword,
   sendEmailOTP,

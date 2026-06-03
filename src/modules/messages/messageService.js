@@ -11,6 +11,8 @@ const MESSAGES_TABLE = process.env.DDB_MESSAGES_TABLE || "ott_messages";
 const FILE_MESSAGES_TABLE = process.env.DYNAMODB_TABLE_NAME || MESSAGES_TABLE;
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME;
 const USERS_TABLE = process.env.DDB_USERS_TABLE || "ott_users";
+const BOT_AI_AVATAR_URL =
+  process.env.BOT_AI_AVATAR_URL || "/botai-avatar.svg";
 
 // conversationId vẫn giữ dạng "channel:1" hoặc "direct:1" để tương thích với API hiện tại
 
@@ -33,6 +35,8 @@ const VALID_CONTENT_TYPES = new Set([
   // Call log entry — schema-only placeholder for future Agora call integration (Phase 2)
   // Stored in ott_messages with callData sub-document. No business logic here.
   "call_log",
+  // Group call active message — system message when a group call starts
+  "group_call_active",
 ]);
 
 /**
@@ -128,6 +132,13 @@ function validateEmojiData(content) {
   // Chỉ cần non-empty string là đủ, không cần kiểm tra unicode sâu
 }
 async function enrichSenderInfo(senderId) {
+  if (String(senderId) === "ai-bot") {
+    return {
+      senderDisplayName: "BotAI",
+      senderAvatarUrl: BOT_AI_AVATAR_URL,
+    };
+  }
+
   try {
     const result = await ddbDocClient.send(
       new GetCommand({
@@ -271,7 +282,7 @@ async function saveMessage(payload) {
         }
       : {}),
     // callData chỉ tồn tại khi contentType === "call_log" — lưu metadata cuộc gọi
-    ...(contentType === "call_log" && payload.callData
+    ...((contentType === "call_log" || contentType === "group_call_active") && payload.callData
       ? { callData: { ...payload.callData } }
       : {}),
     attachments: payload.attachments || null,
@@ -321,6 +332,7 @@ async function saveMessage(payload) {
     ...(newMessage.locationData ? { locationData: newMessage.locationData } : {}),
     // Trả về pollData để frontend hiển thị bình chọn
     ...(newMessage.pollData ? { pollData: newMessage.pollData } : {}),
+    ...(newMessage.callData ? { callData: newMessage.callData } : {}),
     ...(newMessage.reminderData ? { reminderData: newMessage.reminderData } : {}),
     attachments: newMessage.attachments,
     reactions: newMessage.reactions,
@@ -402,6 +414,7 @@ async function getMessagesForConversation(conversationId, currentUserId) {
         ...(msg.locationData ? { locationData: msg.locationData } : {}),
         // pollData được giữ nguyên khi đọc lại từ DB
         ...(msg.pollData ? { pollData: msg.pollData } : {}),
+        ...(msg.callData ? { callData: msg.callData } : {}),
         ...(msg.reminderData ? { reminderData: msg.reminderData } : {}),
         attachments: msg.attachments || null,
         reactions: msg.reactions || null,
@@ -855,6 +868,69 @@ async function searchMessagesForUserGlobal({
     data: enriched,
   };
 }
+
+function resolveTimeRangeBounds(timeRange) {
+  const now = new Date();
+  const normalized = String(timeRange || "").trim().toLowerCase();
+
+  if (!normalized) {
+    return {};
+  }
+
+  if (normalized === "morning") {
+    const from = new Date(now);
+    from.setHours(5, 0, 0, 0);
+    const to = new Date(now);
+    to.setHours(11, 59, 59, 999);
+    return { fromDate: from.toISOString(), toDate: to.toISOString() };
+  }
+
+  const lastHoursMatch = normalized.match(/^last_(\d+)_hours$/);
+  if (lastHoursMatch) {
+    const hours = Number(lastHoursMatch[1] || 0);
+    if (hours > 0) {
+      const from = new Date(now.getTime() - hours * 60 * 60 * 1000);
+      return { fromDate: from.toISOString(), toDate: now.toISOString() };
+    }
+  }
+
+  return {};
+}
+
+async function fetchMessages({
+  conversationId,
+  timeRange,
+  focus,
+  currentUserId,
+  limit = 30,
+}) {
+  const bounds = resolveTimeRangeBounds(timeRange);
+  const messages = await getMessagesForConversation(conversationId, currentUserId);
+  let data = messages.slice();
+
+  if (bounds.fromDate || bounds.toDate) {
+    const fromMs = bounds.fromDate ? new Date(bounds.fromDate).getTime() : null;
+    const toMs = bounds.toDate ? new Date(bounds.toDate).getTime() : null;
+
+    data = data.filter((item) => {
+      const createdMs = item?.createdAt ? new Date(item.createdAt).getTime() : null;
+      if (createdMs == null) return false;
+      if (fromMs != null && createdMs < fromMs) return false;
+      if (toMs != null && createdMs > toMs) return false;
+      return true;
+    });
+  }
+
+  data = data.slice(-Math.max(1, Math.min(Number(limit) || 30, 50)));
+
+  return {
+    conversationId,
+    timeRange: timeRange || null,
+    focus: focus || "general",
+    count: data.length,
+    data,
+  };
+}
 /**
  * Dừng phên chia sẻ vị trí trực tiếp.
  * Cập nhật field locationData.isLive = false và locationData.liveUntil = now
@@ -912,6 +988,90 @@ async function stopLiveLocationMessage(conversationId, messageId, stoppedAt) {
   return messages[idx];
 }
 
+/**
+ * Mark a group_call_active message as ended when the group call finishes.
+ * Finds the message by callId in callData, sets callStatus to "ended" and endedAt.
+ *
+ * IDEMPOTENT: if message already marked ended, returns it without writing.
+ *
+ * @param {string} conversationId
+ * @param {string} callId - The group call session ID
+ * @param {string} [endedAt] - ISO timestamp (defaults to now)
+ * @returns {Promise<Object|null>} The updated message or null if not found
+ */
+async function markGroupCallActiveMessageEnded(conversationId, callId, endedAt) {
+  if (!conversationId || !callId) return null;
+
+  const res = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MESSAGES_TABLE,
+      Key: { conversationId },
+    })
+  );
+
+  if (!res.Item || !Array.isArray(res.Item.messages)) {
+    return null;
+  }
+
+  const messages = res.Item.messages.slice();
+  const idx = messages.findIndex(
+    (m) => m.contentType === "group_call_active" && m.callData?.callId === callId,
+  );
+  if (idx === -1) return null;
+
+  const msg = messages[idx];
+  if (!msg.callData) return null;
+
+  // Idempotent: already ended
+  if (msg.callData.callStatus === "ended") return msg;
+
+  const now = endedAt || new Date().toISOString();
+
+  // Update in-place
+  messages[idx] = {
+    ...msg,
+    content: "Cuộc gọi nhóm đã kết thúc",
+    callData: {
+      ...msg.callData,
+      callStatus: "ended",
+      endedAt: now,
+    },
+  };
+
+  // Write back full messages array (DynamoDB document store)
+  await ddbDocClient.send(
+    new PutCommand({
+      TableName: MESSAGES_TABLE,
+      Item: {
+        conversationId,
+        messages,
+      },
+    })
+  );
+
+  // Broadcast message update realtime
+  try {
+    const { getIO } = require("../../socket/socketHandler");
+    const io = getIO();
+    if (io) {
+      const updatedMessage = messages[idx];
+      console.log(`[message:updated] Broadcasting update to room ${conversationId}`, updatedMessage.id);
+      io.to(conversationId).emit("message:updated", {
+        conversationId,
+        messageId: String(updatedMessage.id),
+        contentType: updatedMessage.contentType,
+        content: updatedMessage.content,
+        callData: updatedMessage.callData,
+        updatedAt: updatedMessage.callData?.endedAt || now,
+      });
+    }
+  } catch (emitErr) {
+    console.error("[message:updated] Failed to broadcast:", emitErr.message);
+  }
+
+  return messages[idx];
+}
+
 module.exports = {
   saveMessage,
   saveStickerMessage,
@@ -921,6 +1081,8 @@ module.exports = {
   saveFileMessage,
   searchMessagesInConversation,
   searchMessagesForUserGlobal,
+  fetchMessages,
   stopLiveLocationMessage,
+  markGroupCallActiveMessageEnded,
   enrichSenderInfo,
 };

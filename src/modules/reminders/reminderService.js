@@ -421,6 +421,7 @@ module.exports = {
   buildReminderDueMessage,
   cancelReminder,
   completeTriggeredReminder,
+  create: createReminder,
   createReminder,
   ensureRemindersTable,
   findDueReminders,

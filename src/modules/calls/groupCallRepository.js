@@ -6,6 +6,7 @@ const {
   PutCommand,
   QueryCommand,
   ScanCommand,
+  UpdateCommand,
 } = require('@aws-sdk/lib-dynamodb');
 const { ddbDocClient } = require('../../config/awsConfig');
 const { CALLS_TABLE } = require('./callModel');
@@ -49,7 +50,8 @@ function isLiveParticipant(participant) {
   return (
     status === PARTICIPANT_STATUS.JOINED ||
     status === PARTICIPANT_STATUS.RINGING ||
-    status === PARTICIPANT_STATUS.INVITED
+    status === PARTICIPANT_STATUS.INVITED ||
+    status === PARTICIPANT_STATUS.RECONNECTING
   );
 }
 
@@ -128,10 +130,12 @@ async function createSession({ conversationId, channelName, hostUserId }) {
     status: SESSION_STATUS.RINGING,
     channelName,
     participants: [],
-    startedAt: now,
+    startedAt: null,
     endedAt: null,
     endedReason: null,
     endedBy: null,
+    activeCallMessageCreated: false,
+    callLogCreated: false,
     createdAt: now,
     updatedAt: now,
   };
@@ -167,6 +171,9 @@ async function updateSessionStatus(sessionId, status, endReason = null) {
 
   session.status = storedStatus;
   session.updatedAt = now;
+  if (storedStatus === SESSION_STATUS.ACTIVE && !session.startedAt) {
+    session.startedAt = now;
+  }
   if (ended) {
     session.endedAt = now;
     session.endedReason = endReason;
@@ -333,6 +340,102 @@ async function getRawSession(sessionId) {
   return result.Item || null;
 }
 
+async function markActiveCallMessageCreated(sessionId) {
+  try {
+    await ddbDocClient.send(
+      new UpdateCommand({
+        TableName: CALLS_TABLE,
+        Key: { callId: String(sessionId) },
+        UpdateExpression: "SET activeCallMessageCreated = :true",
+        ConditionExpression: "activeCallMessageCreated = :false",
+        ExpressionAttributeValues: {
+          ":true": true,
+          ":false": false,
+        },
+      }),
+    );
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      return false;
+    }
+    throw err;
+  }
+}
+
+async function markCallLogCreated(sessionId) {
+  try {
+    await ddbDocClient.send(
+      new UpdateCommand({
+        TableName: CALLS_TABLE,
+        Key: { callId: String(sessionId) },
+        UpdateExpression: "SET callLogCreated = :true",
+        ConditionExpression: "callLogCreated = :false",
+        ExpressionAttributeValues: {
+          ":true": true,
+          ":false": false,
+        },
+      }),
+    );
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      return false;
+    }
+    throw err;
+  }
+}
+
+// ─── Disconnect / Reconnect ─────────────────────────────────────────────────
+
+/**
+ * Mark a participant as disconnected (socket lost).
+ * Sets status to 'reconnecting' and records disconnectedAt.
+ */
+async function markParticipantDisconnected(sessionId, userId) {
+  const session = await getRawSession(sessionId);
+  if (!session) throw new Error(`Session ${sessionId} not found`);
+
+  const participants = Array.isArray(session.participants) ? session.participants : [];
+  const idx = participants.findIndex((p) => String(p.userId) === String(userId));
+  if (idx === -1) throw new Error(`Participant ${userId} not found`);
+
+  participants[idx] = {
+    ...participants[idx],
+    status: 'reconnecting',
+    disconnectedAt: nowIso(),
+  };
+
+  session.participants = participants;
+  session.updatedAt = nowIso();
+  await putSession(session);
+  return toServiceSession(session);
+}
+
+/**
+ * Mark a participant as reconnected after a disconnect.
+ * Sets status back to 'joined' and records reconnectedAt.
+ */
+async function markParticipantReconnected(sessionId, userId) {
+  const session = await getRawSession(sessionId);
+  if (!session) throw new Error(`Session ${sessionId} not found`);
+
+  const participants = Array.isArray(session.participants) ? session.participants : [];
+  const idx = participants.findIndex((p) => String(p.userId) === String(userId));
+  if (idx === -1) throw new Error(`Participant ${userId} not found`);
+
+  participants[idx] = {
+    ...participants[idx],
+    status: 'joined',
+    reconnectedAt: nowIso(),
+  };
+
+  session.participants = participants;
+  session.updatedAt = nowIso();
+  await putSession(session);
+  return toServiceSession(session);
+}
+
 module.exports = {
   ensureTables,
   createSession,
@@ -347,4 +450,8 @@ module.exports = {
   getActiveSessionByConversation,
   getActiveSessionForUser,
   countJoinedParticipants,
+  markActiveCallMessageCreated,
+  markCallLogCreated,
+  markParticipantDisconnected,
+  markParticipantReconnected,
 };

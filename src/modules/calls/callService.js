@@ -21,6 +21,7 @@ const {
   CALL_MODE,
   CALL_TYPE,
   PARTICIPANT_STATUS,
+  CONNECTION_STATE,
   ENDED_REASON,
   TIMEOUTS,
 } = require("./call.constants");
@@ -112,6 +113,22 @@ async function resolveConversation(conversationId) {
   };
 }
 
+async function isUserInGroupConversation(conversationId, userId) {
+  if (!conversationId || !userId) return false;
+
+  const memberRes = await ddbDocClient.send(
+    new GetCommand({
+      TableName: MEMBERS_TABLE,
+      Key: {
+        groupId: String(conversationId),
+        userId: String(userId),
+      },
+    }),
+  );
+
+  return !!memberRes.Item;
+}
+
 /**
  * Create a call_log message in ott_messages when a call reaches a terminal state.
  * This is the ONLY place call_log messages are generated.
@@ -175,6 +192,7 @@ async function createCallLogMessage(callSession) {
     callStatus: callSession.status,
     endedReason: callSession.endedReason || null,
     durationSeconds: callSession.durationSeconds || 0,
+    startedAt: callSession.startedAt || null,
     initiatorId: callSession.initiatorId,
     acceptedCount,
     rejectedCount,
@@ -273,11 +291,13 @@ async function startCall({ userId, conversationId, callType }) {
   const conversation = await resolveConversation(conversationId);
   const { callMode, members } = conversation;
 
-  // 3. Group audio is not supported (Zalo-like rule: group calls are video-only)
-  if (callMode === CALL_MODE.GROUP && normalizedType === CALL_TYPE.AUDIO) {
+  // 3. Group calls are handled exclusively by the group call rebuild system
+  //    (groupCallService + groupCallRepository). The unified callService only
+  //    handles direct (1:1) calls. Reject any group call attempt here.
+  if (callMode === CALL_MODE.GROUP) {
     throw new CallError(
-      "Group calls support video only. Audio group calls are not allowed.",
-      "GROUP_AUDIO_NOT_ALLOWED",
+      "Group calls must use the group call API (POST /api/calls/group/initiate).",
+      "USE_GROUP_CALL_API",
       400,
     );
   }
@@ -310,11 +330,52 @@ async function startCall({ userId, conversationId, callType }) {
       `status=${existingCall.status} ageMs=${ageMs} BLOCKING_STATUSES=${BLOCKING_STATUSES.join(",")}`,
     );
 
-    // Auto-cleanup stale RINGING calls that exceeded the ring timeout
+    let shouldCleanup = false;
+
+    // Rule 1: Stale RINGING — exceeded ring timeout
     if (existingCall.status === CALL_STATUS.RINGING && ageMs > TIMEOUTS.RING_TIMEOUT_MS) {
+      shouldCleanup = true;
+    }
+
+    // Rule 2: Direct call ACTIVE/RECONNECTING — all participants disconnected or left
+    if (!shouldCleanup && callMode === CALL_MODE.DIRECT) {
+      const staleableStatuses = [CALL_STATUS.ACTIVE, CALL_STATUS.RECONNECTING];
+      if (staleableStatuses.includes(existingCall.status)) {
+        const participants = existingCall.participants || [];
+        const allGone = participants.length > 0 && participants.every((p) => {
+          const terminal = [PARTICIPANT_STATUS.LEFT, PARTICIPANT_STATUS.REJECTED, PARTICIPANT_STATUS.MISSED];
+          return terminal.includes(p.status) || p.connectionState === CONNECTION_STATE.DISCONNECTED;
+        });
+        if (allGone) {
+          shouldCleanup = true;
+        }
+      }
+    }
+
+    // Rule 3: RECONNECTING — disconnect grace period expired (any call mode)
+    if (!shouldCleanup && existingCall.status === CALL_STATUS.RECONNECTING) {
+      const disconnectedParticipants = (existingCall.participants || []).filter(
+        (p) => p.connectionState === CONNECTION_STATE.DISCONNECTED && p.disconnectedAt,
+      );
+      for (const p of disconnectedParticipants) {
+        const disconnectAge = Date.now() - new Date(p.disconnectedAt).getTime();
+        if (disconnectAge > TIMEOUTS.DISCONNECT_GRACE_MS) {
+          shouldCleanup = true;
+          break;
+        }
+      }
+    }
+
+    // Rule 4: Safety — any call older than 24h is definitely stale
+    const MAX_CALL_AGE_MS = 24 * 60 * 60 * 1000;
+    if (!shouldCleanup && ageMs > MAX_CALL_AGE_MS) {
+      shouldCleanup = true;
+    }
+
+    if (shouldCleanup) {
       console.log(
-        `[call:stale-cleanup] callId=${existingCall.callId} oldStatus=ringing newStatus=ended ` +
-        `reason=AUTO_TIMEOUT_CLEANUP ageMs=${ageMs} threshold=${TIMEOUTS.RING_TIMEOUT_MS}`,
+        `[call:stale-cleanup] callId=${existingCall.callId} oldStatus=${existingCall.status} ` +
+        `reason=AUTO_TIMEOUT_CLEANUP ageMs=${ageMs} callMode=${existingCall.callMode}`,
       );
       try {
         await callRepository.cleanupStaleConversationCalls(conversationId, ENDED_REASON.SYSTEM_CLEANUP);
@@ -324,9 +385,10 @@ async function startCall({ userId, conversationId, callType }) {
       // Fall through — allow the new call
     } else {
       // Legitimately active call — block new call
+      const receiverId = members.find((m) => m !== callerId) || "unknown";
       console.log(
-        `[call:start-blocked] conversationId=${conversationId} callId=${existingCall.callId} ` +
-        `status=${existingCall.status} ageMs=${ageMs}`,
+        `[CALL_START_CONFLICT] callerId=${callerId} receiverId=${receiverId} ` +
+        `existingCallId=${existingCall.callId} status=${existingCall.status}`,
       );
       throw new CallError(
         "An active call already exists in this conversation",
@@ -1116,14 +1178,24 @@ async function joinCall({ userId, callId }) {
   if (!call) {
     throw new CallError("Call not found", "CALL_NOT_FOUND", 404);
   }
-  if (call.status !== CALL_STATUS.ACTIVE) {
-    throw new CallError("Call is not active", "CALL_NOT_ACTIVE", 400);
+  const joinableStatuses = [CALL_STATUS.ACTIVE, CALL_STATUS.RINGING];
+  if (!joinableStatuses.includes(call.status)) {
+    throw new CallError("Call is not joinable", "CALL_NOT_ACTIVE", 400);
   }
   if (call.callMode !== CALL_MODE.GROUP) {
     throw new CallError("Cannot join a direct call", "NOT_GROUP_CALL", 400);
   }
 
   const uid = String(userId);
+  const isCurrentMember = await isUserInGroupConversation(call.conversationId, uid);
+  if (!isCurrentMember) {
+    throw new CallError(
+      "You are not a member of this group",
+      "NOT_GROUP_MEMBER",
+      403,
+    );
+  }
+
   const existing = callModel.findParticipant(call, uid);
 
   let updatedCall;
@@ -1141,6 +1213,10 @@ async function joinCall({ userId, callId }) {
       status: PARTICIPANT_STATUS.ACCEPTED,
       joinedAt: new Date().toISOString(),
     });
+  }
+
+  if (call.status === CALL_STATUS.RINGING) {
+    updatedCall = await callRepository.activateCall(callId);
   }
 
   const tokenPayload = generateTokenPayload(updatedCall.channelName, uid);

@@ -96,11 +96,12 @@ async function isUserBusy(userId) {
     new ScanCommand({
       TableName: CALLS_TABLE,
       FilterExpression:
-        "(#s = :active OR #s = :ringing)",
+        "#s IN (:active, :ringing, :reconnecting)",
       ExpressionAttributeNames: { "#s": "status" },
       ExpressionAttributeValues: {
         ":active": CALL_STATUS.ACTIVE,
         ":ringing": CALL_STATUS.RINGING,
+        ":reconnecting": CALL_STATUS.RECONNECTING,
       },
     }),
   );
@@ -425,11 +426,12 @@ async function findActiveForUser(userId) {
     new ScanCommand({
       TableName: CALLS_TABLE,
       FilterExpression:
-        "(#s = :active OR #s = :ringing)",
+        "#s IN (:active, :ringing, :reconnecting)",
       ExpressionAttributeNames: { "#s": "status" },
       ExpressionAttributeValues: {
         ":active": CALL_STATUS.ACTIVE,
         ":ringing": CALL_STATUS.RINGING,
+        ":reconnecting": CALL_STATUS.RECONNECTING,
       },
     }),
   );

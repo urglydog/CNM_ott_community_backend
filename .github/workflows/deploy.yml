@@ -1,0 +1,37 @@
+name: Deploy Node.js Backend to AWS EC2
+
+# Kịch bản sẽ tự động chạy mỗi khi bạn push code mới lên nhánh main
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v4
+
+    - name: SSH into EC2 and Deploy
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets::EC2_HOST }}
+        username: ${{ secrets::EC2_USERNAME }}
+        key: ${{ secrets::EC2_SSH_KEY }}
+        port: 22
+        script: |
+          # 1. Di chuyển vào đúng thư mục dự án trên EC2
+          cd /home/ubuntu/CNM_ott_community_backend
+          
+          # 2. Kéo code mới nhất từ GitHub về máy ảo
+          git pull origin main
+          
+          # 3. Cài đặt các package mới nếu có thay đổi (bỏ qua download chromium của puppeteer để tránh lỗi)
+          PUPPETEER_SKIP_DOWNLOAD=true npm install
+          
+          # 4. Khởi động lại tiến trình PM2 cũ để cập nhật code mới
+          pm2 restart ott-backend --update-env
+          
+          # 5. Lưu lại trạng thái PM2
+          pm2 save

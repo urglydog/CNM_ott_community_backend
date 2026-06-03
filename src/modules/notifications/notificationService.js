@@ -286,6 +286,86 @@ async function notifyMessageCreated(message, io) {
   return pushResult;
 }
 
+async function sendPushNotificationForCall(payloadData) {
+  const admin = getFirebaseAdmin();
+  if (!admin) return { enabled: false };
+
+  const { recipients, data, callerName } = payloadData;
+  if (!recipients || recipients.length === 0) return { enabled: true, sent: 0 };
+
+  const { getUserById, removeFcmToken } = require("../users/userService");
+
+  let tokens = [];
+  const tokenToUserId = new Map();
+
+  for (const userId of recipients) {
+    const user = await getUserById(userId);
+    if (user && Array.isArray(user.fcm_tokens)) {
+      user.fcm_tokens.forEach(token => {
+        tokens.push(token);
+        tokenToUserId.set(token, userId);
+      });
+    }
+  }
+
+  if (tokens.length === 0) return { enabled: true, sent: 0 };
+
+  const messagePayload = {
+    notification: {
+      title: "Cuộc gọi đến",
+      body: `Cuộc gọi từ ${callerName || "ai đó"}`,
+    },
+    data: {
+      type: "incoming_call",
+      ...data,
+    },
+    android: {
+      priority: "high",
+      notification: {
+        channelId: "incoming_calls",
+        sound: "ringtone",
+        priority: "max",
+      },
+    },
+    apns: {
+      payload: {
+        aps: {
+          sound: "ringtone.caf",
+          "content-available": 1,
+        },
+      },
+    },
+    tokens,
+  };
+
+  try {
+    const result = await admin.messaging().sendEachForMulticast(messagePayload);
+    
+    // Cleanup invalid tokens
+    if (result.failureCount > 0) {
+      const responses = result.responses;
+      for (let i = 0; i < responses.length; i++) {
+        if (!responses[i].success) {
+          const error = responses[i].error;
+          if (
+            error.code === 'messaging/invalid-registration-token' ||
+            error.code === 'messaging/registration-token-not-registered'
+          ) {
+            const invalidToken = tokens[i];
+            const userId = tokenToUserId.get(invalidToken);
+            await removeFcmToken(userId, invalidToken);
+          }
+        }
+      }
+    }
+    
+    return { enabled: true, sent: result.successCount, failed: result.failureCount };
+  } catch (err) {
+    console.error("[notifications] Failed to send call push:", err);
+    return { enabled: true, error: err.message };
+  }
+}
+
 module.exports = {
   registerDeviceToken,
   removeDeviceToken,
@@ -293,4 +373,5 @@ module.exports = {
   getFirebasePublicConfig,
   notifyMessageCreated,
   sendPushNotifications,
+  sendPushNotificationForCall,
 };

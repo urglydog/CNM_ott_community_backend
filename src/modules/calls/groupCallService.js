@@ -2,6 +2,7 @@
 
 const groupCallRepo = require('./groupCallRepository');
 const AgoraProvider = require('./providers/agoraProvider');
+const groupService = require('../groups/groupService');
 
 const agoraProvider = new AgoraProvider();
 
@@ -15,6 +16,18 @@ const agoraProvider = new AgoraProvider();
 
 async function startGroupCall({ conversationId, hostUserId, memberUserIds }) {
   console.log(`[GROUP_CALL_START] conversationId=${conversationId} host=${hostUserId}`);
+
+  const groupMemberIds = await getGroupMemberIds(conversationId);
+  ensureGroupMember(groupMemberIds, hostUserId);
+
+  const requestedIds = Array.isArray(memberUserIds)
+    ? memberUserIds.map((id) => String(id)).filter(Boolean)
+    : [];
+  const selectedIds = requestedIds.length > 0 ? requestedIds : groupMemberIds;
+  const allowedIds = new Set(groupMemberIds);
+  const participantUserIds = [
+    ...new Set([String(hostUserId), ...selectedIds.filter((id) => allowedIds.has(String(id)))]),
+  ];
 
   // Check for existing active session
   const existing = await groupCallRepo.getActiveSessionByConversation(conversationId);
@@ -43,8 +56,8 @@ async function startGroupCall({ conversationId, hostUserId, memberUserIds }) {
     status: 'JOINED',
   });
 
-  const invitees = memberUserIds.filter((id) => id !== hostUserId);
-  console.log(`[GROUP_CALL_MEMBERS] members=[${memberUserIds.join(',')}] invitees=[${invitees.join(',')}]`);
+  const invitees = participantUserIds.filter((id) => id !== String(hostUserId));
+  console.log(`[GROUP_CALL_MEMBERS] members=[${participantUserIds.join(',')}] invitees=[${invitees.join(',')}]`);
 
   for (const memberId of invitees) {
     await groupCallRepo.createParticipant({
@@ -65,6 +78,9 @@ async function startGroupCall({ conversationId, hostUserId, memberUserIds }) {
 
   // Return full session + host join info
   const allParticipants = await groupCallRepo.getParticipantsBySession(session.id);
+
+  // Create system message in chat
+  await createGroupCallActiveMessage(session, allParticipants);
 
   return {
     session: {
@@ -104,6 +120,7 @@ async function acceptGroupCall({ sessionId, userId }) {
   if (session.status === 'ENDED' || session.status === 'FAILED') {
     throw new Error('Session already ended');
   }
+  await assertUserInGroup(session.conversationId, userId);
 
   const participant = await groupCallRepo.getParticipant(sessionId, userId);
   if (!participant) {
@@ -199,20 +216,42 @@ async function endGroupCall({ sessionId, userId, reason = 'host_ended' }) {
     throw new Error('Session not found');
   }
 
-  // Mark remaining participants as LEFT
-  const participants = await groupCallRepo.getParticipantsBySession(sessionId);
-  for (const p of participants) {
-    if (p.status === 'JOINED' || p.status === 'RINGING' || p.status === 'INVITED') {
-      await groupCallRepo.updateParticipantStatus(sessionId, p.userId, 'LEFT');
-    }
-  }
+  const endedSession = await finalizeSession(sessionId, reason, {
+    joinedStatus: 'LEFT',
+    pendingStatus: 'MISSED',
+  });
 
-  await groupCallRepo.endSession(sessionId, reason);
-
-  return { sessionId, reason };
+  return {
+    sessionId,
+    reason,
+    conversationId: endedSession?.conversationId || session.conversationId,
+  };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+function notGroupMemberError() {
+  const err = new Error('You are not a member of this group');
+  err.status = 403;
+  err.code = 'NOT_GROUP_MEMBER';
+  return err;
+}
+
+async function getGroupMemberIds(conversationId) {
+  const members = await groupService.getGroupMembers(conversationId);
+  return members.map((m) => String(m.userId)).filter(Boolean);
+}
+
+function ensureGroupMember(memberUserIds, userId) {
+  if (!memberUserIds.includes(String(userId))) {
+    throw notGroupMemberError();
+  }
+}
+
+async function assertUserInGroup(conversationId, userId) {
+  const isMember = await groupService.checkUserInGroup(conversationId, userId);
+  if (!isMember) throw notGroupMemberError();
+}
 
 async function checkAndMaybeEndSession(sessionId, reason) {
   // Single read to avoid race conditions between multiple DynamoDB queries
@@ -229,12 +268,124 @@ async function checkAndMaybeEndSession(sessionId, reason) {
   // Diagnostic log
   console.log(`[GROUP_ALL_LEFT_CHECK] sessionId=${sessionId} joinedCount=${joinedCount} ringingCount=${ringingCount} participants=[${allParticipants.map((p) => `${p.userId}:${norm(p.status)}`).join(',')}]`);
 
-  if (joinedCount === 0 && ringingCount === 0) {
+  const reconnectingCount = allParticipants.filter((p) => norm(p.status) === 'reconnecting').length;
+
+  if (joinedCount === 0 && reconnectingCount === 0) {
     console.log(`[GROUP_CALL_END] auto-ending sessionId=${sessionId} reason=${reason}`);
-    await groupCallRepo.endSession(sessionId, reason);
+    await finalizeSession(sessionId, reason, {
+      joinedStatus: 'LEFT',
+      pendingStatus: 'MISSED',
+    });
     return true;
   }
   return false;
+}
+
+async function finalizeSession(
+  sessionId,
+  reason,
+  {
+    joinedStatus = 'LEFT',
+    pendingStatus = 'MISSED',
+  } = {},
+) {
+  const participants = await groupCallRepo.getParticipantsBySession(sessionId);
+  const norm = (s) => String(s || '').toLowerCase();
+
+  for (const participant of participants) {
+    const status = norm(participant.status);
+    if (status === 'joined' || status === 'reconnecting') {
+      await groupCallRepo.updateParticipantStatus(sessionId, participant.userId, joinedStatus);
+      continue;
+    }
+    if (status === 'ringing' || status === 'invited') {
+      await groupCallRepo.updateParticipantStatus(sessionId, participant.userId, pendingStatus);
+    }
+  }
+
+  const endedSession = await groupCallRepo.endSession(sessionId, reason);
+  await createGroupCallLogMessage(sessionId, reason);
+
+  // Update the existing group_call_active message to ended status
+  // so FE doesn't show stale "Tham gia" button after reload
+  try {
+    const { markGroupCallActiveMessageEnded } = require("../messages/messageService");
+    const endedAt = endedSession?.endedAt || new Date().toISOString();
+    const conversationId = endedSession?.conversationId || sessionId;
+    await markGroupCallActiveMessageEnded(conversationId, sessionId, endedAt);
+  } catch (markErr) {
+    console.error("[group-call] Failed to mark active message as ended:", markErr.message);
+    // Non-fatal — don't break the call end flow
+  }
+
+  return endedSession;
+}
+
+// ── Disconnect / Reconnect handling ────────────────────────────────────────
+
+/**
+ * Handle participant socket disconnect during an active group call.
+ * Marks the participant as reconnecting in DB.
+ *
+ * @param {string} sessionId
+ * @param {string} userId
+ * @returns {Promise<Object|null>} Updated session or null if not applicable
+ */
+async function handleDisconnect(sessionId, userId) {
+  const participant = await groupCallRepo.getParticipant(sessionId, userId);
+  if (!participant) return null;
+
+  const norm = (s) => String(s || '').toLowerCase();
+  if (norm(participant.status) !== 'joined') return null;
+
+  console.log(`[GROUP_CALL_DISCONNECT] sessionId=${sessionId} userId=${userId}`);
+  return groupCallRepo.markParticipantDisconnected(sessionId, userId);
+}
+
+/**
+ * Handle participant reconnect after a disconnect.
+ * Marks participant as joined, returns fresh Agora token.
+ *
+ * @param {string} sessionId
+ * @param {string} userId
+ * @returns {Promise<{session: Object, tokenPayload: Object}|null>}
+ */
+async function handleReconnect(sessionId, userId) {
+  const participant = await groupCallRepo.getParticipant(sessionId, userId);
+  if (!participant) return null;
+
+  const norm = (s) => String(s || '').toLowerCase();
+  if (norm(participant.status) !== 'reconnecting') return null;
+
+  console.log(`[GROUP_CALL_RECONNECT] sessionId=${sessionId} userId=${userId}`);
+  const session = await groupCallRepo.markParticipantReconnected(sessionId, userId);
+
+  const uid = hashCode(userId);
+  const token = agoraProvider.generateToken(session.channelName, uid);
+
+  return {
+    session,
+    tokenPayload: { token, uid, channelName: session.channelName },
+  };
+}
+
+/**
+ * End a group call participant's presence due to disconnect timeout.
+ * Marks participant as LEFT, then checks if session should end.
+ *
+ * @param {string} sessionId
+ * @param {string} userId
+ * @returns {Promise<{ended: boolean}>}
+ */
+async function endCallDueToDisconnect(sessionId, userId) {
+  console.log(`[GROUP_CALL_DISCONNECT_TIMEOUT] sessionId=${sessionId} userId=${userId}`);
+
+  const participant = await groupCallRepo.getParticipant(sessionId, userId);
+  if (!participant) return { ended: false };
+
+  await groupCallRepo.updateParticipantStatus(sessionId, userId, 'LEFT');
+  const ended = await checkAndMaybeEndSession(sessionId, 'disconnect_timeout');
+  return { ended };
 }
 
 /**
@@ -251,11 +402,166 @@ function hashCode(str) {
   return Math.abs(hash);
 }
 
+function formatDuration(seconds) {
+  if (!seconds || seconds <= 0) return "0:00";
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/**
+ * Create a "group_call_active" system message when a group call starts.
+ * IDEMPOTENT: uses activeCallMessageCreated flag to prevent duplicate messages.
+ *
+ * @param {Object} session - The group call session
+ * @param {string} session.id - The session/call ID
+ * @param {string} session.conversationId - The conversation ID
+ * @param {string} session.hostUserId - The initiator's user ID
+ * @param {string} session.channelName - The Agora channel name
+ * @param {string} session.startedAt - When the call started
+ * @param {Array} participants - Array of { userId, role, status }
+ */
+async function createGroupCallActiveMessage(session, participants) {
+  if (!session || !session.conversationId) return;
+
+  // Idempotency guard
+  const marked = await groupCallRepo.markActiveCallMessageCreated(session.id);
+  if (!marked) return; // Already created
+
+  const participantIds = (participants || []).map((p) => String(p.userId));
+
+  const callData = {
+    callId: session.id,
+    callMode: "group",
+    callType: "video",
+    callStatus: "active",
+    conversationId: session.conversationId,
+    startedAt: session.startedAt || new Date().toISOString(),
+    initiatorId: session.hostUserId,
+    participantIds,
+  };
+
+  try {
+    const { saveMessage } = require("../messages/messageService");
+    const savedMessage = await saveMessage({
+      conversationId: session.conversationId,
+      senderId: session.hostUserId,
+      content: "Cuộc gọi nhóm đang diễn ra",
+      contentType: "group_call_active",
+      callData,
+    });
+
+    // Broadcast realtime
+    try {
+      const { getIO } = require("../../socket/socketHandler");
+      const io = getIO();
+      if (io && savedMessage) {
+        const roomId = session.conversationId;
+        console.log(`[group-call:system-message] Broadcasting group_call_active to room ${roomId}`, savedMessage.id);
+        io.to(roomId).emit("receive_message", savedMessage);
+      }
+    } catch (emitErr) {
+      console.error("[group-call:system-message] Failed to broadcast realtime:", emitErr.message);
+    }
+  } catch (err) {
+    console.error("[group-call:system-message] Failed to create message:", err.message);
+    // Don't throw — message creation failure should not break the call flow
+  }
+}
+
+/**
+ * Create a "call_log" system message when a group call ends.
+ * IDEMPOTENT: uses callLogCreated flag to prevent duplicate messages.
+ *
+ * @param {string} sessionId - The ended session ID
+ * @param {string} endedReason - Why the call ended
+ */
+async function createGroupCallLogMessage(sessionId, endedReason) {
+  if (!sessionId) return;
+
+  // Idempotency guard
+  const marked = await groupCallRepo.markCallLogCreated(sessionId);
+  if (!marked) return; // Already created
+
+  try {
+    // Re-read session to get final state
+    const session = await groupCallRepo.getSession(sessionId);
+    if (!session || !session.conversationId) return;
+
+    const participants = await groupCallRepo.getParticipantsBySession(sessionId);
+    const norm = (s) => String(s || '').toLowerCase();
+
+    const acceptedCount = participants.filter((p) => norm(p.status) === 'joined').length;
+    const rejectedCount = participants.filter((p) => norm(p.status) === 'rejected').length;
+    const missedCount = participants.filter(
+      (p) => norm(p.status) === 'missed' || norm(p.status) === 'ringing' || norm(p.status) === 'invited'
+    ).length;
+    const participantCount = participants.length;
+
+    // Calculate duration
+    const startedAt = session.startedAt || session.createdAt;
+    const endedAt = session.endedAt || new Date().toISOString();
+    let durationSeconds = 0;
+    if (startedAt) {
+      durationSeconds = Math.max(0, Math.floor((new Date(endedAt).getTime() - new Date(startedAt).getTime()) / 1000));
+    }
+
+    // Build content string
+    const suffix = durationSeconds > 0 ? ` · ${formatDuration(durationSeconds)}` : "";
+    const content = `Cuộc gọi đã kết thúc${suffix}`;
+
+    const callData = {
+      callId: sessionId,
+      conversationId: session.conversationId,
+      callMode: "group",
+      callType: session.callType || "video",
+      callStatus: "ended",
+      endedReason: endedReason || null,
+      durationSeconds,
+      initiatorId: session.initiatorId || session.hostUserId || session.callerId,
+      acceptedCount,
+      rejectedCount,
+      missedCount,
+      participantCount,
+    };
+
+    const { saveMessage } = require("../messages/messageService");
+    const savedMessage = await saveMessage({
+      conversationId: session.conversationId,
+      senderId: session.initiatorId || session.hostUserId || session.callerId,
+      content,
+      contentType: "call_log",
+      callData,
+    });
+
+    // Broadcast realtime
+    try {
+      const { getIO } = require("../../socket/socketHandler");
+      const io = getIO();
+      if (io && savedMessage) {
+        const roomId = session.conversationId;
+        console.log(`[group-call:call-log] Broadcasting call_log to room ${roomId}`, savedMessage.id);
+        io.to(roomId).emit("receive_message", savedMessage);
+      }
+    } catch (emitErr) {
+      console.error("[group-call:call-log] Failed to broadcast realtime:", emitErr.message);
+    }
+  } catch (err) {
+    console.error("[group-call:call-log] Failed to create call_log:", err.message);
+    // Don't throw — message creation failure should not break the call flow
+  }
+}
+
 module.exports = {
   startGroupCall,
   acceptGroupCall,
   rejectGroupCall,
   leaveGroupCall,
   endGroupCall,
+  handleDisconnect,
+  handleReconnect,
+  endCallDueToDisconnect,
   hashCode,
+  createGroupCallActiveMessage,
+  createGroupCallLogMessage,
 };

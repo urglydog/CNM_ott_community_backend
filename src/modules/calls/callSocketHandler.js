@@ -17,6 +17,7 @@
 const callService = require("./callService");
 const callModel = require("./callModel");
 const { emitToUserSockets: emitToUserSocketsRegistry, onlineUsers } = require("../../socket/socketUserRegistry");
+const { sendPushNotificationForCall } = require("../notifications/notificationService");
 const {
   SOCKET_EVENTS,
   CALL_STATUS,
@@ -437,6 +438,26 @@ async function handleCallStart(io, socket, userId, data, callback) {
     if (callSession.callMode === CALL_MODE.GROUP) {
       console.log(`[GROUP_CALL_INVITE] emittedCount=${emittedCount}`);
     }
+
+    // --- FCM Push Notification ---
+    try {
+      const { getUserById } = require("../users/userService");
+      const hostDisplayInfo = await getUserById(userId);
+      sendPushNotificationForCall({
+        recipients: recipientIds,
+        callerName: hostDisplayInfo?.display_name || hostDisplayInfo?.username || String(userId),
+        data: {
+          callType: callSession.callMode,
+          callId: callId,
+          conversationId: callSession.conversationId,
+          channelName: callSession.channelName,
+          callerId: userId,
+        }
+      }).catch(err => console.error('[FCM_PUSH_ERROR]', err));
+    } catch (e) {
+      console.error('[FCM_PUSH_SETUP_ERROR]', e);
+    }
+    // -----------------------------
 
     // Start ringing timeout
     // Fix 4: Direct = one timer for callId, Group = per-participant timers
@@ -870,9 +891,7 @@ function registerCallHandlers(io, socket) {
   socket.on(SOCKET_EVENTS.DIRECT_CALL_ACCEPT, (data, callback) => {
     handleCallAccept(io, socket, uid, data, callback);
   });
-  socket.on(SOCKET_EVENTS.GROUP_CALL_ACCEPT, (data, callback) => {
-    handleCallAccept(io, socket, uid, data, callback);
-  });
+  // group-call:accept handled by groupCallSocketHandler.js only
 
   socket.on(SOCKET_EVENTS.CALL_REJECT, (data, callback) => {
     handleCallReject(io, socket, uid, data, callback);
@@ -880,9 +899,7 @@ function registerCallHandlers(io, socket) {
   socket.on(SOCKET_EVENTS.DIRECT_CALL_REJECT, (data, callback) => {
     handleCallReject(io, socket, uid, data, callback);
   });
-  socket.on(SOCKET_EVENTS.GROUP_CALL_REJECT, (data, callback) => {
-    handleCallReject(io, socket, uid, data, callback);
-  });
+  // group-call:reject handled by groupCallSocketHandler.js only
 
   socket.on(SOCKET_EVENTS.CALL_CANCEL, (data, callback) => {
     handleCallCancel(io, socket, uid, data, callback);
@@ -894,23 +911,17 @@ function registerCallHandlers(io, socket) {
   socket.on(SOCKET_EVENTS.DIRECT_CALL_END, (data, callback) => {
     handleCallEnd(io, socket, uid, data, callback);
   });
-  socket.on(SOCKET_EVENTS.GROUP_CALL_END, (data, callback) => {
-    handleCallEnd(io, socket, uid, data, callback);
-  });
+  // group-call:end handled by groupCallSocketHandler.js only
 
   socket.on(SOCKET_EVENTS.CALL_JOIN, (data, callback) => {
     handleCallJoin(io, socket, uid, data, callback);
   });
-  socket.on(SOCKET_EVENTS.GROUP_CALL_JOIN, (data, callback) => {
-    handleCallJoin(io, socket, uid, data, callback);
-  });
+  // group-call:join handled by groupCallSocketHandler.js only
 
   socket.on(SOCKET_EVENTS.CALL_LEAVE, (data, callback) => {
     handleCallLeave(io, socket, uid, data, callback);
   });
-  socket.on(SOCKET_EVENTS.GROUP_CALL_LEAVE, (data, callback) => {
-    handleCallLeave(io, socket, uid, data, callback);
-  });
+  // group-call:leave handled by groupCallSocketHandler.js only
 
   socket.on(SOCKET_EVENTS.CALL_HEARTBEAT, (data) => {
     handleCallHeartbeat(io, socket, uid, data);

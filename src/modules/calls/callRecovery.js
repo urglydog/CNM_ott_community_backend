@@ -14,6 +14,10 @@
  *     - disconnectedAt > RECONNECT_GRACE_MS (15s) → end/leave by disconnect timeout (DB only)
  *     - disconnectedAt < RECONNECT_GRACE_MS       → rebuild remaining reconnect timer
  *
+ *   Group call participants with reconnecting status:
+ *     - status='reconnecting' + disconnectedAt > RECONNECT_GRACE_MS → mark LEFT, end session if empty
+ *     - status='reconnecting' + disconnectedAt < RECONNECT_GRACE_MS → rebuild group reconnect timer
+ *
  * Duplicate call_log prevention:
  *   All service functions use the existing callLogCreated guard (atomic conditional
  *   update) so recovery will never create duplicate call_log messages.
@@ -42,7 +46,7 @@ const {
  *   - Rebuilds in-memory timers for still-valid ones
  *
  * @param {Object} io - Socket.IO server instance (needed for timer callbacks)
- * @returns {Promise<{ ringingRecovered: number, ringingExpired: number, disconnectRecovered: number, disconnectExpired: number }>}
+ * @returns {Promise<{ ringingRecovered: number, ringingExpired: number, disconnectRecovered: number, disconnectExpired: number, groupDisconnectRecovered: number, groupDisconnectExpired: number }>}
  */
 async function recoverCallsOnBoot(io) {
   const stats = {
@@ -50,6 +54,8 @@ async function recoverCallsOnBoot(io) {
     ringingExpired: 0,
     disconnectRecovered: 0,
     disconnectExpired: 0,
+    groupDisconnectRecovered: 0,
+    groupDisconnectExpired: 0,
   };
 
   const now = Date.now();
@@ -161,13 +167,100 @@ async function recoverCallsOnBoot(io) {
     }
   }
 
+  // ── 3. Recover group call participants with reconnecting status ────────
+  // Group call rebuild system uses status='reconnecting' instead of connectionState
+
+  let groupCallRepo;
+  try {
+    groupCallRepo = require("./groupCallRepository");
+  } catch {}
+
+  if (groupCallRepo) {
+    let activeGroupCalls;
+    try {
+      const { ddbDocClient } = require("../../config/awsConfig");
+      const { ScanCommand } = require("@aws-sdk/lib-dynamodb");
+      const { CALLS_TABLE } = require("./callModel");
+      const res = await ddbDocClient.send(
+        new ScanCommand({
+          TableName: CALLS_TABLE,
+          FilterExpression: "#s = :active AND (callType = :groupType OR callMode = :groupMode)",
+          ExpressionAttributeNames: { "#s": "status" },
+          ExpressionAttributeValues: {
+            ":active": "active",
+            ":groupType": "GROUP",
+            ":groupMode": "group",
+          },
+        }),
+      );
+      activeGroupCalls = res.Items || [];
+    } catch (err) {
+      console.error("[call-recovery] Failed to scan group calls:", err.message);
+      activeGroupCalls = [];
+    }
+
+    for (const call of activeGroupCalls) {
+      const reconnectingParticipants = (call.participants || []).filter(
+        (p) => String(p.status || '').toLowerCase() === 'reconnecting' && p.disconnectedAt,
+      );
+
+      for (const p of reconnectingParticipants) {
+        try {
+          const disconnectedAtMs = new Date(p.disconnectedAt).getTime();
+          const elapsed = now - disconnectedAtMs;
+          const remaining = TIMEOUTS.RECONNECT_GRACE_MS - elapsed;
+
+          if (remaining <= 0) {
+            await groupCallRepo.updateParticipantStatus(call.callId, p.userId, 'left');
+            const allParticipants = await groupCallRepo.getParticipantsBySession(call.callId);
+            const norm = (s) => String(s || '').toLowerCase();
+            const joinedCount = allParticipants.filter((pp) => norm(pp.status) === 'joined').length;
+            const reconnectingCount = allParticipants.filter((pp) => norm(pp.status) === 'reconnecting').length;
+            if (joinedCount === 0 && reconnectingCount === 0) {
+              await groupCallRepo.endSession(call.callId, 'disconnect_timeout');
+              stats.groupDisconnectExpired++;
+              console.log(
+                `[call-recovery] Group call ${call.callId} expired (all disconnected), ended`,
+              );
+            } else {
+              stats.groupDisconnectExpired++;
+              console.log(
+                `[call-recovery] Participant ${p.userId} in group call ${call.callId} disconnect expired, marked LEFT`,
+              );
+            }
+          } else {
+            try {
+              const { startGroupReconnectTimer } = require("./groupCallSocketHandler");
+              const emptyOnlineUsers = new Map();
+              startGroupReconnectTimer(io, call.callId, p.userId, emptyOnlineUsers, remaining);
+              stats.groupDisconnectRecovered++;
+            } catch (timerErr) {
+              console.warn(`[call-recovery] Could not rebuild timer for group call ${call.callId}:${p.userId}:`, timerErr.message);
+              stats.groupDisconnectRecovered++;
+            }
+            console.log(
+              `[call-recovery] Participant ${p.userId} in group call ${call.callId} reconnect recovered (remaining=${remaining}ms)`,
+            );
+          }
+        } catch (err) {
+          console.error(
+            `[call-recovery] Error recovering group call disconnect for ${p.userId} in ${call.callId}:`,
+            err.message,
+          );
+        }
+      }
+    }
+  }
+
   // ── Summary ─────────────────────────────────────────────────────────────
 
   const total =
     stats.ringingRecovered +
     stats.ringingExpired +
     stats.disconnectRecovered +
-    stats.disconnectExpired;
+    stats.disconnectExpired +
+    stats.groupDisconnectRecovered +
+    stats.groupDisconnectExpired;
 
   if (total > 0) {
     console.log(
@@ -175,7 +268,9 @@ async function recoverCallsOnBoot(io) {
         `${stats.ringingExpired} ringing expired, ` +
         `${stats.ringingRecovered} ringing recovered, ` +
         `${stats.disconnectExpired} disconnect expired, ` +
-        `${stats.disconnectRecovered} disconnect recovered`,
+        `${stats.disconnectRecovered} disconnect recovered, ` +
+        `${stats.groupDisconnectExpired} group disconnect expired, ` +
+        `${stats.groupDisconnectRecovered} group disconnect recovered`,
     );
   } else {
     console.log("[call-recovery] No stale calls found — clean startup");

@@ -50,30 +50,21 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",")
   : ["http://localhost:3000"];
 
+// SỬA THÀNH THẾ NÀY:
 const io = new Server(server, {
   cors: {
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
+    origin: "*", // Cho phép tất cả các nguồn kết nối Socket
+    methods: ["GET", "POST"],
   },
 });
 
 app.set("socketio", io);
 
+// SỬA THÀNH THẾ NÀY:
 const corsOptions = {
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    // eslint-disable-next-line no-console
-    console.warn(`[CORS Blocked]: Origin ${origin} không được phép truy cập.`);
-    return callback(new Error("Not allowed by CORS"));
-  },
-  credentials: true,
+  origin: "*", // Cho phép tất cả các nguồn gọi API
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 };
 
 app.use(cors(corsOptions));

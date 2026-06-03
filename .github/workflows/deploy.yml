@@ -1,9 +1,11 @@
 name: Deploy Node.js Backend to AWS EC2
 
-# Kịch bản sẽ tự động chạy mỗi khi bạn push code mới lên nhánh main
 on:
   push:
     branches: [ main ]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   deploy:
@@ -21,17 +23,22 @@ jobs:
         key: ${{ secrets.EC2_SSH_KEY }}
         port: 22
         script: |
-          # 1. Di chuyển vào đúng thư mục dự án trên EC2
+          # 1. Ép hệ thống nạp cấu hình NVM và các biến môi trường của user ubuntu
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+          
+          # 2. Di chuyển vào đúng thư mục dự án trên EC2
           cd /home/ubuntu/CNM_ott_community_backend
           
-          # 2. Kéo code mới nhất từ GitHub về máy ảo
+          # 3. Kéo code mới nhất từ GitHub về máy ảo
           git pull origin main
           
-          # 3. Cài đặt các package mới nếu có thay đổi (bỏ qua download chromium của puppeteer để tránh lỗi)
+          # 4. Cài đặt các package mới (bỏ qua download chromium của puppeteer để tránh lỗi)
           PUPPETEER_SKIP_DOWNLOAD=true npm install
           
-          # 4. Khởi động lại tiến trình PM2 cũ để cập nhật code mới
+          # 5. Khởi động lại tiến trình PM2 cũ để cập nhật code mới
           pm2 restart ott-backend --update-env
           
-          # 5. Lưu lại trạng thái PM2
+          # 6. Lưu lại trạng thái PM2
           pm2 save

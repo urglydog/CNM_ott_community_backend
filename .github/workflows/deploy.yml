@@ -16,9 +16,9 @@ jobs:
     - name: SSH into EC2 and Deploy
       uses: appleboy/ssh-action@master
       with:
-        host: ${{ secrets::EC2_HOST }}
-        username: ${{ secrets::EC2_USERNAME }}
-        key: ${{ secrets::EC2_SSH_KEY }}
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_SSH_KEY }}
         port: 22
         script: |
           # 1. Di chuyển vào đúng thư mục dự án trên EC2
